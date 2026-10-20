@@ -32,7 +32,12 @@ const noOverrides: Overrides = {
 
 export default function ClonePanel() {
   const [classes, setClasses] = useState<ClassInfo[]>([]);
-  const [options, setOptions] = useState<KnownOptions>({ stats: [], races: [], class_types: [] });
+  const [options, setOptions] = useState<KnownOptions>({
+    stats: [],
+    races: [],
+    class_types: [],
+    race_realms: {},
+  });
   const [sourceId, setSourceId] = useState<string>("");
   const [newName, setNewName] = useState("");
   const [newIdent, setNewIdent] = useState("");
@@ -148,12 +153,14 @@ export default function ClonePanel() {
       {source && (
         <>
           <div className="source-summary">
-            <strong>{source.name}</strong> ({source.class_ident}) - profession:{" "}
-            {source.profession ?? "-"}, stats: {source.primary_stat}/{source.secondary_stat}/
-            {source.tertiary_stat}, mana: {source.mana_stat ?? "-"}, WS base: {source.ws_base},
-            base HP: {source.base_hp}, type: {source.class_type}, focus caster:{" "}
-            {String(source.is_focus_caster)}, races:{" "}
-            {source.eligible_races.length ? source.eligible_races.join(", ") : "(realm default)"}
+            <strong>{source.name}</strong> ({source.class_ident}) - realm: {source.realm},
+            profession: {source.profession ?? "-"}, stats: {source.primary_stat}/
+            {source.secondary_stat}/{source.tertiary_stat}, mana: {source.mana_stat ?? "-"}, WS
+            base: {source.ws_base}, base HP: {source.base_hp}, type: {source.class_type}, focus
+            caster: {String(source.is_focus_caster)}, races:{" "}
+            {source.effective_eligible_races.length
+              ? source.effective_eligible_races.join(", ")
+              : "(none found)"}
           </div>
 
           <h2>2. Name your new class</h2>
@@ -312,24 +319,26 @@ export default function ClonePanel() {
               onToggle={() => toggle("eligible_races")}
             >
               <div className="race-checkboxes">
-                {options.races.map((r) => (
-                  <label key={r}>
-                    <input
-                      type="checkbox"
-                      defaultChecked={source.eligible_races.includes(r)}
-                      onChange={(e) => {
-                        const current = (values.eligible_races as string[]) ?? [
-                          ...source.eligible_races,
-                        ];
-                        const next = e.target.checked
-                          ? [...new Set([...current, r])]
-                          : current.filter((x) => x !== r);
-                        setValue("eligible_races", next);
-                      }}
-                    />
-                    {r}
-                  </label>
-                ))}
+                {options.races
+                  .filter((r) => options.race_realms[r] === source.realm)
+                  .map((r) => (
+                    <label key={r}>
+                      <input
+                        type="checkbox"
+                        defaultChecked={source.effective_eligible_races.includes(r)}
+                        onChange={(e) => {
+                          const current = (values.eligible_races as string[]) ?? [
+                            ...source.effective_eligible_races,
+                          ];
+                          const next = e.target.checked
+                            ? [...new Set([...current, r])]
+                            : current.filter((x) => x !== r);
+                          setValue("eligible_races", next);
+                        }}
+                      />
+                      {r}
+                    </label>
+                  ))}
               </div>
             </OverrideRow>
           </div>

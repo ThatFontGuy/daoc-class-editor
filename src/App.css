@@ -140,7 +140,7 @@ select {
   display: flex;
 }
 
-.override-value input,
+.override-value input:not([type="checkbox"]),
 .override-value select {
   width: 100%;
   padding: 0.35rem;
@@ -164,6 +164,11 @@ select {
   display: flex;
   align-items: center;
   gap: 0.3rem;
+}
+
+.race-checkboxes input[type="checkbox"] {
+  width: auto;
+  flex: none;
 }
 
 .code-preview {

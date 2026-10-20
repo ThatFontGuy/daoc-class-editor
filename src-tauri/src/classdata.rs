@@ -22,6 +22,10 @@ pub struct ClassInfo {
     pub realm: String,
     /// The C# type name, e.g. "ClassDruid" - this is what a clone's `: Base` clause references.
     pub class_ident: String,
+    /// The actual C# type it extends, e.g. "ClassNaturalist" for ClassDruid, or
+    /// "CharacterClassBase" for a top-level base class. Used to resolve inherited fields
+    /// (most importantly EligibleRaces, which most concrete classes don't override themselves).
+    pub parent_ident: String,
     pub profession: Option<String>,
     pub primary_stat: Option<String>,
     pub secondary_stat: Option<String>,
@@ -33,6 +37,10 @@ pub struct ClassInfo {
     pub class_type: Option<String>,
     pub is_focus_caster: Option<bool>,
     pub eligible_races: Vec<String>,
+    /// EligibleRaces resolved up the inheritance chain if this class doesn't override it itself
+    /// (most don't) - this is what the frontend should actually use to filter race checkboxes.
+    /// Equal to `eligible_races` when this class does have its own override.
+    pub effective_eligible_races: Vec<String>,
     /// Full original source, kept so the UI can show "what you're cloning" for reference.
     pub raw_source: String,
 }
@@ -70,11 +78,10 @@ fn parse_one(path: &Path, enum_ids: &HashMap<String, i32>) -> Option<ClassInfo> 
     let base_class_name = attr_caps[3].to_string();
     let id = *enum_ids.get(&enum_name)?;
 
-    let class_ident_re = Regex::new(r"(?m)^\s*public\s+class\s+(\w+)\s*:\s*\w+").ok()?;
-    let class_ident = capture1(&class_ident_re, &raw_source).unwrap_or_default();
-    if class_ident.is_empty() {
-        return None;
-    }
+    let class_decl_re = Regex::new(r"(?m)^\s*public\s+class\s+(\w+)\s*:\s*(\w+)").ok()?;
+    let class_decl = class_decl_re.captures(&raw_source)?;
+    let class_ident = class_decl[1].to_string();
+    let parent_ident = class_decl[2].to_string();
 
     let profession = capture1(
         &Regex::new(r#"m_profession\s*=\s*"([^"]+)""#).ok()?,
@@ -134,6 +141,7 @@ fn parse_one(path: &Path, enum_ids: &HashMap<String, i32>) -> Option<ClassInfo> 
         base_class_name,
         realm: realm_from_path(path),
         class_ident,
+        parent_ident,
         profession,
         primary_stat,
         secondary_stat,
@@ -144,6 +152,7 @@ fn parse_one(path: &Path, enum_ids: &HashMap<String, i32>) -> Option<ClassInfo> 
         specialization_multiplier,
         class_type,
         is_focus_caster,
+        effective_eligible_races: eligible_races.clone(),
         eligible_races,
         raw_source,
     })
@@ -169,10 +178,28 @@ pub fn parse_enum_ids(enum_file: &Path) -> (HashMap<String, i32>, i32) {
     (map, max_id)
 }
 
+/// Extracts the real race -> realm mapping straight from PlayerRace.cs
+/// (`{ eRace.Briton, new PlayerRace(eRace.Briton, eRealm.Albion, ...) }`), so class realm
+/// classification can be grounded in actual race eligibility rather than guessed from folder
+/// names (which mislabels every class filed under the shared `base/` folder).
+fn parse_race_realms(path: &Path) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(re) = Regex::new(r"eRace\.(\w+)\s*,\s*new\s+PlayerRace\(\s*eRace\.\w+\s*,\s*eRealm\.(\w+)")
+        {
+            for cap in re.captures_iter(&text) {
+                map.insert(cap[1].to_string(), cap[2].to_string());
+            }
+        }
+    }
+    map
+}
+
 /// Walks the bundled `playerclasses/` resource folder and parses every class file found.
 pub fn load_all_classes(resources_dir: &Path) -> Vec<ClassInfo> {
     let enum_file = resources_dir.join("core").join("eCharacterClass.cs");
     let (enum_ids, _) = parse_enum_ids(&enum_file);
+    let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
 
     let playerclasses_dir = resources_dir.join("playerclasses");
     let mut out = Vec::new();
@@ -187,8 +214,52 @@ pub fn load_all_classes(resources_dir: &Path) -> Vec<ClassInfo> {
             }
         }
     }
+    resolve_effective_eligible_races(&mut out);
+    for class in out.iter_mut() {
+        if let Some(race) = class.effective_eligible_races.first() {
+            if let Some(realm) = race_realms.get(race) {
+                class.realm = realm.clone();
+            }
+        }
+    }
     out.sort_by(|a, b| a.realm.cmp(&b.realm).then(a.name.cmp(&b.name)));
     out
+}
+
+/// `EligibleRaces` is abstract in CharacterClassBase, so every concrete class gets it from
+/// somewhere in its inheritance chain - but most classes (Cleric, Druid, ...) don't override it
+/// themselves, inheriting it from a realm-specific base class (ClassAcolyte, ClassViking,
+/// ClassNaturalist, ...) instead. This walks up `parent_ident` for any class with no override of
+/// its own, until it finds an ancestor that does have one (or runs out of known ancestors).
+fn resolve_effective_eligible_races(classes: &mut [ClassInfo]) {
+    let own_races: HashMap<String, Vec<String>> = classes
+        .iter()
+        .filter(|c| !c.eligible_races.is_empty())
+        .map(|c| (c.class_ident.clone(), c.eligible_races.clone()))
+        .collect();
+    let parents: HashMap<String, String> = classes
+        .iter()
+        .map(|c| (c.class_ident.clone(), c.parent_ident.clone()))
+        .collect();
+
+    for class in classes.iter_mut() {
+        if !class.eligible_races.is_empty() {
+            continue;
+        }
+        let mut current = class.parent_ident.clone();
+        // Capped: the real inheritance chains here are at most 2-3 levels deep; this just
+        // guards against an unexpected cycle in malformed vendored data.
+        for _ in 0..10 {
+            if let Some(races) = own_races.get(&current) {
+                class.effective_eligible_races = races.clone();
+                break;
+            }
+            match parents.get(&current) {
+                Some(next) => current = next.clone(),
+                None => break,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +267,9 @@ pub struct KnownOptions {
     pub stats: Vec<String>,
     pub races: Vec<String>,
     pub class_types: Vec<String>,
+    /// Race name -> realm ("Albion"/"Midgard"/"Hibernia"), so the frontend can filter the full
+    /// race list down to just the realm of whatever class is being cloned.
+    pub race_realms: HashMap<String, String>,
 }
 
 /// Extracts the canonical stat/race/class-type names straight from the vendored source files
@@ -214,6 +288,7 @@ pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
         resources_dir.join("core").join("PlayerRace.cs"),
         r"public static PlayerRace (\w+) =>",
     );
+    let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
     // Scoped to just the `enum eClassType { ... }` block, not the whole interface file, so an
     // unrelated trailing-comma line elsewhere can't sneak in as a false match.
     let class_types = std::fs::read_to_string(resources_dir.join("core").join("ICharacterClass.cs"))
@@ -235,6 +310,7 @@ pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
         stats,
         races,
         class_types,
+        race_realms,
     }
 }
 
@@ -291,6 +367,7 @@ mod tests {
         assert_eq!(s.id, 63);
         assert_eq!(s.base_class_name, "Acolyte");
         assert_eq!(s.class_ident, "ClassSluaghbinder");
+        assert_eq!(s.parent_ident, "ClassAcolyte");
         assert_eq!(s.primary_stat.as_deref(), Some("STR"));
         assert_eq!(s.secondary_stat.as_deref(), Some("INT"));
         assert_eq!(s.tertiary_stat.as_deref(), Some("CON"));
@@ -300,11 +377,19 @@ mod tests {
         assert_eq!(s.specialization_multiplier, Some(10));
         assert_eq!(s.class_type.as_deref(), Some("Hybrid"));
         assert_eq!(s.is_focus_caster, Some(false));
+        // Sluaghbinder overrides EligibleRaces itself (to Hibernia races, despite subclassing the
+        // Albion-base ClassAcolyte purely for stats/mechanics) - own and effective must match.
         assert_eq!(s.eligible_races, vec!["Celt", "Firbolg"]);
+        assert_eq!(s.effective_eligible_races, vec!["Celt", "Firbolg"]);
+        // Its realm classification should follow its actual races, not its parent's folder.
+        assert_eq!(s.realm, "Hibernia");
     }
 
     #[test]
-    fn druid_inherits_from_naturalist() {
+    fn druid_narrows_races_relative_to_naturalist() {
+        // Every concrete class actually has its own EligibleRaces override in practice (verified
+        // across all 63 vendored files) - Druid specifically excludes Graoch, which its base
+        // class ClassNaturalist otherwise allows, a real per-class narrowing, not an omission.
         let classes = load_all_classes(&resources());
         let d = classes
             .iter()
@@ -312,7 +397,74 @@ mod tests {
             .expect("Druid should parse");
         assert_eq!(d.base_class_name, "Naturalist");
         assert_eq!(d.class_ident, "ClassDruid");
+        assert_eq!(d.parent_ident, "ClassNaturalist");
+        assert_eq!(d.eligible_races, vec!["Celt", "Firbolg", "Sylvan"]);
+        assert_eq!(d.effective_eligible_races, d.eligible_races);
         assert_eq!(d.realm, "Hibernia");
+
+        let naturalist = classes
+            .iter()
+            .find(|c| c.class_ident == "ClassNaturalist")
+            .expect("ClassNaturalist should parse");
+        assert_eq!(
+            naturalist.eligible_races,
+            vec!["Celt", "Firbolg", "Sylvan", "Graoch"]
+        );
+        assert!(
+            !d.eligible_races.contains(&"Graoch".to_string()),
+            "Druid should not include Graoch even though its base class allows it"
+        );
+    }
+
+    #[test]
+    fn midgard_base_folder_class_gets_correct_realm() {
+        // ClassViking (Midgard's warrior base) lives under playerclasses/base/, not
+        // playerclasses/midgard/ - folder-based classification would wrongly call it "Base".
+        let classes = load_all_classes(&resources());
+        let viking = classes
+            .iter()
+            .find(|c| c.class_ident == "ClassViking")
+            .expect("ClassViking should parse");
+        assert_eq!(viking.realm, "Midgard", "folder-based realm would say Base");
+        assert_eq!(
+            viking.eligible_races,
+            vec!["Dwarf", "Frostalf", "Kobold", "Deifrang", "Norseman", "Troll", "Valkyn"]
+        );
+
+        let warrior = classes
+            .iter()
+            .find(|c| c.name == "Warrior")
+            .expect("Warrior should parse");
+        assert_eq!(warrior.parent_ident, "ClassViking");
+        // Warrior has its own, narrower override too (excludes Frostalf/Deifrang) - also real
+        // per-class narrowing, not inheritance.
+        assert_eq!(
+            warrior.eligible_races,
+            vec!["Dwarf", "Kobold", "Norseman", "Troll", "Valkyn"]
+        );
+        assert_eq!(warrior.realm, "Midgard");
+    }
+
+    #[test]
+    fn no_class_is_left_unclassified() {
+        // Every one of the 63 vendored classes has its own, real EligibleRaces override, so none
+        // should fall back to the generic "Base" folder label after realm reclassification.
+        let classes = load_all_classes(&resources());
+        let unclassified: Vec<&str> = classes
+            .iter()
+            .filter(|c| c.realm == "Base")
+            .map(|c| c.class_ident.as_str())
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "classes still labeled Base: {unclassified:?}"
+        );
+        for realm in ["Albion", "Midgard", "Hibernia"] {
+            assert!(
+                classes.iter().any(|c| c.realm == realm),
+                "expected at least one class in {realm}"
+            );
+        }
     }
 
     #[test]
@@ -347,5 +499,10 @@ mod known_options_tests {
             "{:?}",
             opts.class_types
         );
+
+        assert_eq!(opts.race_realms.get("Celt").map(String::as_str), Some("Hibernia"));
+        assert_eq!(opts.race_realms.get("Troll").map(String::as_str), Some("Midgard"));
+        assert_eq!(opts.race_realms.get("Briton").map(String::as_str), Some("Albion"));
+        assert_eq!(opts.race_realms.len(), 21, "{:?}", opts.race_realms);
     }
 }

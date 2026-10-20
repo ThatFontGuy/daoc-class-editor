@@ -6,6 +6,7 @@ export interface ClassInfo {
   base_class_name: string;
   realm: string;
   class_ident: string;
+  parent_ident: string;
   profession: string | null;
   primary_stat: string | null;
   secondary_stat: string | null;
@@ -17,6 +18,7 @@ export interface ClassInfo {
   class_type: string | null;
   is_focus_caster: boolean | null;
   eligible_races: string[];
+  effective_eligible_races: string[];
   raw_source: string;
 }
 
@@ -24,6 +26,7 @@ export interface KnownOptions {
   stats: string[];
   races: string[];
   class_types: string[];
+  race_realms: Record<string, string>;
 }
 
 export interface CloneRequest {
