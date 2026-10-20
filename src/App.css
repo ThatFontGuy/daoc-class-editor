@@ -1,0 +1,228 @@
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+header {
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid #8884;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+header h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+nav {
+  display: flex;
+  gap: 0.5rem;
+}
+
+nav button {
+  background: none;
+  border: 1px solid #8884;
+  border-radius: 6px;
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+}
+
+nav button.active {
+  background: #6b8afd;
+  color: white;
+  border-color: #6b8afd;
+}
+
+main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem;
+}
+
+.panel {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.panel h2 {
+  font-size: 1rem;
+  margin-top: 2rem;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid #8884;
+  padding-bottom: 0.25rem;
+}
+
+.panel h3 {
+  font-size: 0.9rem;
+  margin-top: 1.5rem;
+}
+
+.hint {
+  font-size: 0.85rem;
+  opacity: 0.75;
+  margin: 0.25rem 0 0.75rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-bottom: 0.75rem;
+}
+
+.field span {
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+
+.field input,
+.field select {
+  padding: 0.4rem;
+  border-radius: 6px;
+  border: 1px solid #8886;
+}
+
+select {
+  padding: 0.4rem;
+  border-radius: 6px;
+  border: 1px solid #8886;
+}
+
+.source-summary {
+  background: #8882;
+  border-radius: 8px;
+  padding: 0.75rem;
+  font-size: 0.85rem;
+  margin: 0.5rem 0 1rem;
+  line-height: 1.5;
+}
+
+.override-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.override-row {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid #8882;
+}
+
+.override-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.override-value {
+  display: flex;
+}
+
+.override-value input,
+.override-value select {
+  width: 100%;
+  padding: 0.35rem;
+  border-radius: 6px;
+  border: 1px solid #8886;
+}
+
+.override-value.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.race-checkboxes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.25rem;
+  font-size: 0.8rem;
+}
+
+.race-checkboxes label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.code-preview {
+  width: 100%;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.78rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid #8886;
+  background: #8881;
+}
+
+.sql-box {
+  width: 100%;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  padding: 0.5rem;
+  border-radius: 6px;
+  border: 1px solid #8886;
+}
+
+.actions {
+  display: flex;
+  gap: 0.6rem;
+  margin: 0.75rem 0;
+  flex-wrap: wrap;
+}
+
+button {
+  padding: 0.45rem 0.9rem;
+  border-radius: 6px;
+  border: 1px solid #8886;
+  background: #8882;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.status {
+  background: #0003;
+  border-radius: 8px;
+  padding: 0.75rem;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.mode-badge {
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+  background: #6b8afd2a;
+  color: #6b8afd;
+  margin-bottom: 1rem;
+}
