@@ -3,10 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import ClonePanel from "./ClonePanel";
 import DeploySettingsPanel from "./DeploySettingsPanel";
+import DeployedClassesPanel from "./DeployedClassesPanel";
 import { ProjectProvider, emptyProjectState, useProject } from "./ProjectContext";
 import "./App.css";
 
-type Tab = "clone" | "settings";
+type Tab = "clone" | "deployed" | "settings";
 
 const FILTERS = [{ name: "DAoC Class Project", extensions: ["daocclass.json", "json"] }];
 
@@ -53,6 +54,9 @@ function Header({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
         <button className={tab === "clone" ? "active" : ""} onClick={() => setTab("clone")}>
           Clone a class
         </button>
+        <button className={tab === "deployed" ? "active" : ""} onClick={() => setTab("deployed")}>
+          Deployed classes
+        </button>
         <button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>
           Server connection
         </button>
@@ -74,7 +78,11 @@ export default function App() {
     <ProjectProvider>
       <div className="app">
         <Header tab={tab} setTab={setTab} />
-        <main>{tab === "clone" ? <ClonePanel /> : <DeploySettingsPanel />}</main>
+        <main>
+          {tab === "clone" && <ClonePanel />}
+          {tab === "deployed" && <DeployedClassesPanel />}
+          {tab === "settings" && <DeploySettingsPanel />}
+        </main>
       </div>
     </ProjectProvider>
   );

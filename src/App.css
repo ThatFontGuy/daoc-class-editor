@@ -211,6 +211,12 @@ button:disabled {
   cursor: not-allowed;
 }
 
+button.danger {
+  border-color: #e05a5a88;
+  background: #e05a5a22;
+  color: #e05a5a;
+}
+
 .status {
   background: #0003;
   border-radius: 8px;

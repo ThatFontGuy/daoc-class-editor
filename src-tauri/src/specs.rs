@@ -15,7 +15,7 @@
 //!     row itself, its SpellLine(s), their LineXSpell entries, and its Style (melee skill) rows
 //!     are all duplicated. Procs (StyleXSpell) are not cloned yet - a known gap, noted in the UI.
 
-use crate::deploy::{run_remote_sql, run_remote_sql_json, SshConfig};
+use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -46,7 +46,10 @@ pub struct SpecAssignment {
 }
 
 fn str_field(row: &Value, key: &str) -> String {
-    row.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    row.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn int_field(row: &Value, key: &str) -> i64 {
@@ -113,10 +116,13 @@ pub fn apply_class_specs(
                     a.level_acquired
                 );
                 run_remote_sql(cfg, &sql)?;
-                log.push_str(&format!("reused {} at level {}\n", a.source_key, a.level_acquired));
+                log.push_str(&format!(
+                    "reused {} at level {}\n",
+                    a.source_key, a.level_acquired
+                ));
             }
             "clone" => {
-                let new_key = a
+                let raw_new_key = a
                     .new_key
                     .clone()
                     .ok_or("a clone assignment needs new_key")?;
@@ -124,19 +130,35 @@ pub fn apply_class_specs(
                     .new_name
                     .clone()
                     .ok_or("a clone assignment needs new_name")?;
-                clone_spec(cfg, &a.source_key, &new_key, &new_name, source_class_id, new_class_id)?;
+                // Embedding the new class's ID directly in the stored KeyName (not just the
+                // spell lines under it) gives every row this clone creates a reliable,
+                // greppable suffix - `delete_deployed_class` relies on exactly this to find and
+                // remove only what was cloned for a given class, never a reused/shared spec.
+                let final_key = format!("{raw_new_key}_{new_class_id}");
+                clone_spec(
+                    cfg,
+                    &a.source_key,
+                    &final_key,
+                    &new_name,
+                    source_class_id,
+                    new_class_id,
+                )?;
                 let sql = format!(
                     "INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) VALUES ({new_class_id}, '{}', {});",
-                    sql_quote(&new_key),
+                    sql_quote(&final_key),
                     a.level_acquired
                 );
                 run_remote_sql(cfg, &sql)?;
                 log.push_str(&format!(
                     "cloned {} -> {} ('{}') at level {}\n",
-                    a.source_key, new_key, new_name, a.level_acquired
+                    a.source_key, final_key, new_name, a.level_acquired
                 ));
             }
-            other => return Err(format!("unknown assignment mode '{other}' (expected reuse or clone)")),
+            other => {
+                return Err(format!(
+                    "unknown assignment mode '{other}' (expected reuse or clone)"
+                ));
+            }
         }
     }
     Ok(log)
@@ -174,7 +196,7 @@ fn clone_spec(
         let old_line_key = str_field(line, "KeyName");
         let line_name = str_field(line, "Name");
         let is_base = line.get("IsBaseLine").and_then(Value::as_i64).unwrap_or(0);
-        let new_line_key = format!("{new_key}_{new_class_id}_{}", old_line_key);
+        let new_line_key = format!("{new_key}_{}", old_line_key);
         let old_line_key_q = sql_quote(&old_line_key);
         let new_line_key_q = sql_quote(&new_line_key);
         let line_name_q = sql_quote(&line_name);
@@ -199,9 +221,7 @@ fn clone_spec(
         .iter()
         .any(|s| int_field(s, "ClassId") == source_class_id);
     let style_class_expr = if any_class_locked {
-        format!(
-            "CASE WHEN ClassId = {source_class_id} THEN {new_class_id} ELSE ClassId END"
-        )
+        format!("CASE WHEN ClassId = {source_class_id} THEN {new_class_id} ELSE ClassId END")
     } else {
         "ClassId".to_string()
     };
@@ -284,12 +304,20 @@ mod tests {
 
         let specs = list_specializations(&cfg).unwrap();
         assert_eq!(specs.len(), 2);
-        assert!(specs.iter().any(|s| s.key_name == "slash" && s.name == "Slash"));
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.key_name == "slash" && s.name == "Slash")
+        );
         assert!(specs.iter().any(|s| s.key_name == "smite" && s.icon == 200));
 
         let class_specs = list_class_specs(&cfg, 1).unwrap();
         assert_eq!(class_specs.len(), 2);
-        assert!(class_specs.iter().any(|c| c.spec_key_name == "slash" && c.spec_name == "Slash"));
+        assert!(
+            class_specs
+                .iter()
+                .any(|c| c.spec_key_name == "slash" && c.spec_name == "Slash")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -334,28 +362,48 @@ mod tests {
         // The new Specialization row exists, independent from the source.
         let all_specs = list_specializations(&cfg).unwrap();
         assert_eq!(all_specs.len(), 3, "{all_specs:?}");
-        let cloned = all_specs.iter().find(|s| s.key_name == "earthshatter").unwrap();
+        let cloned = all_specs
+            .iter()
+            .find(|s| s.key_name == "earthshatter_64")
+            .unwrap();
         assert_eq!(cloned.name, "Earthshatter");
-        assert_eq!(cloned.icon, 100, "icon should be copied from the source spec");
+        assert_eq!(
+            cloned.icon, 100,
+            "icon should be copied from the source spec"
+        );
 
         // The new class is assigned the cloned spec, not the original.
         let new_class_specs = list_class_specs(&cfg, 64).unwrap();
         assert_eq!(new_class_specs.len(), 1);
-        assert_eq!(new_class_specs[0].spec_key_name, "earthshatter");
+        assert_eq!(new_class_specs[0].spec_key_name, "earthshatter_64");
 
         // Styles: 2 on the source ("slash"), both must now exist under the new spec key too -
         // one was ClassId=1 (locked to the source class, must now point at the new class), one
         // was ClassId=0 (unrestricted, must stay 0).
         let rows = run_remote_sql_json(
             &cfg,
-            "SELECT Name, ClassId FROM Style WHERE SpecKeyName='earthshatter' ORDER BY Name;",
+            "SELECT Name, ClassId FROM Style WHERE SpecKeyName='earthshatter_64' ORDER BY Name;",
         )
         .unwrap();
         assert_eq!(rows.len(), 2, "{rows:?}");
-        let pulverize = rows.iter().find(|r| str_field(r, "Name") == "Pulverize").unwrap();
-        assert_eq!(int_field(pulverize, "ClassId"), 64, "class-locked style should repoint to the new class");
-        let backlash = rows.iter().find(|r| str_field(r, "Name") == "Backlash").unwrap();
-        assert_eq!(int_field(backlash, "ClassId"), 0, "unrestricted style should stay unrestricted");
+        let pulverize = rows
+            .iter()
+            .find(|r| str_field(r, "Name") == "Pulverize")
+            .unwrap();
+        assert_eq!(
+            int_field(pulverize, "ClassId"),
+            64,
+            "class-locked style should repoint to the new class"
+        );
+        let backlash = rows
+            .iter()
+            .find(|r| str_field(r, "Name") == "Backlash")
+            .unwrap();
+        assert_eq!(
+            int_field(backlash, "ClassId"),
+            0,
+            "unrestricted style should stay unrestricted"
+        );
 
         // Original "slash" spec and its styles must be completely untouched.
         let original_styles = run_remote_sql_json(
@@ -364,8 +412,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(original_styles.len(), 2);
-        let original_pulverize = original_styles.iter().find(|r| str_field(r, "Name") == "Pulverize").unwrap();
-        assert_eq!(int_field(original_pulverize, "ClassId"), 1, "source style must be untouched");
+        let original_pulverize = original_styles
+            .iter()
+            .find(|r| str_field(r, "Name") == "Pulverize")
+            .unwrap();
+        assert_eq!(
+            int_field(original_pulverize, "ClassId"),
+            1,
+            "source style must be untouched"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -386,12 +441,15 @@ mod tests {
 
         let lines = run_remote_sql_json(
             &cfg,
-            "SELECT KeyName, Name, Spec, IsBaseLine FROM SpellLine WHERE Spec='frostbolt_tree';",
+            "SELECT KeyName, Name, Spec, IsBaseLine FROM SpellLine WHERE Spec='frostbolt_tree_64';",
         )
         .unwrap();
         assert_eq!(lines.len(), 1, "{lines:?}");
         let new_line_key = str_field(&lines[0], "KeyName");
-        assert_ne!(new_line_key, "smite_base", "cloned line must have its own unique key");
+        assert_ne!(
+            new_line_key, "smite_base",
+            "cloned line must have its own unique key"
+        );
         assert_eq!(str_field(&lines[0], "Name"), "Smiting Spells");
 
         let spells = run_remote_sql_json(

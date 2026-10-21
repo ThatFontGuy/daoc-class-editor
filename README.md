@@ -43,6 +43,14 @@ server source (`dotnet build`, 0 errors) before this tool's design was finalized
   with weapon/armor-class locks correctly repointed to the new class).
 - Deploying the generated file to your server's `scripts/` folder and restarting it, over SSH or
   locally.
+- **Listing and deleting already-deployed classes** - a "Deployed classes" tab lists every
+  custom class currently in `scripts/` (parsed straight from each file's
+  `[CharacterClass(id, "Name", "Base")]` attribute), with a one-click delete that removes the
+  `.cs` file, its `ClassXSpecialization` rows, and - optionally - every `Specialization`/
+  `SpellLine`/`LineXSpell`/`Style` row this tool cloned specifically for it (identified precisely,
+  because cloned spec keys always embed the owning class's ID, e.g. `earthshatter_64` - a reused
+  spec shared with other classes is never touched). Handy for cleaning up a clone that didn't
+  work out while debugging, or just as routine housekeeping.
 - **Save/Load a project** (top-right of the window) - designing a class is something you iterate
   into existence over multiple sessions, not finish in one sitting; a project file captures the
   source class, every override, and every spec assignment so far.
@@ -58,6 +66,9 @@ server source (`dotnet build`, 0 errors) before this tool's design was finalized
   this tool is about *cloning*, not *inventing*.
 - Bot AI quality for the new class: it'll play with the generic `BotBrain` and default to the
   "Damage" party role unless you also touch the bot-side files in the server repo directly.
+- **Not safety-checked:** deleting a class currently in use by an existing character isn't
+  blocked by this tool - it would leave that character in a broken state. Only delete classes
+  nothing has played yet, and stop the server first (same database-lock caution as deploying).
 
 ## Setup
 

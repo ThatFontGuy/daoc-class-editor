@@ -29,7 +29,7 @@ pub struct SshConfig {
     pub start_script_name: String,
 }
 
-fn is_local(cfg: &SshConfig) -> bool {
+pub(crate) fn is_local(cfg: &SshConfig) -> bool {
     cfg.host.trim().is_empty()
 }
 
@@ -52,7 +52,7 @@ pub fn save_config(cfg: &SshConfig) -> Result<(), String> {
     std::fs::write(config_path(), json).map_err(|e| e.to_string())
 }
 
-fn ssh_base_args(cfg: &SshConfig) -> Vec<String> {
+pub(crate) fn ssh_base_args(cfg: &SshConfig) -> Vec<String> {
     let mut args = vec!["-p".to_string(), cfg.port.to_string()];
     if !cfg.identity_file.is_empty() {
         args.push("-i".to_string());
@@ -74,7 +74,7 @@ fn ssh_base_scp_args(cfg: &SshConfig) -> Vec<String> {
     args
 }
 
-fn run_command(mut cmd: Command) -> Result<String, String> {
+pub(crate) fn run_command(mut cmd: Command) -> Result<String, String> {
     let output = cmd.output().map_err(|e| format!("failed to run: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -193,7 +193,8 @@ pub fn run_remote_sql_json(cfg: &SshConfig, sql: &str) -> Result<Vec<serde_json:
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    serde_json::from_str(trimmed).map_err(|e| format!("could not parse sqlite3 JSON output: {e}\n{trimmed}"))
+    serde_json::from_str(trimmed)
+        .map_err(|e| format!("could not parse sqlite3 JSON output: {e}\n{trimmed}"))
 }
 
 fn run_sql_impl(cfg: &SshConfig, sql: &str, json: bool) -> Result<String, String> {

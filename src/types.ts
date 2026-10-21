@@ -88,3 +88,13 @@ export interface SpecAssignmentPayload {
   new_name: string | null;
   level_acquired: number;
 }
+
+// Mirrors src-tauri/src/deployed.rs.
+
+export interface DeployedClass {
+  filename: string;
+  class_ident: string;
+  name: string;
+  id: number;
+  base_class_name: string;
+}
