@@ -181,15 +181,35 @@ pub fn deploy_class_file(cfg: &SshConfig, filename: &str, content: &str) -> Resu
 /// rows this tool manages (ServerProperty, a trainer NPC spawn, starter equipment, a startup
 /// location) - not general-purpose SQL.
 pub fn run_remote_sql(cfg: &SshConfig, sql: &str) -> Result<String, String> {
+    run_sql_impl(cfg, sql, false)
+}
+
+/// Same as `run_remote_sql`, but requests sqlite3's `-json` output mode and parses it, for
+/// commands that need structured results (e.g. listing specializations) rather than a plain
+/// status string.
+pub fn run_remote_sql_json(cfg: &SshConfig, sql: &str) -> Result<Vec<serde_json::Value>, String> {
+    let text = run_sql_impl(cfg, sql, true)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(trimmed).map_err(|e| format!("could not parse sqlite3 JSON output: {e}\n{trimmed}"))
+}
+
+fn run_sql_impl(cfg: &SshConfig, sql: &str, json: bool) -> Result<String, String> {
     let db_path = Path::new(&cfg.remote_server_dir).join("data/opendaoc.sqlite3.db");
     if is_local(cfg) {
         // Passed as separate argv entries, not a shell string, so no escaping is needed at all.
         let mut cmd = Command::new("sqlite3");
+        if json {
+            cmd.arg("-json");
+        }
         cmd.arg(&db_path).arg(sql);
         return run_command(cmd);
     }
     let remote_cmd = format!(
-        "sqlite3 '{}' '{}'",
+        "sqlite3 {}'{}' '{}'",
+        if json { "-json " } else { "" },
         shell_escape(&db_path.to_string_lossy()),
         shell_escape(sql)
     );

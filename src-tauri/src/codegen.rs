@@ -115,9 +115,7 @@ pub fn generate(req: &CloneRequest) -> String {
     }
     if let Some(races) = &req.eligible_races {
         let same = races.len() == req.source.eligible_races.len()
-            && races
-                .iter()
-                .all(|r| req.source.eligible_races.contains(r));
+            && races.iter().all(|r| req.source.eligible_races.contains(r));
         if !same {
             let race_lines = races
                 .iter()

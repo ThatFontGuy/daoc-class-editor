@@ -1,10 +1,12 @@
 mod classdata;
 mod codegen;
 mod deploy;
+mod specs;
 
 use classdata::{ClassInfo, KnownOptions};
 use codegen::CloneRequest;
 use deploy::SshConfig;
+use specs::{ClassSpecRow, SpecAssignment, SpecializationRow};
 use tauri::Manager;
 
 fn resources_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -86,9 +88,40 @@ fn server_control(cfg: SshConfig, action: String) -> Result<String, String> {
     deploy::remote_server_control(&cfg, &action)
 }
 
+#[tauri::command]
+fn list_specializations(cfg: SshConfig) -> Result<Vec<SpecializationRow>, String> {
+    specs::list_specializations(&cfg)
+}
+
+#[tauri::command]
+fn list_class_specs(cfg: SshConfig, class_id: i64) -> Result<Vec<ClassSpecRow>, String> {
+    specs::list_class_specs(&cfg, class_id)
+}
+
+#[tauri::command]
+fn apply_class_specs(
+    cfg: SshConfig,
+    new_class_id: i64,
+    source_class_id: i64,
+    assignments: Vec<SpecAssignment>,
+) -> Result<String, String> {
+    specs::apply_class_specs(&cfg, new_class_id, source_class_id, &assignments)
+}
+
+#[tauri::command]
+fn save_project_file(path: String, json: String) -> Result<(), String> {
+    std::fs::write(&path, json).map_err(|e| format!("could not write {path}: {e}"))
+}
+
+#[tauri::command]
+fn load_project_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             list_classes,
@@ -103,6 +136,11 @@ pub fn run() {
             run_remote_sql,
             server_status,
             server_control,
+            list_specializations,
+            list_class_specs,
+            apply_class_specs,
+            save_project_file,
+            load_project_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

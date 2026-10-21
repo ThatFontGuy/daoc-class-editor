@@ -1,36 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ClassInfo, CloneRequest, KnownOptions, SshConfig, emptySshConfig } from "./types";
-
-type Overrides = {
-  profession: boolean;
-  primary_stat: boolean;
-  secondary_stat: boolean;
-  tertiary_stat: boolean;
-  mana_stat: boolean;
-  ws_base: boolean;
-  base_hp: boolean;
-  specialization_multiplier: boolean;
-  class_type: boolean;
-  is_focus_caster: boolean;
-  eligible_races: boolean;
-};
-
-const noOverrides: Overrides = {
-  profession: false,
-  primary_stat: false,
-  secondary_stat: false,
-  tertiary_stat: false,
-  mana_stat: false,
-  ws_base: false,
-  base_hp: false,
-  specialization_multiplier: false,
-  class_type: false,
-  is_focus_caster: false,
-  eligible_races: false,
-};
+import {
+  ClassInfo,
+  ClassSpecRow,
+  CloneRequest,
+  KnownOptions,
+  SpecAssignmentPayload,
+  SpecializationRow,
+  SshConfig,
+  emptySshConfig,
+} from "./types";
+import { Overrides, SpecAssignmentUI, useProject } from "./ProjectContext";
 
 export default function ClonePanel() {
+  const [project, setProject] = useProject();
   const [classes, setClasses] = useState<ClassInfo[]>([]);
   const [options, setOptions] = useState<KnownOptions>({
     stats: [],
@@ -38,29 +21,28 @@ export default function ClonePanel() {
     class_types: [],
     race_realms: {},
   });
-  const [sourceId, setSourceId] = useState<string>("");
-  const [newName, setNewName] = useState("");
-  const [newIdent, setNewIdent] = useState("");
-  const [newId, setNewId] = useState<number>(0);
-  const [overrides, setOverrides] = useState<Overrides>(noOverrides);
-  const [values, setValues] = useState<Record<string, string | number | boolean | string[]>>({});
-  const [code, setCode] = useState<string>("");
-  const [filename, setFilename] = useState("");
-  const [log, setLog] = useState<string>("");
   const [sshConfig, setSshConfig] = useState<SshConfig>(emptySshConfig);
   const [sql, setSql] = useState("");
+  const [log, setLog] = useState<string>("");
   const [busy, setBusy] = useState(false);
+
+  const [allSpecs, setAllSpecs] = useState<SpecializationRow[]>([]);
+  const [sourceSpecs, setSourceSpecs] = useState<ClassSpecRow[] | null>(null);
+  const [specLog, setSpecLog] = useState("");
 
   useEffect(() => {
     invoke<ClassInfo[]>("list_classes").then(setClasses);
     invoke<KnownOptions>("known_options").then(setOptions);
-    invoke<number>("suggest_next_id").then(setNewId);
     invoke<SshConfig>("load_ssh_config").then(setSshConfig);
+    if (project.newId === 0) {
+      invoke<number>("suggest_next_id").then((id) => setProject((p) => ({ ...p, newId: id })));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const source = useMemo(
-    () => classes.find((c) => c.class_ident === sourceId),
-    [classes, sourceId],
+    () => classes.find((c) => c.class_ident === project.sourceClassIdent),
+    [classes, project.sourceClassIdent],
   );
 
   const byRealm = useMemo(() => {
@@ -71,36 +53,40 @@ export default function ClonePanel() {
     return groups;
   }, [classes]);
 
-  async function onPickSource(id: string) {
-    setSourceId(id);
-    setOverrides(noOverrides);
-    setValues({});
-    setCode("");
+  function onPickSource(id: string) {
+    setProject((p) => ({
+      ...p,
+      sourceClassIdent: id,
+      generatedCode: "",
+    }));
+    setSourceSpecs(null);
   }
 
   async function onNameChange(name: string) {
-    setNewName(name);
-    if (name.trim()) {
-      const ident = await invoke<string>("sanitize_class_ident", { name });
-      setNewIdent(`Class${ident}`);
-    }
+    const ident = name.trim() ? await invoke<string>("sanitize_class_ident", { name }) : "";
+    setProject((p) => ({
+      ...p,
+      newName: name,
+      newIdent: ident ? `Class${ident}` : p.newIdent,
+    }));
   }
 
   function toggle(key: keyof Overrides) {
-    setOverrides({ ...overrides, [key]: !overrides[key] });
+    setProject((p) => ({ ...p, overrides: { ...p.overrides, [key]: !p.overrides[key] } }));
   }
 
   function setValue(key: string, v: string | number | boolean | string[]) {
-    setValues({ ...values, [key]: v });
+    setProject((p) => ({ ...p, values: { ...p.values, [key]: v } }));
   }
 
   async function generate() {
     if (!source) return;
+    const { overrides, values } = project;
     const req: CloneRequest = {
       source,
-      new_name: newName,
-      new_class_ident: newIdent,
-      new_id: newId,
+      new_name: project.newName,
+      new_class_ident: project.newIdent,
+      new_id: project.newId,
       base_class_name: source.base_class_name,
       profession: overrides.profession ? (values.profession as string) ?? null : null,
       primary_stat: overrides.primary_stat ? (values.primary_stat as string) ?? null : null,
@@ -117,8 +103,7 @@ export default function ClonePanel() {
       eligible_races: overrides.eligible_races ? (values.eligible_races as string[]) ?? [] : null,
     };
     const generated = await invoke<string>("generate_class_code", { req });
-    setCode(generated);
-    setFilename(`${newIdent}.cs`);
+    setProject((p) => ({ ...p, generatedCode: generated, filename: `${project.newIdent}.cs` }));
   }
 
   async function runAction(label: string, action: () => Promise<string>) {
@@ -134,10 +119,106 @@ export default function ClonePanel() {
     }
   }
 
+  async function loadSourceSpecs() {
+    if (!source) return;
+    setSpecLog("loading...");
+    try {
+      const [all, mine] = await Promise.all([
+        invoke<SpecializationRow[]>("list_specializations", { cfg: sshConfig }),
+        invoke<ClassSpecRow[]>("list_class_specs", { cfg: sshConfig, classId: source.id }),
+      ]);
+      setAllSpecs(all);
+      setSourceSpecs(mine);
+      // Pre-fill assignments from the source class's own specs, defaulting every one to "reuse"
+      // (same mechanics, shared with the source class) unless already customized.
+      if (project.specAssignments.length === 0) {
+        setProject((p) => ({
+          ...p,
+          specAssignments: mine.map((m) => ({
+            source_key: m.spec_key_name,
+            source_name: m.spec_name,
+            mode: "reuse",
+            new_key: "",
+            new_name: "",
+            level_acquired: m.level_acquired,
+            applied: false,
+          })),
+        }));
+      }
+      setSpecLog(`found ${mine.length} spec(s) on ${source.name}`);
+    } catch (e) {
+      setSpecLog(`error: ${e}`);
+    }
+  }
+
+  function updateSpecAssignment(index: number, patch: Partial<SpecAssignmentUI>) {
+    setProject((p) => ({
+      ...p,
+      specAssignments: p.specAssignments.map((a, i) =>
+        i === index ? { ...a, ...patch, applied: false } : a,
+      ),
+    }));
+  }
+
+  function removeSpecAssignment(index: number) {
+    setProject((p) => ({
+      ...p,
+      specAssignments: p.specAssignments.filter((_, i) => i !== index),
+    }));
+  }
+
+  function addBlankAssignment() {
+    setProject((p) => ({
+      ...p,
+      specAssignments: [
+        ...p.specAssignments,
+        {
+          source_key: allSpecs[0]?.key_name ?? "",
+          source_name: allSpecs[0]?.name ?? "",
+          mode: "reuse",
+          new_key: "",
+          new_name: "",
+          level_acquired: 0,
+          applied: false,
+        },
+      ],
+    }));
+  }
+
+  async function applySpecsToServer() {
+    if (!source) return;
+    setBusy(true);
+    setSpecLog("applying...");
+    try {
+      const payload: SpecAssignmentPayload[] = project.specAssignments.map((a) => ({
+        source_key: a.source_key,
+        mode: a.mode,
+        new_key: a.mode === "clone" ? a.new_key : null,
+        new_name: a.mode === "clone" ? a.new_name : null,
+        level_acquired: a.level_acquired,
+      }));
+      const result = await invoke<string>("apply_class_specs", {
+        cfg: sshConfig,
+        newClassId: project.newId,
+        sourceClassId: source.id,
+        assignments: payload,
+      });
+      setSpecLog(result || "done");
+      setProject((p) => ({
+        ...p,
+        specAssignments: p.specAssignments.map((a) => ({ ...a, applied: true })),
+      }));
+    } catch (e) {
+      setSpecLog(`error: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="panel">
       <h2>1. Pick a class to clone</h2>
-      <select value={sourceId} onChange={(e) => onPickSource(e.target.value)}>
+      <select value={project.sourceClassIdent} onChange={(e) => onPickSource(e.target.value)}>
         <option value="">-- choose a source class --</option>
         {Object.entries(byRealm).map(([realm, list]) => (
           <optgroup label={realm} key={realm}>
@@ -153,8 +234,8 @@ export default function ClonePanel() {
       {source && (
         <>
           <div className="source-summary">
-            <strong>{source.name}</strong> ({source.class_ident}) - realm: {source.realm},
-            profession: {source.profession ?? "-"}, stats: {source.primary_stat}/
+            <strong>{source.name}</strong> ({source.class_ident}, ID {source.id}) - realm:{" "}
+            {source.realm}, profession: {source.profession ?? "-"}, stats: {source.primary_stat}/
             {source.secondary_stat}/{source.tertiary_stat}, mana: {source.mana_stat ?? "-"}, WS
             base: {source.ws_base}, base HP: {source.base_hp}, type: {source.class_type}, focus
             caster: {String(source.is_focus_caster)}, races:{" "}
@@ -167,29 +248,142 @@ export default function ClonePanel() {
           <label className="field">
             <span>Display name (shown at character creation)</span>
             <input
-              value={newName}
+              value={project.newName}
               onChange={(e) => onNameChange(e.target.value)}
               placeholder="e.g. Grovekeeper"
             />
           </label>
           <label className="field">
             <span>C# class name (auto-derived, editable)</span>
-            <input value={newIdent} onChange={(e) => setNewIdent(e.target.value)} />
+            <input
+              value={project.newIdent}
+              onChange={(e) => setProject((p) => ({ ...p, newIdent: e.target.value }))}
+            />
           </label>
           <label className="field">
             <span>Class ID (must be unused - next free one is suggested)</span>
             <input
               type="number"
-              value={newId}
-              onChange={(e) => setNewId(Number(e.target.value))}
+              value={project.newId}
+              onChange={(e) => setProject((p) => ({ ...p, newId: Number(e.target.value) }))}
             />
           </label>
 
-          <h2>3. Everything below is inherited from {source.name} unless you check and change it</h2>
+          <h2>3. Spec lines</h2>
+          <p className="hint">
+            Specializations are assigned per class by raw numeric ID in the server's database,
+            with no inheritance from the class you're cloning - without this step your new class
+            would have no specs, no combat styles, and no weapon/armor proficiency at all, even
+            though the generated .cs file correctly subclasses {source.name}. "Reuse" shares the
+            exact same spec (and any edits to it) with every other class that already has it;
+            "Clone" makes an independent copy under a new name - its own spell lines/spells and
+            styles - that you can rename and, later, edit separately.
+          </p>
+          {sourceSpecs === null ? (
+            <button onClick={loadSourceSpecs} disabled={busy}>
+              Load {source.name}'s current specs
+            </button>
+          ) : (
+            <>
+              <table className="spec-table">
+                <thead>
+                  <tr>
+                    <th>Source spec</th>
+                    <th>Mode</th>
+                    <th>New name (if cloning)</th>
+                    <th>Level acquired</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {project.specAssignments.map((a, i) => (
+                    <tr key={i}>
+                      <td>
+                        <select
+                          value={a.source_key}
+                          onChange={(e) => {
+                            const picked = allSpecs.find((s) => s.key_name === e.target.value);
+                            updateSpecAssignment(i, {
+                              source_key: e.target.value,
+                              source_name: picked?.name ?? e.target.value,
+                            });
+                          }}
+                        >
+                          {allSpecs.map((s) => (
+                            <option value={s.key_name} key={s.key_name}>
+                              {s.name}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          value={a.mode}
+                          onChange={(e) =>
+                            updateSpecAssignment(i, { mode: e.target.value as "reuse" | "clone" })
+                          }
+                        >
+                          <option value="reuse">Reuse</option>
+                          <option value="clone">Clone &amp; rename</option>
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          disabled={a.mode !== "clone"}
+                          value={a.new_name}
+                          placeholder={a.mode === "clone" ? "e.g. Earthshatter" : "-"}
+                          onChange={(e) => {
+                            const new_name = e.target.value;
+                            const new_key = new_name
+                              .toLowerCase()
+                              .replace(/[^a-z0-9]+/g, "_")
+                              .replace(/^_+|_+$/g, "");
+                            updateSpecAssignment(i, { new_name, new_key });
+                          }}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          value={a.level_acquired}
+                          onChange={(e) =>
+                            updateSpecAssignment(i, { level_acquired: Number(e.target.value) })
+                          }
+                        />
+                      </td>
+                      <td>
+                        {a.applied ? (
+                          <span className="mode-badge" style={{ marginBottom: 0 }}>
+                            applied
+                          </span>
+                        ) : (
+                          <button onClick={() => removeSpecAssignment(i)}>Remove</button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="actions">
+                <button onClick={addBlankAssignment} disabled={allSpecs.length === 0}>
+                  + Add another spec
+                </button>
+                <button
+                  onClick={applySpecsToServer}
+                  disabled={busy || project.specAssignments.length === 0}
+                >
+                  Apply spec assignments to server
+                </button>
+              </div>
+              {specLog && <pre className="status">{specLog}</pre>}
+            </>
+          )}
+
+          <h2>4. Everything below is inherited from {source.name} unless you check and change it</h2>
           <div className="override-grid">
             <OverrideRow
               label="Profession (flavor text)"
-              checked={overrides.profession}
+              checked={project.overrides.profession}
               onToggle={() => toggle("profession")}
             >
               <input
@@ -200,7 +394,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Primary stat"
-              checked={overrides.primary_stat}
+              checked={project.overrides.primary_stat}
               onToggle={() => toggle("primary_stat")}
             >
               <StatSelect
@@ -212,7 +406,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Secondary stat"
-              checked={overrides.secondary_stat}
+              checked={project.overrides.secondary_stat}
               onToggle={() => toggle("secondary_stat")}
             >
               <StatSelect
@@ -224,7 +418,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Tertiary stat"
-              checked={overrides.tertiary_stat}
+              checked={project.overrides.tertiary_stat}
               onToggle={() => toggle("tertiary_stat")}
             >
               <StatSelect
@@ -236,7 +430,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Mana stat"
-              checked={overrides.mana_stat}
+              checked={project.overrides.mana_stat}
               onToggle={() => toggle("mana_stat")}
             >
               <StatSelect
@@ -248,7 +442,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Weapon skill base"
-              checked={overrides.ws_base}
+              checked={project.overrides.ws_base}
               onToggle={() => toggle("ws_base")}
             >
               <input
@@ -260,7 +454,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Base HP"
-              checked={overrides.base_hp}
+              checked={project.overrides.base_hp}
               onToggle={() => toggle("base_hp")}
             >
               <input
@@ -272,7 +466,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Specialization multiplier"
-              checked={overrides.specialization_multiplier}
+              checked={project.overrides.specialization_multiplier}
               onToggle={() => toggle("specialization_multiplier")}
             >
               <input
@@ -284,7 +478,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Class type"
-              checked={overrides.class_type}
+              checked={project.overrides.class_type}
               onToggle={() => toggle("class_type")}
             >
               <select
@@ -301,7 +495,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Focus caster"
-              checked={overrides.is_focus_caster}
+              checked={project.overrides.is_focus_caster}
               onToggle={() => toggle("is_focus_caster")}
             >
               <select
@@ -315,7 +509,7 @@ export default function ClonePanel() {
 
             <OverrideRow
               label="Eligible races"
-              checked={overrides.eligible_races}
+              checked={project.overrides.eligible_races}
               onToggle={() => toggle("eligible_races")}
             >
               <div className="race-checkboxes">
@@ -327,7 +521,7 @@ export default function ClonePanel() {
                         type="checkbox"
                         defaultChecked={source.effective_eligible_races.includes(r)}
                         onChange={(e) => {
-                          const current = (values.eligible_races as string[]) ?? [
+                          const current = (project.values.eligible_races as string[]) ?? [
                             ...source.effective_eligible_races,
                           ];
                           const next = e.target.checked
@@ -343,19 +537,27 @@ export default function ClonePanel() {
             </OverrideRow>
           </div>
 
-          <button onClick={generate} disabled={!newName || !newIdent}>
+          <button onClick={generate} disabled={!project.newName || !project.newIdent}>
             Generate code
           </button>
 
-          {code && (
+          {project.generatedCode && (
             <>
-              <h2>4. Preview</h2>
-              <textarea className="code-preview" readOnly value={code} rows={20} />
+              <h2>5. Preview</h2>
+              <textarea
+                className="code-preview"
+                readOnly
+                value={project.generatedCode}
+                rows={20}
+              />
 
-              <h2>5. Deploy</h2>
+              <h2>6. Deploy</h2>
               <label className="field">
                 <span>Filename in the server's scripts/ folder</span>
-                <input value={filename} onChange={(e) => setFilename(e.target.value)} />
+                <input
+                  value={project.filename}
+                  onChange={(e) => setProject((p) => ({ ...p, filename: e.target.value }))}
+                />
               </label>
               <div className="actions">
                 <button
@@ -381,11 +583,11 @@ export default function ClonePanel() {
                 <button
                   disabled={busy}
                   onClick={() =>
-                    runAction(`Deploy ${filename}`, () =>
+                    runAction(`Deploy ${project.filename}`, () =>
                       invoke<string>("deploy_class", {
                         cfg: sshConfig,
-                        filename,
-                        content: code,
+                        filename: project.filename,
+                        content: project.generatedCode,
                       }),
                     )
                   }

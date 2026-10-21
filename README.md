@@ -34,10 +34,23 @@ server source (`dotnet build`, 0 errors) before this tool's design was finalized
   specs, races, and profession text, parsed straight from the server's own source.
 - Generating a new class file via literal inheritance from any existing one, with a live code
   preview before you deploy anything.
-- Deploying the generated file to your server's `scripts/` folder and restarting it, over SSH.
+- **Spec line assignment** - the real fix this needed: specializations are assigned per class by
+  raw numeric ID in the server's database (`ClassXSpecialization`), with zero inheritance from
+  whatever the class's `.cs` file subclasses. Without this, a cloned class would have no specs, no
+  combat styles, and no weapon/armor proficiency at all. Pick each spec to **reuse** (the exact
+  same spec, shared with every class that already has it) or **clone & rename** (an independent
+  copy - its own `Specialization` row, `SpellLine`(s), `LineXSpell` entries, and `Style` rows,
+  with weapon/armor-class locks correctly repointed to the new class).
+- Deploying the generated file to your server's `scripts/` folder and restarting it, over SSH or
+  locally.
+- **Save/Load a project** (top-right of the window) - designing a class is something you iterate
+  into existence over multiple sessions, not finish in one sitting; a project file captures the
+  source class, every override, and every spec assignment so far.
 
-**Not automated** (genuinely needs your own design judgment, or a manual SQL step this tool gives
-you a box for, but doesn't have a dedicated form for yet):
+**Not automated yet** (planned next, see the phased plan in project history/issues, or ask):
+- Individual spell and melee-style *details* (damage, duration, range, growth rate, procs, etc.) -
+  currently you can only assign/clone whole spec lines, not edit what's inside them field by
+  field yet.
 - A trainer NPC spawn, starter equipment, and a starting location are needed for a smooth
   first-level experience - reuse an existing one via SQL (there's a "run SQL on the server" box
   for exactly this) or extend the class-editing form later.
@@ -59,8 +72,9 @@ you a box for, but doesn't have a dedicated form for yet):
      your existing SSH keys/agent, nothing is sent anywhere except directly to your own server.
    - Either way, also set the start/stop script's filename (`daoc-server.sh` by default, but may
      be renamed).
-4. In **Clone a class**, pick a source class, name your new one, override only what you want to
-   change, generate, preview, and deploy.
+4. In **Clone a class**: pick a source class, name your new one, assign its spec lines (reuse or
+   clone & rename each), override only what stat/race fields you want to change, generate,
+   preview, and deploy. Use **Save**/**Load** (top-right) any time to pick this back up later.
 
 ## Where the reference data comes from
 

@@ -65,3 +65,26 @@ export const emptySshConfig: SshConfig = {
   remote_server_dir: "",
   start_script_name: "daoc-server.sh",
 };
+
+// Mirrors src-tauri/src/specs.rs.
+
+export interface SpecializationRow {
+  key_name: string;
+  name: string;
+  description: string;
+  icon: number;
+}
+
+export interface ClassSpecRow {
+  spec_key_name: string;
+  spec_name: string;
+  level_acquired: number;
+}
+
+export interface SpecAssignmentPayload {
+  source_key: string;
+  mode: string;
+  new_key: string | null;
+  new_name: string | null;
+  level_acquired: number;
+}

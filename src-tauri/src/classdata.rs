@@ -185,7 +185,8 @@ pub fn parse_enum_ids(enum_file: &Path) -> (HashMap<String, i32>, i32) {
 fn parse_race_realms(path: &Path) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Ok(text) = std::fs::read_to_string(path) {
-        if let Ok(re) = Regex::new(r"eRace\.(\w+)\s*,\s*new\s+PlayerRace\(\s*eRace\.\w+\s*,\s*eRealm\.(\w+)")
+        if let Ok(re) =
+            Regex::new(r"eRace\.(\w+)\s*,\s*new\s+PlayerRace\(\s*eRace\.\w+\s*,\s*eRealm\.(\w+)")
         {
             for cap in re.captures_iter(&text) {
                 map.insert(cap[1].to_string(), cap[2].to_string());
@@ -291,21 +292,22 @@ pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
     let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
     // Scoped to just the `enum eClassType { ... }` block, not the whole interface file, so an
     // unrelated trailing-comma line elsewhere can't sneak in as a false match.
-    let class_types = std::fs::read_to_string(resources_dir.join("core").join("ICharacterClass.cs"))
-        .ok()
-        .and_then(|text| {
-            let start = text.find("enum eClassType")?;
-            let open = text[start..].find('{')? + start;
-            let close = text[open..].find('}')? + open;
-            let block = &text[open..close];
-            let re = Regex::new(r"(?m)^\s*(\w+)\s*,?\s*$").ok()?;
-            Some(
-                re.captures_iter(block)
-                    .map(|c| c[1].to_string())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .unwrap_or_default();
+    let class_types =
+        std::fs::read_to_string(resources_dir.join("core").join("ICharacterClass.cs"))
+            .ok()
+            .and_then(|text| {
+                let start = text.find("enum eClassType")?;
+                let open = text[start..].find('{')? + start;
+                let close = text[open..].find('}')? + open;
+                let block = &text[open..close];
+                let re = Regex::new(r"(?m)^\s*(\w+)\s*,?\s*$").ok()?;
+                Some(
+                    re.captures_iter(block)
+                        .map(|c| c[1].to_string())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
     KnownOptions {
         stats,
         races,
@@ -428,7 +430,9 @@ mod tests {
         assert_eq!(viking.realm, "Midgard", "folder-based realm would say Base");
         assert_eq!(
             viking.eligible_races,
-            vec!["Dwarf", "Frostalf", "Kobold", "Deifrang", "Norseman", "Troll", "Valkyn"]
+            vec![
+                "Dwarf", "Frostalf", "Kobold", "Deifrang", "Norseman", "Troll", "Valkyn"
+            ]
         );
 
         let warrior = classes
@@ -470,7 +474,10 @@ mod tests {
     #[test]
     fn next_free_id_is_above_highest_known() {
         let id = next_free_id(&resources());
-        assert!(id >= 64, "expected next free id >= 64 (Sluaghbinder is 63), got {id}");
+        assert!(
+            id >= 64,
+            "expected next free id >= 64 (Sluaghbinder is 63), got {id}"
+        );
     }
 }
 
@@ -487,7 +494,11 @@ mod known_options_tests {
         assert!(opts.stats.contains(&"STR".to_string()));
         assert!(opts.stats.contains(&"INT".to_string()));
         assert!(opts.stats.contains(&"ACU".to_string()));
-        assert!(!opts.stats.iter().any(|s| s.starts_with('_')), "{:?}", opts.stats);
+        assert!(
+            !opts.stats.iter().any(|s| s.starts_with('_')),
+            "{:?}",
+            opts.stats
+        );
 
         assert!(opts.races.contains(&"Celt".to_string()));
         assert!(opts.races.contains(&"Firbolg".to_string()));
@@ -500,9 +511,18 @@ mod known_options_tests {
             opts.class_types
         );
 
-        assert_eq!(opts.race_realms.get("Celt").map(String::as_str), Some("Hibernia"));
-        assert_eq!(opts.race_realms.get("Troll").map(String::as_str), Some("Midgard"));
-        assert_eq!(opts.race_realms.get("Briton").map(String::as_str), Some("Albion"));
+        assert_eq!(
+            opts.race_realms.get("Celt").map(String::as_str),
+            Some("Hibernia")
+        );
+        assert_eq!(
+            opts.race_realms.get("Troll").map(String::as_str),
+            Some("Midgard")
+        );
+        assert_eq!(
+            opts.race_realms.get("Briton").map(String::as_str),
+            Some("Albion")
+        );
         assert_eq!(opts.race_realms.len(), 21, "{:?}", opts.race_realms);
     }
 }
