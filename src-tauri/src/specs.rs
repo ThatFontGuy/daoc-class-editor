@@ -8,16 +8,25 @@
 //! not carry this over; it has to be done here, as data.
 //!
 //! Every spec assignment is a full, independent clone - the Specialization row itself, its
-//! SpellLine(s), their LineXSpell entries, and its Style (melee skill) rows are all duplicated
-//! under a new KeyName/display Name the caller chooses. This used to also offer a "reuse" mode
-//! (sharing the exact same spec/styles with the source class, no duplication) - removed after a
-//! real, reproduced bug: `SkillBase.GetStyleList(specID, classId)` looks up a class-locked
-//! style's availability by an *exact* class-ID match, so a reused spec whose styles are locked to
-//! the *source* class's ID (a very common case for any real combat spec) would train and show a
-//! level, but its styles would never actually appear for the new class at all - silently,
-//! nothing in the UI or server logs flags it. Cloning always repoints a class-locked style's
-//! ClassId to the new class, so this can't happen. Procs (StyleXSpell) are not cloned yet - a
-//! known gap, noted in the UI.
+//! SpellLine(s), their LineXSpell entries, its Style (melee skill) rows, and its SpecXAbility
+//! (level-granted abilities, e.g. Stealth's "Safe Fall"/"Detect Hidden", or a "Career" spec's
+//! auto-trained bonuses) are all duplicated under a new KeyName/display Name the caller chooses.
+//! This used to also offer a "reuse" mode (sharing the exact same spec/styles with the source
+//! class, no duplication) - removed after a real, reproduced bug: `SkillBase.GetStyleList(specID,
+//! classId)` looks up a class-locked style's availability by an *exact* class-ID match, so a
+//! reused spec whose styles are locked to the *source* class's ID (a very common case for any
+//! real combat spec) would train and show a level, but its styles would never actually appear
+//! for the new class at all - silently, nothing in the UI or server logs flags it. Cloning always
+//! repoints a class-locked style's (and ability's - the exact same bug class applies to
+//! SpecXAbility's own ClassId) ClassId to the new class, so this can't happen. Procs
+//! (StyleXSpell) are not cloned yet - a known gap, noted in the UI.
+//!
+//! Renaming a spec that's already assigned to the class being edited does *not* remove the old
+//! ClassXSpecialization assignment under its original key - a real, reproduced bug found live:
+//! editing an existing class and re-cloning one of its own already-assigned specs under a new
+//! name (e.g. "Stealth" -> "stealth_64") leaves *both* assigned, so the same ability shows twice
+//! (and any points already trained stay split across both keys). The caller must explicitly
+//! remove the old assignment itself if a rename is meant to replace it, not just add to it.
 
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use serde::{Deserialize, Serialize};
@@ -227,6 +236,36 @@ pub fn apply_class_specs(
         // for a given class, never a spec shared by other classes.
         let final_key = format!("{}_{new_class_id}", a.new_key);
         clone_spec(cfg, &a.source_key, &final_key, &a.new_name, new_class_id)?;
+
+        // If this class already had the *source* spec assigned directly (this rename is meant to
+        // replace it, not just add alongside it), remove that old assignment - a real bug found
+        // live: leaving it meant the same ability showed up twice (e.g. "Stealth" appearing
+        // twice on the character sheet), with any already-trained points left split across both
+        // keys instead of following the rename. This only removes the ClassXSpecialization row,
+        // never the source spec's own Specialization/Style/etc rows (which may still be used by
+        // other classes) - same "only remove what's safe" caution as delete_deployed_class.
+        let source_key_q = sql_quote(&a.source_key);
+        let existing = run_remote_sql_json(
+            cfg,
+            &format!(
+                "SELECT 1 FROM ClassXSpecialization WHERE ClassID = {new_class_id} AND SpecKeyName = '{source_key_q}';"
+            ),
+        )?;
+        if !existing.is_empty() {
+            run_remote_sql(
+                cfg,
+                &format!(
+                    "DELETE FROM ClassXSpecialization WHERE ClassID = {new_class_id} AND SpecKeyName = '{source_key_q}';"
+                ),
+            )?;
+            log.push_str(&format!(
+                "removed the old '{}' assignment this class already had - note: any points a \
+                 character already trained under that key are NOT migrated automatically, check \
+                 DOLCharacters.SerializedSpecs for characters on this class\n",
+                a.source_key
+            ));
+        }
+
         let sql = format!(
             "INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) VALUES ({new_class_id}, '{}', {});",
             sql_quote(&final_key),
@@ -328,6 +367,23 @@ fn clone_spec(
          FROM Style WHERE SpecKeyName = '{source_key_q}' GROUP BY Name, SpecLevelRequirement;\n"
     ));
 
+    // SpecXAbility: level-granted abilities (e.g. Stealth's "Safe Fall"/"Detect Hidden"/etc.,
+    // or a "Career" spec's auto-trained bonuses like Evade) - a real, confirmed gap found live:
+    // cloning a spec with these (any Implementation, not just plain combat specs) silently
+    // dropped every one of them, since this table was never touched by cloning at all. Carries
+    // the exact same two real bugs Style already had to guard against, confirmed with the same
+    // live data shape: a non-zero ClassId locks an ability to that *exact* class only (so any
+    // non-zero lock must repoint to the new class, unconditionally), and the same
+    // (AbilityKey, SpecLevel, AbilityLevel) is frequently duplicated once per originally-eligible
+    // class (Stealth's 35 real rows are only 9 distinct abilities, repeated across 3-4 classes
+    // each) - GROUP BY collapses that before cloning, same as Style.
+    let ability_class_expr = format!("CASE WHEN ClassId != 0 THEN {new_class_id} ELSE 0 END");
+    batch.push_str(&format!(
+        "INSERT INTO SpecXAbility (Spec, SpecLevel, AbilityKey, AbilityLevel, ClassId) \
+         SELECT '{new_key_q}', SpecLevel, AbilityKey, AbilityLevel, {ability_class_expr} \
+         FROM SpecXAbility WHERE Spec = '{source_key_q}' GROUP BY AbilityKey, SpecLevel, AbilityLevel;\n"
+    ));
+
     run_remote_sql(cfg, &batch)?;
     Ok(())
 }
@@ -390,6 +446,8 @@ mod tests {
                 OpeningRequirementType INTEGER, OpeningRequirementValue INTEGER, AttackResultRequirement INTEGER,
                 WeaponTypeRequirement INTEGER, GrowthOffset REAL, GrowthRate REAL, BonusToHit INTEGER,
                 BonusToDefense INTEGER, TwoHandAnimation INTEGER, RandomProc INTEGER, ArmorHitLocation INTEGER);
+            CREATE TABLE SpecXAbility (SpecXabilityID INTEGER PRIMARY KEY AUTOINCREMENT, Spec TEXT, SpecLevel INTEGER,
+                AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
 
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL, 0);
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL, 0);
@@ -603,6 +661,105 @@ mod tests {
             64,
             "a style locked to an unrelated third class must still repoint to the new class"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clone_deep_clones_and_repoints_spec_x_ability() {
+        // Mirrors the Style repoint/dedup test, but for SpecXAbility - a real, confirmed gap
+        // found live: a Stealth-type clone silently dropped every one of its level-granted
+        // abilities (35 real rows, Safe Fall/Detect Hidden/etc.) since SpecXAbility was never
+        // cloned at all. The real data also had the exact same (AbilityKey, SpecLevel) once per
+        // originally-eligible class (e.g. "Safe Fall" at level 10 repeated across 4 classes), so
+        // this also confirms the clone collapses those into one row per ability, repointed to
+        // the new class.
+        let dir = setup_test_db("clone-spec-ability");
+        let cfg = test_cfg(&dir);
+        let sql = "
+            INSERT INTO SpecXAbility (Spec, SpecLevel, AbilityKey, AbilityLevel, ClassId) VALUES ('slash', 10, 'SafeFall', 1, 9);
+            INSERT INTO SpecXAbility (Spec, SpecLevel, AbilityKey, AbilityLevel, ClassId) VALUES ('slash', 10, 'SafeFall', 1, 23);
+            INSERT INTO SpecXAbility (Spec, SpecLevel, AbilityKey, AbilityLevel, ClassId) VALUES ('slash', 10, 'SafeFall', 1, 49);
+            INSERT INTO SpecXAbility (Spec, SpecLevel, AbilityKey, AbilityLevel, ClassId) VALUES ('slash', 5, 'Evade', 2, 0);
+        ";
+        let status = Command::new("sqlite3")
+            .arg(dir.join("data/opendaoc.sqlite3.db"))
+            .arg(sql)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let assignments = vec![SpecAssignment {
+            source_key: "slash".to_string(),
+            new_key: "earthshatter".to_string(),
+            new_name: "Earthshatter".to_string(),
+            level_acquired: 0,
+        }];
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
+
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT AbilityKey, ClassId FROM SpecXAbility WHERE Spec='earthshatter_64' ORDER BY AbilityKey;",
+        )
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "three duplicate rows for the same ability must collapse to one, not {rows:?}"
+        );
+        let safe_fall = rows
+            .iter()
+            .find(|r| str_field(r, "AbilityKey") == "SafeFall")
+            .unwrap();
+        assert_eq!(
+            int_field(safe_fall, "ClassId"),
+            64,
+            "a class-locked ability must repoint to the new class"
+        );
+        let evade = rows
+            .iter()
+            .find(|r| str_field(r, "AbilityKey") == "Evade")
+            .unwrap();
+        assert_eq!(
+            int_field(evade, "ClassId"),
+            0,
+            "an unrestricted (ClassId=0) ability must stay unrestricted"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn renaming_an_already_assigned_spec_removes_the_old_assignment() {
+        // Reproduces a real bug found live: editing an existing class and re-cloning one of its
+        // own already-assigned specs under a new name (e.g. "Stealth" -> "stealth_64") left both
+        // the old and new ClassXSpecialization rows in place, so the same ability showed up
+        // twice on the character sheet.
+        let dir = setup_test_db("rename-already-assigned");
+        let cfg = test_cfg(&dir);
+        let sql = "INSERT INTO ClassXSpecialization VALUES (64, 'slash', -9);";
+        let status = Command::new("sqlite3")
+            .arg(dir.join("data/opendaoc.sqlite3.db"))
+            .arg(sql)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let assignments = vec![SpecAssignment {
+            source_key: "slash".to_string(),
+            new_key: "earthshatter".to_string(),
+            new_name: "Earthshatter".to_string(),
+            level_acquired: -9,
+        }];
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
+
+        let rows = list_class_specs(&cfg, 64).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the old 'slash' assignment must be removed, not left alongside the rename: {rows:?}"
+        );
+        assert_eq!(rows[0].spec_key_name, "earthshatter_64");
 
         std::fs::remove_dir_all(&dir).ok();
     }
