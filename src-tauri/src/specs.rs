@@ -183,6 +183,12 @@ fn clone_spec(
     // actually locked to three different classes, none of them the source or destination) - so
     // repoint *any* non-zero lock to the new class unconditionally. ClassId 0 (genuinely
     // unrestricted) is left as-is.
+    //
+    // GROUP BY Name, SpecLevelRequirement collapses exactly that "same style, one row per
+    // originally-eligible class" pattern into a single row before the clone - without it, cloning
+    // a spec like that would produce several duplicate, identically-named styles all now locked
+    // to the same new class (confirmed real: Celtic Dual has every style name three times, once
+    // per class, with every other field - EnduranceCost, Icon, etc. - identical between them).
     let style_class_expr = format!("CASE WHEN ClassId != 0 THEN {new_class_id} ELSE 0 END");
     batch.push_str(&format!(
         "INSERT INTO Style (ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, EnduranceCost, \
@@ -193,7 +199,7 @@ fn clone_spec(
          StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
          WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, \
          RandomProc, ArmorHitLocation \
-         FROM Style WHERE SpecKeyName = '{source_key_q}';\n"
+         FROM Style WHERE SpecKeyName = '{source_key_q}' GROUP BY Name, SpecLevelRequirement;\n"
     ));
 
     run_remote_sql(cfg, &batch)?;
@@ -366,12 +372,18 @@ mod tests {
         // cloned from Shadowblade, but its styles were locked to three *other* classes entirely -
         // not Shadowblade, not the new class. The old repoint logic only handled a lock matching
         // the literal class being cloned *from*, so it would have copied this style over still
-        // locked to a class that isn't the new one either - just as invisible as before.
+        // locked to a class that isn't the new one either - just as invisible as before. The real
+        // data also had the exact same style (same name/level/every other field) once per
+        // eligible class - three rows for "Misty Gloom" alone - so this also confirms the clone
+        // collapses those into one row instead of producing three duplicates all locked to the
+        // same new class.
         let dir = setup_test_db("clone-third-party-lock");
         let cfg = test_cfg(&dir);
         let sql = "
             INSERT INTO Specialization VALUES ('dual', 'Celtic Dual', 'Dual wield', 300, NULL);
             INSERT INTO Style VALUES (NULL, 999, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
+            INSERT INTO Style VALUES (NULL, 888, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
+            INSERT INTO Style VALUES (NULL, 777, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
         ";
         let status = Command::new("sqlite3")
             .arg(dir.join("data/opendaoc.sqlite3.db"))
@@ -386,8 +398,8 @@ mod tests {
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
         }];
-        // 999 is neither a class involved in the clone request at all - exactly the real-world
-        // case this guards against.
+        // 999/888/777 are neither a class involved in the clone request at all - exactly the
+        // real-world case this guards against.
         apply_class_specs(&cfg, 64, &assignments).unwrap();
 
         let rows = run_remote_sql_json(
@@ -395,7 +407,11 @@ mod tests {
             "SELECT ClassId FROM Style WHERE SpecKeyName='nosferatusclaw_64';",
         )
         .unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.len(),
+            1,
+            "three same-name/level rows for different classes must collapse to one, not {rows:?}"
+        );
         assert_eq!(
             int_field(&rows[0], "ClassId"),
             64,
