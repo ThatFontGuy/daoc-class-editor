@@ -89,9 +89,8 @@ export interface ClassSpecRow {
 
 export interface SpecAssignmentPayload {
   source_key: string;
-  mode: string;
-  new_key: string | null;
-  new_name: string | null;
+  new_key: string;
+  new_name: string;
   level_acquired: number;
 }
 

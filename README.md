@@ -49,10 +49,16 @@ deployment path was confirmed against a real running server after an early mix-u
 - **Spec line assignment** - the real fix this needed: specializations are assigned per class by
   raw numeric ID in the server's database (`ClassXSpecialization`), with zero inheritance from
   whatever the class's `.cs` file subclasses. Without this, a cloned class would have no specs, no
-  combat styles, and no weapon/armor proficiency at all. Pick each spec to **reuse** (the exact
-  same spec, shared with every class that already has it) or **clone & rename** (an independent
-  copy - its own `Specialization` row, `SpellLine`(s), `LineXSpell` entries, and `Style` rows,
-  with weapon/armor-class locks correctly repointed to the new class).
+  combat styles, and no weapon/armor proficiency at all. Every spec you add is always cloned -
+  its own independent copy of the `Specialization` row, `SpellLine`(s), `LineXSpell` entries, and
+  `Style` rows - which you can rename (and, later, edit separately). This used to also offer
+  "reuse" (sharing the exact same spec, unchanged, with the class you cloned from), but that was
+  removed after a real, reproduced bug: the server looks up whether a class can use a style by an
+  *exact* class-ID match, so a reused spec whose styles happened to be locked to some other class
+  (not even necessarily the class you cloned from - a shared spec can be locked to an entirely
+  unrelated third class) would train and show a level with zero usable styles, invisibly, with no
+  error anywhere. Cloning always repoints any class-locked style to your new class, so this can't
+  happen.
 - Deploying the generated file to your server's `bin/scripts/` folder and restarting it, over
   SSH or locally.
 - **Listing, editing, and deleting already-deployed classes** - a "Deployed classes" tab lists
@@ -63,9 +69,8 @@ deployment path was confirmed against a real running server after an early mix-u
   it actually subclasses - change what you want and redeploy. **Delete** removes the `.cs` file,
   its `ClassXSpecialization` rows, and - optionally - every `Specialization`/`SpellLine`/
   `LineXSpell`/`Style` row this tool cloned specifically for it (identified precisely, because
-  cloned spec keys always embed the owning class's ID, e.g. `earthshatter_64` - a reused spec
-  shared with other classes is never touched). Handy for fixing or cleaning up a clone that
-  didn't work out while debugging, or just as routine housekeeping.
+  cloned spec keys always embed the owning class's ID, e.g. `earthshatter_64`). Handy for fixing
+  or cleaning up a clone that didn't work out while debugging, or just as routine housekeeping.
 - **Save/Load a project** (top-right of the window) - designing a class is something you iterate
   into existence over multiple sessions, not finish in one sitting; a project file captures the
   source class, every override, and every spec assignment so far.
@@ -107,8 +112,9 @@ deployment path was confirmed against a real running server after an early mix-u
      your existing SSH keys/agent, nothing is sent anywhere except directly to your own server.
    - Either way, also set the start/stop script's filename (`daoc-server.sh` by default, but may
      be renamed).
-4. In **Clone a class**: pick a source class, name your new one, assign its spec lines (reuse or
-   clone & rename each), override only what stat/race fields you want to change, generate,
+4. In **Clone a class**: pick a source class, name your new one, assign its spec lines (each
+   clones as its own independent copy, optionally rename each), override only what stat/race
+   fields you want to change, generate,
    preview, and deploy. Use **Save**/**Load** (top-right) any time to pick this back up later.
 
 ## Where the reference data comes from

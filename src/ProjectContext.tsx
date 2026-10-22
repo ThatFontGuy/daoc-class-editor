@@ -36,8 +36,6 @@ export const noOverrides: Overrides = {
 export interface SpecAssignmentUI {
   source_key: string;
   source_name: string;
-  mode: "reuse" | "clone";
-  new_key: string;
   new_name: string;
   level_acquired: number;
   /** Set once "Apply to server" has run for this assignment, so re-applying is a visible choice. */

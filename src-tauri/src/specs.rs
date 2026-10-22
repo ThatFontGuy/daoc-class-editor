@@ -7,13 +7,17 @@
 //! until ClassXSpecialization rows exist for its own new ID. Literal C# inheritance alone does
 //! not carry this over; it has to be done here, as data.
 //!
-//! Two ways to assign a spec to the new class:
-//!   - "reuse": the exact same spec line the source class has, shared with every other class
-//!     that already uses it (same KeyName) - simplest, no duplication, but renaming it would
-//!     rename it for everyone.
-//!   - "clone": a full, independent copy under a new KeyName/display Name - the Specialization
-//!     row itself, its SpellLine(s), their LineXSpell entries, and its Style (melee skill) rows
-//!     are all duplicated. Procs (StyleXSpell) are not cloned yet - a known gap, noted in the UI.
+//! Every spec assignment is a full, independent clone - the Specialization row itself, its
+//! SpellLine(s), their LineXSpell entries, and its Style (melee skill) rows are all duplicated
+//! under a new KeyName/display Name the caller chooses. This used to also offer a "reuse" mode
+//! (sharing the exact same spec/styles with the source class, no duplication) - removed after a
+//! real, reproduced bug: `SkillBase.GetStyleList(specID, classId)` looks up a class-locked
+//! style's availability by an *exact* class-ID match, so a reused spec whose styles are locked to
+//! the *source* class's ID (a very common case for any real combat spec) would train and show a
+//! level, but its styles would never actually appear for the new class at all - silently,
+//! nothing in the UI or server logs flags it. Cloning always repoints a class-locked style's
+//! ClassId to the new class, so this can't happen. Procs (StyleXSpell) are not cloned yet - a
+//! known gap, noted in the UI.
 
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use serde::{Deserialize, Serialize};
@@ -37,11 +41,8 @@ pub struct ClassSpecRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecAssignment {
     pub source_key: String,
-    /// "reuse" or "clone".
-    pub mode: String,
-    /// Required when mode is "clone".
-    pub new_key: Option<String>,
-    pub new_name: Option<String>,
+    pub new_key: String,
+    pub new_name: String,
     pub level_acquired: i64,
 }
 
@@ -96,70 +97,34 @@ fn sql_quote(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Applies a full set of spec assignments to `new_class_id`, cloning spec lines/spell
-/// lines/styles as needed. Runs as one multi-statement SQL batch per assignment (sqlite3 accepts
-/// semicolon-separated statements in a single invocation), so a clone's several INSERTs either
-/// all land or the batch fails visibly - not a silent partial clone.
+/// Applies a full set of spec assignments to `new_class_id` - every one is a clone (see the
+/// module doc comment for why "reuse" was removed). Runs as one multi-statement SQL batch per
+/// assignment (sqlite3 accepts semicolon-separated statements in a single invocation), so a
+/// clone's several INSERTs either all land or the batch fails visibly - not a silent partial
+/// clone.
 pub fn apply_class_specs(
     cfg: &SshConfig,
     new_class_id: i64,
-    source_class_id: i64,
     assignments: &[SpecAssignment],
 ) -> Result<String, String> {
     let mut log = String::new();
     for a in assignments {
-        match a.mode.as_str() {
-            "reuse" => {
-                let sql = format!(
-                    "INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) VALUES ({new_class_id}, '{}', {});",
-                    sql_quote(&a.source_key),
-                    a.level_acquired
-                );
-                run_remote_sql(cfg, &sql)?;
-                log.push_str(&format!(
-                    "reused {} at level {}\n",
-                    a.source_key, a.level_acquired
-                ));
-            }
-            "clone" => {
-                let raw_new_key = a
-                    .new_key
-                    .clone()
-                    .ok_or("a clone assignment needs new_key")?;
-                let new_name = a
-                    .new_name
-                    .clone()
-                    .ok_or("a clone assignment needs new_name")?;
-                // Embedding the new class's ID directly in the stored KeyName (not just the
-                // spell lines under it) gives every row this clone creates a reliable,
-                // greppable suffix - `delete_deployed_class` relies on exactly this to find and
-                // remove only what was cloned for a given class, never a reused/shared spec.
-                let final_key = format!("{raw_new_key}_{new_class_id}");
-                clone_spec(
-                    cfg,
-                    &a.source_key,
-                    &final_key,
-                    &new_name,
-                    source_class_id,
-                    new_class_id,
-                )?;
-                let sql = format!(
-                    "INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) VALUES ({new_class_id}, '{}', {});",
-                    sql_quote(&final_key),
-                    a.level_acquired
-                );
-                run_remote_sql(cfg, &sql)?;
-                log.push_str(&format!(
-                    "cloned {} -> {} ('{}') at level {}\n",
-                    a.source_key, final_key, new_name, a.level_acquired
-                ));
-            }
-            other => {
-                return Err(format!(
-                    "unknown assignment mode '{other}' (expected reuse or clone)"
-                ));
-            }
-        }
+        // Embedding the new class's ID directly in the stored KeyName (not just the spell lines
+        // under it) gives every row this clone creates a reliable, greppable suffix -
+        // `delete_deployed_class` relies on exactly this to find and remove only what was cloned
+        // for a given class, never a spec shared by other classes.
+        let final_key = format!("{}_{new_class_id}", a.new_key);
+        clone_spec(cfg, &a.source_key, &final_key, &a.new_name, new_class_id)?;
+        let sql = format!(
+            "INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) VALUES ({new_class_id}, '{}', {});",
+            sql_quote(&final_key),
+            a.level_acquired
+        );
+        run_remote_sql(cfg, &sql)?;
+        log.push_str(&format!(
+            "cloned {} -> {} ('{}') at level {}\n",
+            a.source_key, final_key, a.new_name, a.level_acquired
+        ));
     }
     Ok(log)
 }
@@ -172,7 +137,6 @@ fn clone_spec(
     source_key: &str,
     new_key: &str,
     new_name: &str,
-    source_class_id: i64,
     new_class_id: i64,
 ) -> Result<(), String> {
     let source_key_q = sql_quote(source_key);
@@ -210,21 +174,16 @@ fn clone_spec(
         ));
     }
 
-    // Styles: ClassId on the source row, if it equals the source class, means that style was
-    // itself locked to that one class - the clone should lock to the new class instead. ClassId
-    // 0 (unrestricted, shared) is left as-is.
-    let styles = run_remote_sql_json(
-        cfg,
-        &format!("SELECT ClassId FROM Style WHERE SpecKeyName = '{source_key_q}';"),
-    )?;
-    let any_class_locked = styles
-        .iter()
-        .any(|s| int_field(s, "ClassId") == source_class_id);
-    let style_class_expr = if any_class_locked {
-        format!("CASE WHEN ClassId = {source_class_id} THEN {new_class_id} ELSE ClassId END")
-    } else {
-        "ClassId".to_string()
-    };
+    // Styles: any non-zero ClassId locks a style to that *exact* class only - confirmed in the
+    // real server source (Specialization.GetStylesForLiving only falls back to the ClassId=0
+    // bucket when the player's own class has zero styles at all, so a non-matching lock hides a
+    // style completely, silently). This isn't limited to styles locked to whatever class we're
+    // cloning *from* - a spec can carry styles locked to an entirely unrelated third class (a
+    // real, reproduced case: cloning "Celtic Dual" from a Midgard class, whose styles are
+    // actually locked to three different classes, none of them the source or destination) - so
+    // repoint *any* non-zero lock to the new class unconditionally. ClassId 0 (genuinely
+    // unrestricted) is left as-is.
+    let style_class_expr = format!("CASE WHEN ClassId != 0 THEN {new_class_id} ELSE 0 END");
     batch.push_str(&format!(
         "INSERT INTO Style (ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, EnduranceCost, \
          StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
@@ -323,41 +282,17 @@ mod tests {
     }
 
     #[test]
-    fn reuse_assignment_inserts_a_plain_classxspecialization_row() {
-        let dir = setup_test_db("reuse");
-        let cfg = test_cfg(&dir);
-
-        let assignments = vec![SpecAssignment {
-            source_key: "slash".to_string(),
-            mode: "reuse".to_string(),
-            new_key: None,
-            new_name: None,
-            level_acquired: 0,
-        }];
-        apply_class_specs(&cfg, 64, 1, &assignments).unwrap();
-
-        let new_specs = list_class_specs(&cfg, 64).unwrap();
-        assert_eq!(new_specs.len(), 1);
-        assert_eq!(new_specs[0].spec_key_name, "slash");
-        // Reuse must not duplicate the Specialization row itself - still exactly 2 total.
-        assert_eq!(list_specializations(&cfg).unwrap().len(), 2);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn clone_assignment_deep_clones_spec_spellline_and_styles() {
         let dir = setup_test_db("clone-melee");
         let cfg = test_cfg(&dir);
 
         let assignments = vec![SpecAssignment {
             source_key: "slash".to_string(),
-            mode: "clone".to_string(),
-            new_key: Some("earthshatter".to_string()),
-            new_name: Some("Earthshatter".to_string()),
+            new_key: "earthshatter".to_string(),
+            new_name: "Earthshatter".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, 1, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
 
         // The new Specialization row exists, independent from the source.
         let all_specs = list_specializations(&cfg).unwrap();
@@ -426,18 +361,62 @@ mod tests {
     }
 
     #[test]
+    fn clone_repoints_a_style_locked_to_an_unrelated_third_class_too() {
+        // Reproduces a real bug found live: "Celtic Dual" was reused (not cloned) by a class
+        // cloned from Shadowblade, but its styles were locked to three *other* classes entirely -
+        // not Shadowblade, not the new class. The old repoint logic only handled a lock matching
+        // the literal class being cloned *from*, so it would have copied this style over still
+        // locked to a class that isn't the new one either - just as invisible as before.
+        let dir = setup_test_db("clone-third-party-lock");
+        let cfg = test_cfg(&dir);
+        let sql = "
+            INSERT INTO Specialization VALUES ('dual', 'Celtic Dual', 'Dual wield', 300, NULL);
+            INSERT INTO Style VALUES (NULL, 999, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
+        ";
+        let status = Command::new("sqlite3")
+            .arg(dir.join("data/opendaoc.sqlite3.db"))
+            .arg(sql)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let assignments = vec![SpecAssignment {
+            source_key: "dual".to_string(),
+            new_key: "nosferatusclaw".to_string(),
+            new_name: "Nosferatu's Claw".to_string(),
+            level_acquired: 0,
+        }];
+        // 999 is neither a class involved in the clone request at all - exactly the real-world
+        // case this guards against.
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
+
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT ClassId FROM Style WHERE SpecKeyName='nosferatusclaw_64';",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            int_field(&rows[0], "ClassId"),
+            64,
+            "a style locked to an unrelated third class must still repoint to the new class"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn clone_assignment_deep_clones_spell_line_and_its_spells() {
         let dir = setup_test_db("clone-caster");
         let cfg = test_cfg(&dir);
 
         let assignments = vec![SpecAssignment {
             source_key: "smite".to_string(),
-            mode: "clone".to_string(),
-            new_key: Some("frostbolt_tree".to_string()),
-            new_name: Some("Frostbolt Tree".to_string()),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, 1, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
 
         let lines = run_remote_sql_json(
             &cfg,
@@ -471,23 +450,6 @@ mod tests {
         .unwrap();
         assert_eq!(original_spells.len(), 2);
 
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn unknown_mode_is_rejected() {
-        let dir = setup_test_db("bad-mode");
-        let cfg = test_cfg(&dir);
-        let assignments = vec![SpecAssignment {
-            source_key: "slash".to_string(),
-            mode: "teleport".to_string(),
-            new_key: None,
-            new_name: None,
-            level_acquired: 0,
-        }];
-        let result = apply_class_specs(&cfg, 64, 1, &assignments);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown assignment mode"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

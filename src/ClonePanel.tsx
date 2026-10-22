@@ -233,17 +233,16 @@ export default function ClonePanel() {
       ]);
       setAllSpecs(all);
       setSourceSpecs(mine);
-      // Pre-fill assignments from the source class's own specs, defaulting every one to "reuse"
-      // (same mechanics, shared with the source class) unless already customized.
+      // Pre-fill assignments from the source class's own specs, defaulting the new name to the
+      // source spec's own name (editable) - every assignment is always a clone now (see
+      // specs.rs's module doc comment for why "reuse" was removed).
       if (project.specAssignments.length === 0) {
         setProject((p) => ({
           ...p,
           specAssignments: mine.map((m) => ({
             source_key: m.spec_key_name,
             source_name: m.spec_name,
-            mode: "reuse",
-            new_key: "",
-            new_name: "",
+            new_name: m.spec_name,
             level_acquired: m.level_acquired,
             applied: false,
           })),
@@ -279,14 +278,19 @@ export default function ClonePanel() {
         {
           source_key: allSpecs[0]?.key_name ?? "",
           source_name: allSpecs[0]?.name ?? "",
-          mode: "reuse",
-          new_key: "",
-          new_name: "",
+          new_name: allSpecs[0]?.name ?? "",
           level_acquired: 0,
           applied: false,
         },
       ],
     }));
+  }
+
+  // A reasonable, unique-enough DB key from whatever the user named the clone - doesn't need to
+  // be pretty, just stable and safe for a SQL identifier; apply_class_specs always appends the
+  // new class's own ID on top of this anyway, so collisions across classes aren't a concern.
+  function deriveSpecKey(name: string): string {
+    return name.replace(/[^A-Za-z0-9]/g, "").toLowerCase() || "spec";
   }
 
   async function applySpecsToServer() {
@@ -296,15 +300,13 @@ export default function ClonePanel() {
     try {
       const payload: SpecAssignmentPayload[] = project.specAssignments.map((a) => ({
         source_key: a.source_key,
-        mode: a.mode,
-        new_key: a.mode === "clone" ? a.new_key : null,
-        new_name: a.mode === "clone" ? a.new_name : null,
+        new_key: deriveSpecKey(a.new_name),
+        new_name: a.new_name,
         level_acquired: a.level_acquired,
       }));
       const result = await invoke<string>("apply_class_specs", {
         cfg: sshConfig,
         newClassId: specsWriteToId,
-        sourceClassId: specsReadFromId,
         assignments: payload,
       });
       setSpecLog(result || "done");
@@ -460,10 +462,7 @@ export default function ClonePanel() {
           <h2>3. Spec lines</h2>
           <p className="hint">
             {isEditing ? (
-              <>
-                Showing {specsOwnerName}'s own currently-assigned specs - add more, or switch an
-                existing "reuse" to "clone" to give it its own independent copy.
-              </>
+              <>Showing {specsOwnerName}'s own currently-assigned specs - add more below.</>
             ) : (
               <>
                 Specializations are assigned per class by raw numeric ID in the server's
@@ -473,9 +472,14 @@ export default function ClonePanel() {
                 {source.name}.
               </>
             )}{" "}
-            "Reuse" shares the exact same spec (and any edits to it) with every other class that
-            already has it; "Clone" makes an independent copy under a new name - its own spell
-            lines/spells and styles - that you can rename and, later, edit separately.
+            Every spec is always cloned - its own independent copy of the Specialization row,
+            spell lines, and styles - which you can rename (e.g. "Celtic Dual" could become
+            "Nosferatu's Claw") and, later, edit separately. (Sharing a spec verbatim with its
+            source class used to be an option here, but a real, reproduced bug retired it: a
+            class-locked style is only ever visible to the exact class ID it's locked to, so a
+            shared spec whose styles happen to be locked elsewhere would train and show a level
+            with no visible styles at all - invisibly. Cloning always repoints any class lock to
+            your new class, so this can't happen.)
           </p>
           {sourceSpecs === null ? (
             <button onClick={loadSourceSpecs} disabled={busy}>
@@ -487,8 +491,7 @@ export default function ClonePanel() {
                 <thead>
                   <tr>
                     <th>Source spec</th>
-                    <th>Mode</th>
-                    <th>New name (if cloning)</th>
+                    <th>New name</th>
                     <th>Level acquired</th>
                     <th></th>
                   </tr>
@@ -515,29 +518,10 @@ export default function ClonePanel() {
                         </select>
                       </td>
                       <td>
-                        <select
-                          value={a.mode}
-                          onChange={(e) =>
-                            updateSpecAssignment(i, { mode: e.target.value as "reuse" | "clone" })
-                          }
-                        >
-                          <option value="reuse">Reuse</option>
-                          <option value="clone">Clone &amp; rename</option>
-                        </select>
-                      </td>
-                      <td>
                         <input
-                          disabled={a.mode !== "clone"}
                           value={a.new_name}
-                          placeholder={a.mode === "clone" ? "e.g. Earthshatter" : "-"}
-                          onChange={(e) => {
-                            const new_name = e.target.value;
-                            const new_key = new_name
-                              .toLowerCase()
-                              .replace(/[^a-z0-9]+/g, "_")
-                              .replace(/^_+|_+$/g, "");
-                            updateSpecAssignment(i, { new_name, new_key });
-                          }}
+                          placeholder="e.g. Nosferatu's Claw"
+                          onChange={(e) => updateSpecAssignment(i, { new_name: e.target.value })}
                         />
                       </td>
                       <td>

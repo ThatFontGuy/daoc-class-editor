@@ -175,10 +175,9 @@ fn list_class_specs(cfg: SshConfig, class_id: i64) -> Result<Vec<ClassSpecRow>, 
 fn apply_class_specs(
     cfg: SshConfig,
     new_class_id: i64,
-    source_class_id: i64,
     assignments: Vec<SpecAssignment>,
 ) -> Result<String, String> {
-    specs::apply_class_specs(&cfg, new_class_id, source_class_id, &assignments)
+    specs::apply_class_specs(&cfg, new_class_id, &assignments)
 }
 
 #[tauri::command]
