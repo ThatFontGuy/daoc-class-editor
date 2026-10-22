@@ -80,7 +80,7 @@ export default function App() {
         <Header tab={tab} setTab={setTab} />
         <main>
           {tab === "clone" && <ClonePanel />}
-          {tab === "deployed" && <DeployedClassesPanel />}
+          {tab === "deployed" && <DeployedClassesPanel onEditDeployed={() => setTab("clone")} />}
           {tab === "settings" && <DeploySettingsPanel />}
         </main>
       </div>

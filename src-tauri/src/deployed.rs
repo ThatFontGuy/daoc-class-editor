@@ -4,51 +4,21 @@
 //! Unlike the vendored reference classes (classdata.rs), a deployed custom class's attribute
 //! carries a raw integer ID directly (`[CharacterClass(64, "Name", "Base")]`, from codegen.rs's
 //! template) rather than an `(int)eCharacterClass.X` enum reference, since it has no enum entry
-//! at all - so this uses its own, simpler parser rather than reusing classdata.rs's.
+//! at all - so classdata.rs's `parse_deployed_source` uses its own, simpler attribute parser
+//! rather than reusing the vendored-file one.
 
 use crate::classdata::ClassInfo;
 use crate::deploy::{
     SshConfig, is_local, run_command, run_remote_sql, run_remote_sql_json, ssh_base_args,
 };
-use regex::Regex;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployedClass {
-    pub filename: String,
-    pub class_ident: String,
-    pub name: String,
-    pub id: i64,
-    pub base_class_name: String,
-}
-
-fn parse_deployed(content: &str, filename: &str) -> Option<DeployedClass> {
-    let attr_re =
-        Regex::new(r#"\[CharacterClass\(\s*(\d+)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)""#).ok()?;
-    let caps = attr_re.captures(content)?;
-    let id = caps[1].parse().ok()?;
-    let name = caps[2].to_string();
-    let base_class_name = caps[3].to_string();
-    let class_re = Regex::new(r"(?m)^\s*public\s+class\s+(\w+)\s*:").ok()?;
-    let class_ident = class_re.captures(content)?[1].to_string();
-    Some(DeployedClass {
-        filename: filename.to_string(),
-        class_ident,
-        name,
-        id,
-        base_class_name,
-    })
-}
-
 const MARKER: &str = "===DAOC-CLASS-EDITOR-FILE===";
 
-/// Reads every `.cs` file's (filename, content) out of `<server_dir>/scripts/` - shared by
-/// `list_deployed_classes` (which only needs the lightweight summary) and
-/// `fetch_deployed_class_infos` (which needs the full content to parse into a complete
-/// `ClassInfo`, so a deployed class can be picked as a clone source too).
+/// Reads every `.cs` file's (filename, content) out of `<server_dir>/scripts/` - used by
+/// `fetch_deployed_class_infos` to parse each into a full `ClassInfo`.
 fn read_script_files(cfg: &SshConfig) -> Result<Vec<(String, String)>, String> {
     let scripts_dir = Path::new(&cfg.remote_server_dir).join("scripts");
     if is_local(cfg) {
@@ -86,26 +56,21 @@ fn read_script_files(cfg: &SshConfig) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-/// Every `.cs` file in `<server_dir>/scripts/` that looks like a class definition (has the
-/// `[CharacterClass(...)]` attribute) - not every file in that folder is necessarily one of this
-/// tool's clones, but anything that isn't a recognizable class definition is simply skipped.
-pub fn list_deployed_classes(cfg: &SshConfig) -> Result<Vec<DeployedClass>, String> {
-    let mut out: Vec<DeployedClass> = read_script_files(cfg)?
-        .iter()
-        .filter_map(|(filename, content)| parse_deployed(content, filename))
-        .collect();
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(out)
-}
-
-/// Parses every deployed custom class into a full `ClassInfo` (not just the lightweight
-/// `DeployedClass` summary), so it can be offered as a clone source too - "clone of a clone".
-/// `realm`/`effective_eligible_races` are left unresolved here; the caller must fold the result
-/// into `classdata::load_all_classes_with_extra` to resolve those across the combined set.
+/// Parses every deployed custom class into a full `ClassInfo` - not just a name/id summary, so a
+/// deployed class can be picked as a clone source ("clone of a clone") or edited in place, with
+/// `filename` set so the caller knows which file to overwrite/delete. `realm`/
+/// `effective_eligible_races` are left unresolved here; the caller must fold the result into
+/// `classdata::load_all_classes_with_extra` to resolve those across the combined set. Anything in
+/// `scripts/` that isn't a recognizable class definition (no `[CharacterClass(...)]` attribute) is
+/// simply skipped - not every file there is necessarily one of this tool's clones.
 pub fn fetch_deployed_class_infos(cfg: &SshConfig) -> Result<Vec<ClassInfo>, String> {
     Ok(read_script_files(cfg)?
-        .iter()
-        .filter_map(|(_, content)| crate::classdata::parse_deployed_source(content))
+        .into_iter()
+        .filter_map(|(filename, content)| {
+            let mut info = crate::classdata::parse_deployed_source(&content)?;
+            info.filename = Some(filename);
+            Some(info)
+        })
         .collect())
 }
 
@@ -287,32 +252,21 @@ mod tests {
     }
 
     #[test]
-    fn lists_only_recognizable_class_files() {
-        let dir = setup_test_server("list");
-        let cfg = test_cfg(&dir);
-
-        let classes = list_deployed_classes(&cfg).unwrap();
-        assert_eq!(classes.len(), 1);
-        assert_eq!(classes[0].filename, "GrovekeeperClass.cs");
-        assert_eq!(classes[0].class_ident, "ClassGrovekeeper");
-        assert_eq!(classes[0].name, "Grovekeeper");
-        assert_eq!(classes[0].id, 64);
-        assert_eq!(classes[0].base_class_name, "Acolyte");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn fetch_deployed_class_infos_parses_full_class_info() {
+    fn fetch_deployed_class_infos_parses_full_class_info_and_skips_non_class_files() {
         let dir = setup_test_server("fetch-infos");
         let cfg = test_cfg(&dir);
 
+        // setup_test_server also writes an unrelated NotAClass.cs with no attribute at all -
+        // confirms it's skipped rather than erroring the whole fetch.
         let infos = fetch_deployed_class_infos(&cfg).unwrap();
         assert_eq!(infos.len(), 1);
         let info = &infos[0];
+        assert_eq!(info.filename.as_deref(), Some("GrovekeeperClass.cs"));
         assert_eq!(info.class_ident, "ClassGrovekeeper");
         assert_eq!(info.parent_ident, "ClassAcolyte");
+        assert_eq!(info.name, "Grovekeeper");
         assert_eq!(info.id, 64);
+        assert_eq!(info.base_class_name, "Acolyte");
         assert!(info.is_custom);
 
         std::fs::remove_dir_all(&dir).ok();

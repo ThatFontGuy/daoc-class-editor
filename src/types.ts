@@ -20,6 +20,7 @@ export interface ClassInfo {
   eligible_races: string[];
   effective_eligible_races: string[];
   is_custom: boolean;
+  filename: string | null;
   raw_source: string;
 }
 
@@ -93,14 +94,4 @@ export interface SpecAssignmentPayload {
   new_key: string | null;
   new_name: string | null;
   level_acquired: number;
-}
-
-// Mirrors src-tauri/src/deployed.rs.
-
-export interface DeployedClass {
-  filename: string;
-  class_ident: string;
-  name: string;
-  id: number;
-  base_class_name: string;
 }

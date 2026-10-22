@@ -7,7 +7,6 @@ mod specs;
 use classdata::{ClassInfo, KnownOptions};
 use codegen::CloneRequest;
 use deploy::SshConfig;
-use deployed::DeployedClass;
 use specs::{ClassSpecRow, SpecAssignment, SpecializationRow};
 use tauri::Manager;
 
@@ -151,11 +150,6 @@ fn load_project_file(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn list_deployed_classes(cfg: SshConfig) -> Result<Vec<DeployedClass>, String> {
-    deployed::list_deployed_classes(&cfg)
-}
-
-#[tauri::command]
 fn delete_deployed_class(
     cfg: SshConfig,
     filename: String,
@@ -189,7 +183,6 @@ pub fn run() {
             apply_class_specs,
             save_project_file,
             load_project_file,
-            list_deployed_classes,
             delete_deployed_class,
         ])
         .run(tauri::generate_context!())

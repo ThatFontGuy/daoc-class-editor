@@ -65,6 +65,15 @@ export default function ClonePanel() {
     [classes, project.sourceClassIdent],
   );
 
+  const isEditing = project.editingDeployedClassId !== null;
+  // Step 3 reads "what specs does X currently have" from one class, and writes new assignments
+  // to another - when editing an already-deployed class in place, both are that same class (its
+  // specs are being read and modified directly); when designing a brand-new clone, specs are
+  // read from the source (to show what's available to copy) but written to the new class's ID.
+  const specsReadFromId = isEditing ? project.editingDeployedClassId! : source?.id;
+  const specsWriteToId = isEditing ? project.editingDeployedClassId! : project.newId;
+  const specsOwnerName = isEditing ? project.newName : (source?.name ?? "");
+
   // The base archetype files (ClassFighter, ClassAcolyte, ClassViking, ...) parse into ClassInfo
   // records too (classdata.rs needs them for the EligibleRaces inheritance fallback), but they
   // aren't playable classes themselves - only concrete classes that subclass one of them are
@@ -128,6 +137,9 @@ export default function ClonePanel() {
       ...p,
       sourceClassIdent: id,
       generatedCode: "",
+      // Picking a fresh class from the browser always means "design a new class," even if a
+      // deployed one was being edited a moment ago.
+      editingDeployedClassId: null,
     }));
     setSourceSpecs(null);
   }
@@ -173,7 +185,14 @@ export default function ClonePanel() {
       eligible_races: overrides.eligible_races ? (values.eligible_races as string[]) ?? [] : null,
     };
     const generated = await invoke<string>("generate_class_code", { req });
-    setProject((p) => ({ ...p, generatedCode: generated, filename: `${project.newIdent}.cs` }));
+    setProject((p) => ({
+      ...p,
+      generatedCode: generated,
+      // Preserve an already-set filename (notably while editing a deployed class in place, or
+      // after the user has manually customized it in step 6) - only derive a fresh one the first
+      // time there isn't one yet.
+      filename: p.filename || `${project.newIdent}.cs`,
+    }));
   }
 
   async function runAction(
@@ -195,12 +214,12 @@ export default function ClonePanel() {
   }
 
   async function loadSourceSpecs() {
-    if (!source) return;
+    if (!source || specsReadFromId === undefined) return;
     setSpecLog("loading...");
     try {
       const [all, mine] = await Promise.all([
         invoke<SpecializationRow[]>("list_specializations", { cfg: sshConfig }),
-        invoke<ClassSpecRow[]>("list_class_specs", { cfg: sshConfig, classId: source.id }),
+        invoke<ClassSpecRow[]>("list_class_specs", { cfg: sshConfig, classId: specsReadFromId }),
       ]);
       setAllSpecs(all);
       setSourceSpecs(mine);
@@ -220,7 +239,7 @@ export default function ClonePanel() {
           })),
         }));
       }
-      setSpecLog(`found ${mine.length} spec(s) on ${source.name}`);
+      setSpecLog(`found ${mine.length} spec(s) on ${specsOwnerName}`);
     } catch (e) {
       setSpecLog(`error: ${e}`);
     }
@@ -261,7 +280,7 @@ export default function ClonePanel() {
   }
 
   async function applySpecsToServer() {
-    if (!source) return;
+    if (specsReadFromId === undefined) return;
     setBusy(true);
     setSpecLog("applying...");
     try {
@@ -274,8 +293,8 @@ export default function ClonePanel() {
       }));
       const result = await invoke<string>("apply_class_specs", {
         cfg: sshConfig,
-        newClassId: project.newId,
-        sourceClassId: source.id,
+        newClassId: specsWriteToId,
+        sourceClassId: specsReadFromId,
         assignments: payload,
       });
       setSpecLog(result || "done");
@@ -308,11 +327,20 @@ export default function ClonePanel() {
           stock classes are shown below.
         </p>
       )}
-      {source && (
+      {isEditing ? (
         <div className="picker-breadcrumb">
-          Cloning <strong>{source.name}</strong> ({source.realm}, {source.base_class_name}). Browse
-          below to pick a different one, or continue to step 2.
+          Editing <strong>{project.newName}</strong> (id {project.newId}) in place - its name,
+          C# class name, ID, and filename are locked below so redeploying overwrites the same
+          file. Use "New" at the top to design a separate class instead, or pick a different
+          class below to abandon this edit.
         </div>
+      ) : (
+        source && (
+          <div className="picker-breadcrumb">
+            Cloning <strong>{source.name}</strong> ({source.realm}, {source.base_class_name}).
+            Browse below to pick a different one, or continue to step 2.
+          </div>
+        )
       )}
 
       <div className="picker-step-label">Realm</div>
@@ -374,6 +402,7 @@ export default function ClonePanel() {
       {source && (
         <>
           <div className="source-summary">
+            {isEditing && <em>Parent class ({project.newName} subclasses this): </em>}
             <strong>{source.name}</strong> ({source.class_ident}, ID {source.id}) - realm:{" "}
             {source.realm}, profession: {source.profession ?? "-"}, stats: {source.primary_stat}/
             {source.secondary_stat}/{source.tertiary_stat}, mana: {source.mana_stat ?? "-"}, WS
@@ -385,12 +414,19 @@ export default function ClonePanel() {
           </div>
 
           <h2>2. Name your new class</h2>
+          {isEditing && (
+            <p className="hint">
+              Locked while editing an existing deployed class - start a new clone (the "New"
+              button above) if you want a different name, ID, or file instead.
+            </p>
+          )}
           <label className="field">
             <span>Display name (shown at character creation)</span>
             <input
               value={project.newName}
               onChange={(e) => onNameChange(e.target.value)}
               placeholder="e.g. Grovekeeper"
+              disabled={isEditing}
             />
           </label>
           <label className="field">
@@ -398,6 +434,7 @@ export default function ClonePanel() {
             <input
               value={project.newIdent}
               onChange={(e) => setProject((p) => ({ ...p, newIdent: e.target.value }))}
+              disabled={isEditing}
             />
           </label>
           <label className="field">
@@ -406,22 +443,33 @@ export default function ClonePanel() {
               type="number"
               value={project.newId}
               onChange={(e) => setProject((p) => ({ ...p, newId: Number(e.target.value) }))}
+              disabled={isEditing}
             />
           </label>
 
           <h2>3. Spec lines</h2>
           <p className="hint">
-            Specializations are assigned per class by raw numeric ID in the server's database,
-            with no inheritance from the class you're cloning - without this step your new class
-            would have no specs, no combat styles, and no weapon/armor proficiency at all, even
-            though the generated .cs file correctly subclasses {source.name}. "Reuse" shares the
-            exact same spec (and any edits to it) with every other class that already has it;
-            "Clone" makes an independent copy under a new name - its own spell lines/spells and
-            styles - that you can rename and, later, edit separately.
+            {isEditing ? (
+              <>
+                Showing {specsOwnerName}'s own currently-assigned specs - add more, or switch an
+                existing "reuse" to "clone" to give it its own independent copy.
+              </>
+            ) : (
+              <>
+                Specializations are assigned per class by raw numeric ID in the server's
+                database, with no inheritance from the class you're cloning - without this step
+                your new class would have no specs, no combat styles, and no weapon/armor
+                proficiency at all, even though the generated .cs file correctly subclasses{" "}
+                {source.name}.
+              </>
+            )}{" "}
+            "Reuse" shares the exact same spec (and any edits to it) with every other class that
+            already has it; "Clone" makes an independent copy under a new name - its own spell
+            lines/spells and styles - that you can rename and, later, edit separately.
           </p>
           {sourceSpecs === null ? (
             <button onClick={loadSourceSpecs} disabled={busy}>
-              Load {source.name}'s current specs
+              Load {specsOwnerName}'s current specs
             </button>
           ) : (
             <>
@@ -520,14 +568,14 @@ export default function ClonePanel() {
           )}
 
           <h2>4. Everything below is inherited from {source.name} unless you check and change it</h2>
-          <div className="override-grid">
+          <div className="override-grid" key={`${project.sourceClassIdent}:${project.editingDeployedClassId}`}>
             <OverrideRow
               label="Profession (flavor text)"
               checked={project.overrides.profession}
               onToggle={() => toggle("profession")}
             >
               <input
-                defaultValue={source.profession ?? ""}
+                defaultValue={(project.values.profession as string) ?? source.profession ?? ""}
                 onChange={(e) => setValue("profession", e.target.value)}
               />
             </OverrideRow>
@@ -539,7 +587,7 @@ export default function ClonePanel() {
             >
               <StatSelect
                 options={options.stats}
-                defaultValue={source.primary_stat}
+                defaultValue={(project.values.primary_stat as string) ?? source.primary_stat}
                 onChange={(v) => setValue("primary_stat", v)}
               />
             </OverrideRow>
@@ -551,7 +599,7 @@ export default function ClonePanel() {
             >
               <StatSelect
                 options={options.stats}
-                defaultValue={source.secondary_stat}
+                defaultValue={(project.values.secondary_stat as string) ?? source.secondary_stat}
                 onChange={(v) => setValue("secondary_stat", v)}
               />
             </OverrideRow>
@@ -563,7 +611,7 @@ export default function ClonePanel() {
             >
               <StatSelect
                 options={options.stats}
-                defaultValue={source.tertiary_stat}
+                defaultValue={(project.values.tertiary_stat as string) ?? source.tertiary_stat}
                 onChange={(v) => setValue("tertiary_stat", v)}
               />
             </OverrideRow>
@@ -575,7 +623,7 @@ export default function ClonePanel() {
             >
               <StatSelect
                 options={options.stats}
-                defaultValue={source.mana_stat}
+                defaultValue={(project.values.mana_stat as string) ?? source.mana_stat}
                 onChange={(v) => setValue("mana_stat", v)}
               />
             </OverrideRow>
@@ -587,7 +635,7 @@ export default function ClonePanel() {
             >
               <input
                 type="number"
-                defaultValue={source.ws_base ?? 0}
+                defaultValue={(project.values.ws_base as number) ?? source.ws_base ?? 0}
                 onChange={(e) => setValue("ws_base", e.target.value)}
               />
             </OverrideRow>
@@ -599,7 +647,7 @@ export default function ClonePanel() {
             >
               <input
                 type="number"
-                defaultValue={source.base_hp ?? 0}
+                defaultValue={(project.values.base_hp as number) ?? source.base_hp ?? 0}
                 onChange={(e) => setValue("base_hp", e.target.value)}
               />
             </OverrideRow>
@@ -611,7 +659,11 @@ export default function ClonePanel() {
             >
               <input
                 type="number"
-                defaultValue={source.specialization_multiplier ?? 10}
+                defaultValue={
+                  (project.values.specialization_multiplier as number) ??
+                  source.specialization_multiplier ??
+                  10
+                }
                 onChange={(e) => setValue("specialization_multiplier", e.target.value)}
               />
             </OverrideRow>
@@ -622,7 +674,7 @@ export default function ClonePanel() {
               onToggle={() => toggle("class_type")}
             >
               <select
-                defaultValue={source.class_type ?? ""}
+                defaultValue={(project.values.class_type as string) ?? source.class_type ?? ""}
                 onChange={(e) => setValue("class_type", e.target.value)}
               >
                 {options.class_types.map((t) => (
@@ -639,7 +691,11 @@ export default function ClonePanel() {
               onToggle={() => toggle("is_focus_caster")}
             >
               <select
-                defaultValue={String(source.is_focus_caster ?? false)}
+                defaultValue={String(
+                  (project.values.is_focus_caster as boolean | undefined) ??
+                    source.is_focus_caster ??
+                    false,
+                )}
                 onChange={(e) => setValue("is_focus_caster", e.target.value === "true")}
               >
                 <option value="true">true</option>
@@ -655,24 +711,26 @@ export default function ClonePanel() {
               <div className="race-checkboxes">
                 {options.races
                   .filter((r) => options.race_realms[r] === source.realm)
-                  .map((r) => (
-                    <label key={r}>
-                      <input
-                        type="checkbox"
-                        defaultChecked={source.effective_eligible_races.includes(r)}
-                        onChange={(e) => {
-                          const current = (project.values.eligible_races as string[]) ?? [
-                            ...source.effective_eligible_races,
-                          ];
-                          const next = e.target.checked
-                            ? [...new Set([...current, r])]
-                            : current.filter((x) => x !== r);
-                          setValue("eligible_races", next);
-                        }}
-                      />
-                      {r}
-                    </label>
-                  ))}
+                  .map((r) => {
+                    const current = (project.values.eligible_races as string[]) ?? [
+                      ...source.effective_eligible_races,
+                    ];
+                    return (
+                      <label key={r}>
+                        <input
+                          type="checkbox"
+                          defaultChecked={current.includes(r)}
+                          onChange={(e) => {
+                            const next = e.target.checked
+                              ? [...new Set([...current, r])]
+                              : current.filter((x) => x !== r);
+                            setValue("eligible_races", next);
+                          }}
+                        />
+                        {r}
+                      </label>
+                    );
+                  })}
               </div>
             </OverrideRow>
           </div>
@@ -692,6 +750,12 @@ export default function ClonePanel() {
               />
 
               <h2>6. Deploy</h2>
+              {isEditing && (
+                <p className="hint">
+                  Deploying will overwrite the existing <code>{project.filename}</code> in place -
+                  this is the redeploy step for the edit you just made.
+                </p>
+              )}
               <label className="field">
                 <span>Filename in the server's scripts/ folder</span>
                 <input

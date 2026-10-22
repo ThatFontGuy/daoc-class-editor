@@ -46,6 +46,11 @@ pub struct ClassInfo {
     /// UI badge it, and lets a "clone of a clone" pick it as a source the same as any other.
     #[serde(default)]
     pub is_custom: bool,
+    /// The `.cs` filename this was deployed as, e.g. "ClassGrovekeeper.cs" - `None` for the
+    /// vendored reference classes, which don't live on any particular server. Lets "Edit" on the
+    /// deployed-classes list know which file to overwrite on redeploy.
+    #[serde(default)]
+    pub filename: Option<String>,
     /// Full original source, kept so the UI can show "what you're cloning" for reference.
     pub raw_source: String,
 }
@@ -142,6 +147,7 @@ fn parse_fields(
         effective_eligible_races: eligible_races.clone(),
         eligible_races,
         is_custom,
+        filename: None,
         raw_source,
     })
 }
