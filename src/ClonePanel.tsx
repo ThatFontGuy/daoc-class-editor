@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ClassInfo,
@@ -28,6 +28,16 @@ export default function ClonePanel() {
   const [sql, setSql] = useState("");
   const [log, setLog] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  const logRef = useRef<HTMLPreElement>(null);
+
+  // The log box has a fixed max-height and scrolls, so without this, each new action's result
+  // (e.g. "Check status") lands below the fold of a box full of earlier entries and looks like
+  // nothing happened at all - keep it pinned to the latest line whenever it grows.
+  useEffect(() => {
+    if (logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [log]);
 
   const [allSpecs, setAllSpecs] = useState<SpecializationRow[]>([]);
   const [sourceSpecs, setSourceSpecs] = useState<ClassSpecRow[] | null>(null);
@@ -835,7 +845,11 @@ export default function ClonePanel() {
                 Run SQL
               </button>
 
-              {log && <pre className="status">{log.trim()}</pre>}
+              {log && (
+                <pre className="status" ref={logRef}>
+                  {log.trim()}
+                </pre>
+              )}
             </>
           )}
         </>
