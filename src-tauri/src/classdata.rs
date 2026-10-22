@@ -273,6 +273,106 @@ fn load_vendored_unfinalized(resources_dir: &Path) -> Vec<ClassInfo> {
     out
 }
 
+/// Resolves every scalar field a class might not set in its own file (profession, stats,
+/// ws_base, base_hp, specialization_multiplier, class_type, is_focus_caster) by walking
+/// `parent_ident` upward until an ancestor that *does* set it is found - the same idea as
+/// `resolve_effective_eligible_races`, generalized to every other overridable field at once.
+/// Without this, a field a class's immediate parent *also* doesn't set directly (inheriting it
+/// from one hop further up - e.g. weapon skill base almost always comes from the archetype two
+/// hops up from a promoted class) looked "lost" to anything reading that field directly, instead
+/// of correctly showing the real inherited value. This bit editing Nosferatu (cloned from
+/// Shadowblade): base HP/specialization multiplier are set directly on Shadowblade so a
+/// single-hop lookup happened to work, but weapon skill base is set two hops up on the Midgard
+/// Rogue archetype, so it still showed as missing even after that was fixed.
+fn resolve_effective_scalars(classes: &mut [ClassInfo]) {
+    #[derive(Clone)]
+    struct Snapshot {
+        parent_ident: String,
+        profession: Option<String>,
+        primary_stat: Option<String>,
+        secondary_stat: Option<String>,
+        tertiary_stat: Option<String>,
+        mana_stat: Option<String>,
+        ws_base: Option<i32>,
+        base_hp: Option<i32>,
+        specialization_multiplier: Option<i32>,
+        class_type: Option<String>,
+        is_focus_caster: Option<bool>,
+    }
+
+    // Snapshot every class's own (pre-resolution) values before mutating anything - a lookup for
+    // one class must never see another class's already-resolved effective value instead of its
+    // real own one, which the chain walk below depends on.
+    let snapshots: HashMap<String, Snapshot> = classes
+        .iter()
+        .map(|c| {
+            (
+                c.class_ident.clone(),
+                Snapshot {
+                    parent_ident: c.parent_ident.clone(),
+                    profession: c.profession.clone(),
+                    primary_stat: c.primary_stat.clone(),
+                    secondary_stat: c.secondary_stat.clone(),
+                    tertiary_stat: c.tertiary_stat.clone(),
+                    mana_stat: c.mana_stat.clone(),
+                    ws_base: c.ws_base,
+                    base_hp: c.base_hp,
+                    specialization_multiplier: c.specialization_multiplier,
+                    class_type: c.class_type.clone(),
+                    is_focus_caster: c.is_focus_caster,
+                },
+            )
+        })
+        .collect();
+
+    for class in classes.iter_mut() {
+        let mut current = class.parent_ident.clone();
+        // Capped: the real inheritance chains here are at most 2-3 levels deep; this just
+        // guards against an unexpected cycle in malformed vendored data.
+        for _ in 0..10 {
+            let all_resolved = class.profession.is_some()
+                && class.primary_stat.is_some()
+                && class.secondary_stat.is_some()
+                && class.tertiary_stat.is_some()
+                && class.mana_stat.is_some()
+                && class.ws_base.is_some()
+                && class.base_hp.is_some()
+                && class.specialization_multiplier.is_some()
+                && class.class_type.is_some()
+                && class.is_focus_caster.is_some();
+            if all_resolved {
+                break;
+            }
+            let Some(snap) = snapshots.get(&current) else {
+                break;
+            };
+            class.profession = class.profession.clone().or_else(|| snap.profession.clone());
+            class.primary_stat = class
+                .primary_stat
+                .clone()
+                .or_else(|| snap.primary_stat.clone());
+            class.secondary_stat = class
+                .secondary_stat
+                .clone()
+                .or_else(|| snap.secondary_stat.clone());
+            class.tertiary_stat = class
+                .tertiary_stat
+                .clone()
+                .or_else(|| snap.tertiary_stat.clone());
+            class.mana_stat = class.mana_stat.clone().or_else(|| snap.mana_stat.clone());
+            class.ws_base = class.ws_base.or(snap.ws_base);
+            class.base_hp = class.base_hp.or(snap.base_hp);
+            class.specialization_multiplier = class
+                .specialization_multiplier
+                .or(snap.specialization_multiplier);
+            class.class_type = class.class_type.clone().or_else(|| snap.class_type.clone());
+            class.is_focus_caster = class.is_focus_caster.or(snap.is_focus_caster);
+
+            current = snap.parent_ident.clone();
+        }
+    }
+}
+
 /// Resolves `effective_eligible_races` (walking the inheritance chain) and `realm` (from the
 /// first resolved race's real realm, via `PlayerRace.cs`) across a whole set of classes at once,
 /// then sorts them - shared by the vendored-only list and the vendored+deployed combined list, so
@@ -280,6 +380,7 @@ fn load_vendored_unfinalized(resources_dir: &Path) -> Vec<ClassInfo> {
 /// vendored (or other deployed) class it was cloned from.
 fn finalize_classes(classes: &mut Vec<ClassInfo>, race_realms: &HashMap<String, String>) {
     resolve_effective_eligible_races(classes);
+    resolve_effective_scalars(classes);
     for class in classes.iter_mut() {
         if let Some(race) = class.effective_eligible_races.first() {
             if let Some(realm) = race_realms.get(race) {
@@ -460,6 +561,46 @@ mod tests {
         assert!(names.contains(&"Sluaghbinder"), "Sluaghbinder missing");
         assert!(names.contains(&"Cleric"), "Cleric missing");
         assert!(names.contains(&"Warrior"), "Warrior missing");
+    }
+
+    #[test]
+    fn weapon_skill_base_resolves_through_a_two_hop_inheritance_chain() {
+        // ClassShadowblade sets base HP/specialization multiplier directly, but not weapon skill
+        // base - that's only set on ClassMidgardRogue, two hops up. A class cloned from
+        // Shadowblade (like a real custom Nosferatu) must still resolve it correctly, not just
+        // the fields its immediate parent happens to set itself.
+        let vendored = load_all_classes(&resources());
+        let shadowblade = vendored
+            .iter()
+            .find(|c| c.class_ident == "ClassShadowblade")
+            .expect("ClassShadowblade should parse");
+        assert_eq!(shadowblade.ws_base, Some(360));
+        assert_eq!(shadowblade.base_hp, Some(760));
+        assert_eq!(shadowblade.specialization_multiplier, Some(22));
+
+        let nosferatu_src = r#"
+namespace DOL.GS.PlayerClass
+{
+	[CharacterClass(64, "Nosferatu", "Rogue")]
+	public class ClassNosferatu : ClassShadowblade
+	{
+		public ClassNosferatu()
+			: base()
+		{
+			m_primaryStat = eStat.QUI;
+		}
+	}
+}
+"#;
+        let nosferatu = parse_deployed_source(nosferatu_src).expect("should parse");
+        let combined = load_all_classes_with_extra(&resources(), vec![nosferatu]);
+        let nosferatu = combined
+            .iter()
+            .find(|c| c.class_ident == "ClassNosferatu")
+            .expect("Nosferatu should be present");
+        assert_eq!(nosferatu.ws_base, Some(360));
+        assert_eq!(nosferatu.base_hp, Some(760));
+        assert_eq!(nosferatu.specialization_multiplier, Some(22));
     }
 
     #[test]

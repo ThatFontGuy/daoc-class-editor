@@ -84,6 +84,12 @@ export default function ClonePanel() {
   const specsReadFromId = isEditing ? project.editingDeployedClassId! : source?.id;
   const specsWriteToId = isEditing ? project.editingDeployedClassId! : project.newId;
   const specsOwnerName = isEditing ? project.newName : (source?.name ?? "");
+  // The picker's "active" highlight must track whatever class is actually being worked on - when
+  // editing, that's the deployed class itself (newIdent), not its parent (sourceClassIdent, used
+  // instead for the override grid's inherited-defaults lookup). Without this split, editing
+  // Nosferatu highlighted Shadowblade as "selected" in the picker, which looked like the tool was
+  // showing/editing the wrong class even though the values below it were correct.
+  const activeClassIdent = isEditing ? project.newIdent : project.sourceClassIdent;
 
   // The base archetype files (ClassFighter, ClassAcolyte, ClassViking, ...) parse into ClassInfo
   // records too (classdata.rs needs them for the EligibleRaces inheritance fallback), but they
@@ -144,6 +150,13 @@ export default function ClonePanel() {
   }
 
   function onPickSource(id: string) {
+    // Clicking the class already being edited (now correctly highlighted as active in the
+    // picker) must stay a no-op - otherwise it silently exits edit mode and starts a brand-new
+    // "clone from this class" instead, discarding its real overrides (ws_base/base_hp/etc.) in
+    // favor of that class's own un-inherited raw fields. This is exactly how editing Nosferatu
+    // could make its own correct values vanish just by clicking its (previously unhighlighted)
+    // picker button.
+    if (isEditing && id === project.newIdent) return;
     setProject((p) => ({
       ...p,
       sourceClassIdent: id,
@@ -400,7 +413,7 @@ export default function ClonePanel() {
             {classesForBase.map((c) => (
               <button
                 key={c.class_ident}
-                className={`picker-btn ${project.sourceClassIdent === c.class_ident ? "active" : ""}`}
+                className={`picker-btn ${activeClassIdent === c.class_ident ? "active" : ""}`}
                 onClick={() => onPickSource(c.class_ident)}
               >
                 {c.name}
