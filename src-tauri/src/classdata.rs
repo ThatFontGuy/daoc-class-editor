@@ -41,48 +41,35 @@ pub struct ClassInfo {
     /// (most don't) - this is what the frontend should actually use to filter race checkboxes.
     /// Equal to `eligible_races` when this class does have its own override.
     pub effective_eligible_races: Vec<String>,
+    /// True for a class this tool generated and deployed to a server's `scripts/` folder (as
+    /// opposed to one of the ~63 vendored reference classes the server ships with) - lets the
+    /// UI badge it, and lets a "clone of a clone" pick it as a source the same as any other.
+    #[serde(default)]
+    pub is_custom: bool,
     /// Full original source, kept so the UI can show "what you're cloning" for reference.
     pub raw_source: String,
-}
-
-fn realm_from_path(path: &Path) -> String {
-    let s = path.to_string_lossy().to_lowercase();
-    if s.contains("/albion/") {
-        "Albion".to_string()
-    } else if s.contains("/midgard/") {
-        "Midgard".to_string()
-    } else if s.contains("/hibernia/") {
-        "Hibernia".to_string()
-    } else {
-        "Base".to_string()
-    }
 }
 
 fn capture1(re: &Regex, text: &str) -> Option<String> {
     re.captures(text).map(|c| c[1].to_string())
 }
 
-fn parse_one(path: &Path, enum_ids: &HashMap<String, i32>) -> Option<ClassInfo> {
-    let raw_source = std::fs::read_to_string(path).ok()?;
-
-    // [CharacterClass((int)eCharacterClass.Druid, "Druid", "Naturalist")] - id via the enum name,
-    // looked up in enum_ids (parsed separately from eCharacterClass.cs) rather than assuming the
-    // attribute always carries a raw integer literal.
-    let attr_re = Regex::new(
-        r#"\[CharacterClass\(\s*\(int\)eCharacterClass\.(\w+)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)""#,
-    )
-    .ok()?;
-    let attr_caps = attr_re.captures(&raw_source)?;
-    let enum_name = attr_caps[1].to_string();
-    let name = attr_caps[2].to_string();
-    let base_class_name = attr_caps[3].to_string();
-    let id = *enum_ids.get(&enum_name)?;
-
-    let class_decl_re = Regex::new(r"(?m)^\s*public\s+class\s+(\w+)\s*:\s*(\w+)").ok()?;
-    let class_decl = class_decl_re.captures(&raw_source)?;
-    let class_ident = class_decl[1].to_string();
-    let parent_ident = class_decl[2].to_string();
-
+/// Extracts every field after the identity (id/name/base_class_name/class_ident/parent_ident)
+/// has already been determined - shared by `parse_one` (vendored reference files, whose
+/// `[CharacterClass]` attribute references the `eCharacterClass` enum) and
+/// `parse_deployed_source` (a tool-generated class on a live server, whose attribute carries a
+/// raw integer ID instead, since it has no enum entry at all). `realm` is left blank here: it
+/// depends on `effective_eligible_races`, which can only be resolved once every known class
+/// (vendored and deployed) is assembled into one set - see `finalize_classes`.
+fn parse_fields(
+    raw_source: String,
+    id: i32,
+    name: String,
+    base_class_name: String,
+    class_ident: String,
+    parent_ident: String,
+    is_custom: bool,
+) -> Option<ClassInfo> {
     let profession = capture1(
         &Regex::new(r#"m_profession\s*=\s*"([^"]+)""#).ok()?,
         &raw_source,
@@ -139,7 +126,7 @@ fn parse_one(path: &Path, enum_ids: &HashMap<String, i32>) -> Option<ClassInfo> 
         id,
         name,
         base_class_name,
-        realm: realm_from_path(path),
+        realm: String::new(),
         class_ident,
         parent_ident,
         profession,
@@ -154,8 +141,69 @@ fn parse_one(path: &Path, enum_ids: &HashMap<String, i32>) -> Option<ClassInfo> 
         is_focus_caster,
         effective_eligible_races: eligible_races.clone(),
         eligible_races,
+        is_custom,
         raw_source,
     })
+}
+
+fn parse_one(path: &Path, enum_ids: &HashMap<String, i32>) -> Option<ClassInfo> {
+    let raw_source = std::fs::read_to_string(path).ok()?;
+
+    // [CharacterClass((int)eCharacterClass.Druid, "Druid", "Naturalist")] - id via the enum name,
+    // looked up in enum_ids (parsed separately from eCharacterClass.cs) rather than assuming the
+    // attribute always carries a raw integer literal.
+    let attr_re = Regex::new(
+        r#"\[CharacterClass\(\s*\(int\)eCharacterClass\.(\w+)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)""#,
+    )
+    .ok()?;
+    let attr_caps = attr_re.captures(&raw_source)?;
+    let enum_name = attr_caps[1].to_string();
+    let name = attr_caps[2].to_string();
+    let base_class_name = attr_caps[3].to_string();
+    let id = *enum_ids.get(&enum_name)?;
+
+    let class_decl_re = Regex::new(r"(?m)^\s*public\s+class\s+(\w+)\s*:\s*(\w+)").ok()?;
+    let class_decl = class_decl_re.captures(&raw_source)?;
+    let class_ident = class_decl[1].to_string();
+    let parent_ident = class_decl[2].to_string();
+
+    parse_fields(
+        raw_source,
+        id,
+        name,
+        base_class_name,
+        class_ident,
+        parent_ident,
+        false,
+    )
+}
+
+/// Parses a deployed custom class's source straight from a live server's `scripts/` folder - same
+/// field shapes as a vendored file, but the `[CharacterClass(...)]` attribute carries a raw
+/// integer ID (as emitted by codegen.rs) instead of an `eCharacterClass` enum reference, since a
+/// tool-generated class has no enum entry to reference at all.
+pub fn parse_deployed_source(content: &str) -> Option<ClassInfo> {
+    let attr_re =
+        Regex::new(r#"\[CharacterClass\(\s*(\d+)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)""#).ok()?;
+    let attr_caps = attr_re.captures(content)?;
+    let id: i32 = attr_caps[1].parse().ok()?;
+    let name = attr_caps[2].to_string();
+    let base_class_name = attr_caps[3].to_string();
+
+    let class_decl_re = Regex::new(r"(?m)^\s*public\s+class\s+(\w+)\s*:\s*(\w+)").ok()?;
+    let class_decl = class_decl_re.captures(content)?;
+    let class_ident = class_decl[1].to_string();
+    let parent_ident = class_decl[2].to_string();
+
+    parse_fields(
+        content.to_string(),
+        id,
+        name,
+        base_class_name,
+        class_ident,
+        parent_ident,
+        true,
+    )
 }
 
 /// Parses eCharacterClass.cs into a name -> numeric ID map (e.g. "Druid" -> 47), and separately
@@ -196,11 +244,12 @@ fn parse_race_realms(path: &Path) -> HashMap<String, String> {
     map
 }
 
-/// Walks the bundled `playerclasses/` resource folder and parses every class file found.
-pub fn load_all_classes(resources_dir: &Path) -> Vec<ClassInfo> {
+/// Walks the bundled `playerclasses/` resource folder and parses every class file found, without
+/// resolving realm/effective-races yet (see `finalize_classes`) - split out so deployed custom
+/// classes can be folded into the same set before that resolution pass runs once, together.
+fn load_vendored_unfinalized(resources_dir: &Path) -> Vec<ClassInfo> {
     let enum_file = resources_dir.join("core").join("eCharacterClass.cs");
     let (enum_ids, _) = parse_enum_ids(&enum_file);
-    let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
 
     let playerclasses_dir = resources_dir.join("playerclasses");
     let mut out = Vec::new();
@@ -215,16 +264,50 @@ pub fn load_all_classes(resources_dir: &Path) -> Vec<ClassInfo> {
             }
         }
     }
-    resolve_effective_eligible_races(&mut out);
-    for class in out.iter_mut() {
+    out
+}
+
+/// Resolves `effective_eligible_races` (walking the inheritance chain) and `realm` (from the
+/// first resolved race's real realm, via `PlayerRace.cs`) across a whole set of classes at once,
+/// then sorts them - shared by the vendored-only list and the vendored+deployed combined list, so
+/// a deployed class whose own clone didn't touch races still inherits correctly from whichever
+/// vendored (or other deployed) class it was cloned from.
+fn finalize_classes(classes: &mut Vec<ClassInfo>, race_realms: &HashMap<String, String>) {
+    resolve_effective_eligible_races(classes);
+    for class in classes.iter_mut() {
         if let Some(race) = class.effective_eligible_races.first() {
             if let Some(realm) = race_realms.get(race) {
                 class.realm = realm.clone();
             }
         }
     }
-    out.sort_by(|a, b| a.realm.cmp(&b.realm).then(a.name.cmp(&b.name)));
+    classes.sort_by(|a, b| a.realm.cmp(&b.realm).then(a.name.cmp(&b.name)));
+}
+
+/// Walks the bundled `playerclasses/` resource folder and parses every class file found.
+pub fn load_all_classes(resources_dir: &Path) -> Vec<ClassInfo> {
+    let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
+    let mut out = load_vendored_unfinalized(resources_dir);
+    finalize_classes(&mut out, &race_realms);
     out
+}
+
+/// Same as `load_all_classes`, but also folds in classes that didn't come from the bundled
+/// reference folder at all - namely, custom classes already deployed to a live server (so they
+/// can be picked as a clone source too, i.e. "clone of a clone").
+pub fn load_all_classes_with_extra(resources_dir: &Path, extra: Vec<ClassInfo>) -> Vec<ClassInfo> {
+    let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
+    let mut out = load_vendored_unfinalized(resources_dir);
+    out.extend(extra);
+    finalize_classes(&mut out, &race_realms);
+    out
+}
+
+/// The next ID at least one above the highest already in use, across any mix of vendored and
+/// deployed classes passed in - so a brand-new custom class (which may itself later be cloned
+/// again) never collides with one already deployed to the server.
+pub fn next_free_id_from(classes: &[ClassInfo]) -> i32 {
+    classes.iter().map(|c| c.id).max().unwrap_or(0) + 1
 }
 
 /// `EligibleRaces` is abstract in CharacterClassBase, so every concrete class gets it from
@@ -329,12 +412,6 @@ fn extract_idents(path: std::path::PathBuf, pattern: &str) -> Vec<String> {
 }
 
 /// The next unused numeric class ID, for suggesting a default when creating a new class.
-pub fn next_free_id(resources_dir: &Path) -> i32 {
-    let enum_file = resources_dir.join("core").join("eCharacterClass.cs");
-    let (_, max_id) = parse_enum_ids(&enum_file);
-    max_id + 1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +462,86 @@ mod tests {
         assert_eq!(s.effective_eligible_races, vec!["Celt", "Firbolg"]);
         // Its realm classification should follow its actual races, not its parent's folder.
         assert_eq!(s.realm, "Hibernia");
+    }
+
+    #[test]
+    fn parse_deployed_source_reads_a_tool_generated_class() {
+        // Shaped exactly like codegen.rs's real template: raw integer ID (no enum entry exists
+        // for a brand-new class), a few overridden fields, no EligibleRaces override at all
+        // (meaning it should inherit through the chain once merged with its parent).
+        let content = r#"
+using DOL.GS;
+
+namespace DOL.GS
+{
+    [CharacterClass(64, "Grovekeeper", "Naturalist")]
+    public class ClassGrovekeeper : ClassDruid
+    {
+        public ClassGrovekeeper() : base()
+        {
+            m_profession = "Keepers of the Grove";
+            m_baseHP = 800;
+        }
+    }
+}
+"#;
+        let info = parse_deployed_source(content).expect("should parse");
+        assert_eq!(info.id, 64);
+        assert_eq!(info.name, "Grovekeeper");
+        assert_eq!(info.base_class_name, "Naturalist");
+        assert_eq!(info.class_ident, "ClassGrovekeeper");
+        assert_eq!(info.parent_ident, "ClassDruid");
+        assert_eq!(info.profession.as_deref(), Some("Keepers of the Grove"));
+        assert_eq!(info.base_hp, Some(800));
+        assert!(info.is_custom);
+        assert!(info.eligible_races.is_empty());
+    }
+
+    #[test]
+    fn deployed_class_with_no_race_override_inherits_through_its_custom_parent() {
+        let vendored = load_vendored_unfinalized(&resources());
+        let deployed = parse_deployed_source(
+            r#"
+            [CharacterClass(64, "Grovekeeper", "Naturalist")]
+            public class ClassGrovekeeper : ClassDruid
+            {
+            }
+            "#,
+        )
+        .unwrap();
+        let race_realms = parse_race_realms(&resources().join("core").join("PlayerRace.cs"));
+        let mut combined = vendored;
+        combined.push(deployed);
+        finalize_classes(&mut combined, &race_realms);
+
+        let grovekeeper = combined
+            .iter()
+            .find(|c| c.class_ident == "ClassGrovekeeper")
+            .unwrap();
+        // Druid's own races, inherited transitively (Grovekeeper -> Druid -> Naturalist).
+        assert_eq!(grovekeeper.realm, "Hibernia");
+        assert!(!grovekeeper.effective_eligible_races.is_empty());
+        let druid = combined.iter().find(|c| c.name == "Druid").unwrap();
+        assert_eq!(
+            grovekeeper.effective_eligible_races,
+            druid.effective_eligible_races
+        );
+    }
+
+    #[test]
+    fn next_free_id_from_accounts_for_already_deployed_classes() {
+        let vendored = load_all_classes(&resources());
+        let mut combined = vendored.clone();
+        combined.push(
+            parse_deployed_source(
+                r#"[CharacterClass(200, "Something", "Base")]
+                public class ClassSomething : ClassDruid { }"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(next_free_id_from(&combined), 201);
+        // Without the deployed class folded in, it should just be one above the vendored max.
+        assert!(next_free_id_from(&vendored) < 201);
     }
 
     #[test]
@@ -473,7 +630,7 @@ mod tests {
 
     #[test]
     fn next_free_id_is_above_highest_known() {
-        let id = next_free_id(&resources());
+        let id = next_free_id_from(&load_all_classes(&resources()));
         assert!(
             id >= 64,
             "expected next free id >= 64 (Sluaghbinder is 63), got {id}"

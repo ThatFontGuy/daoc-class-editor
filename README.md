@@ -34,7 +34,11 @@ server source (`dotnet build`, 0 errors) before this tool's design was finalized
   Hibernia; step 2 shows only the archetypes actually used in that realm (Fighter, Acolyte,
   Rogue, ...; most classes are realm-locked already, so there's no point browsing one you can't
   use); step 3 lists the concrete classes descended from that archetype (e.g. Fighter →
-  Armsman/Paladin/Mercenary/Reaver/Mauler) to pick the actual clone source from.
+  Armsman/Paladin/Mercenary/Reaver/Mauler) to pick the actual clone source from - **including any
+  custom classes you've already deployed**, so you can clone a clone to refine it further (e.g.
+  turn a first-draft Grovekeeper into a second, tweaked version) without starting from scratch
+  each time. A deployed class with no race override of its own still correctly inherits races
+  (and therefore realm) from whatever it was cloned from, however many levels deep.
 - Generating a new class file via literal inheritance from any existing one, with a live code
   preview before you deploy anything.
 - **Spec line assignment** - the real fix this needed: specializations are assigned per class by

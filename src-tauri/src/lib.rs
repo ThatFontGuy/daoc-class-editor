@@ -33,10 +33,40 @@ fn list_classes(app: tauri::AppHandle) -> Result<Vec<ClassInfo>, String> {
     Ok(classdata::load_all_classes(&dir))
 }
 
+#[derive(serde::Serialize)]
+struct ClassListResult {
+    classes: Vec<ClassInfo>,
+    /// Set if the deployed-class lookup itself failed (e.g. server unreachable) - the vendored
+    /// classes are still returned so browsing/cloning those isn't blocked by a bad connection.
+    deployed_error: Option<String>,
+}
+
 #[tauri::command]
-fn suggest_next_id(app: tauri::AppHandle) -> Result<i32, String> {
+fn list_classes_with_deployed(
+    app: tauri::AppHandle,
+    cfg: SshConfig,
+) -> Result<ClassListResult, String> {
     let dir = resources_dir(&app)?;
-    Ok(classdata::next_free_id(&dir))
+    let (extra, deployed_error) = match deployed::fetch_deployed_class_infos(&cfg) {
+        Ok(classes) => (classes, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    Ok(ClassListResult {
+        classes: classdata::load_all_classes_with_extra(&dir, extra),
+        deployed_error,
+    })
+}
+
+#[tauri::command]
+fn suggest_next_id(app: tauri::AppHandle, cfg: SshConfig) -> Result<i32, String> {
+    let dir = resources_dir(&app)?;
+    let mut classes = classdata::load_all_classes(&dir);
+    // Best-effort: if the server's unreachable, still suggest a ID that's free among the
+    // vendored classes - better than blocking id suggestion entirely over a bad connection.
+    if let Ok(deployed) = deployed::fetch_deployed_class_infos(&cfg) {
+        classes.extend(deployed);
+    }
+    Ok(classdata::next_free_id_from(&classes))
 }
 
 #[tauri::command]
@@ -142,6 +172,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             list_classes,
+            list_classes_with_deployed,
             suggest_next_id,
             known_options,
             generate_class_code,

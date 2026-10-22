@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Saved class-design project files - personal work in progress, not source
+*.daocclass.json

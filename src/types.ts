@@ -19,7 +19,13 @@ export interface ClassInfo {
   is_focus_caster: boolean | null;
   eligible_races: string[];
   effective_eligible_races: string[];
+  is_custom: boolean;
   raw_source: string;
+}
+
+export interface ClassListResult {
+  classes: ClassInfo[];
+  deployed_error: string | null;
 }
 
 export interface KnownOptions {

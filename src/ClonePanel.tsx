@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ClassInfo,
+  ClassListResult,
   ClassSpecRow,
   CloneRequest,
   KnownOptions,
@@ -15,6 +16,8 @@ import { Overrides, SpecAssignmentUI, useProject } from "./ProjectContext";
 export default function ClonePanel() {
   const [project, setProject] = useProject();
   const [classes, setClasses] = useState<ClassInfo[]>([]);
+  const [classesLoading, setClassesLoading] = useState(false);
+  const [deployedWarning, setDeployedWarning] = useState<string | null>(null);
   const [options, setOptions] = useState<KnownOptions>({
     stats: [],
     races: [],
@@ -30,13 +33,30 @@ export default function ClonePanel() {
   const [sourceSpecs, setSourceSpecs] = useState<ClassSpecRow[] | null>(null);
   const [specLog, setSpecLog] = useState("");
 
-  useEffect(() => {
-    invoke<ClassInfo[]>("list_classes").then(setClasses);
-    invoke<KnownOptions>("known_options").then(setOptions);
-    invoke<SshConfig>("load_ssh_config").then(setSshConfig);
-    if (project.newId === 0) {
-      invoke<number>("suggest_next_id").then((id) => setProject((p) => ({ ...p, newId: id })));
+  async function refreshClasses(cfg: SshConfig) {
+    setClassesLoading(true);
+    try {
+      const result = await invoke<ClassListResult>("list_classes_with_deployed", { cfg });
+      setClasses(result.classes);
+      setDeployedWarning(result.deployed_error);
+    } catch (e) {
+      setDeployedWarning(`Could not load classes: ${e}`);
+    } finally {
+      setClassesLoading(false);
     }
+  }
+
+  useEffect(() => {
+    invoke<KnownOptions>("known_options").then(setOptions);
+    invoke<SshConfig>("load_ssh_config").then((cfg) => {
+      setSshConfig(cfg);
+      refreshClasses(cfg);
+      if (project.newId === 0) {
+        invoke<number>("suggest_next_id", { cfg }).then((id) =>
+          setProject((p) => (p.newId === 0 ? { ...p, newId: id } : p)),
+        );
+      }
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -156,12 +176,17 @@ export default function ClonePanel() {
     setProject((p) => ({ ...p, generatedCode: generated, filename: `${project.newIdent}.cs` }));
   }
 
-  async function runAction(label: string, action: () => Promise<string>) {
+  async function runAction(
+    label: string,
+    action: () => Promise<string>,
+    onSuccess?: () => void,
+  ) {
     setBusy(true);
     setLog((l) => `${l}\n> ${label}...`);
     try {
       const result = await action();
       setLog((l) => `${l}\n${result}`);
+      onSuccess?.();
     } catch (e) {
       setLog((l) => `${l}\nERROR: ${e}`);
     } finally {
@@ -268,6 +293,21 @@ export default function ClonePanel() {
   return (
     <div className="panel">
       <h2>1. Pick a class to clone</h2>
+      <p className="hint">
+        Includes any custom classes you've already deployed to the server (not just the ~63
+        stock classes) - clone one of those again to refine it further.
+      </p>
+      <div className="actions">
+        <button onClick={() => refreshClasses(sshConfig)} disabled={classesLoading}>
+          {classesLoading ? "Refreshing..." : "Refresh class list"}
+        </button>
+      </div>
+      {deployedWarning && (
+        <p className="hint">
+          Could not read deployed custom classes from the server ({deployedWarning}) - only the
+          stock classes are shown below.
+        </p>
+      )}
       {source && (
         <div className="picker-breadcrumb">
           Cloning <strong>{source.name}</strong> ({source.realm}, {source.base_class_name}). Browse
@@ -324,6 +364,7 @@ export default function ClonePanel() {
                 onClick={() => onPickSource(c.class_ident)}
               >
                 {c.name}
+                {c.is_custom && <span className="count">(your custom class)</span>}
               </button>
             ))}
           </div>
@@ -682,12 +723,15 @@ export default function ClonePanel() {
                 <button
                   disabled={busy}
                   onClick={() =>
-                    runAction(`Deploy ${project.filename}`, () =>
-                      invoke<string>("deploy_class", {
-                        cfg: sshConfig,
-                        filename: project.filename,
-                        content: project.generatedCode,
-                      }),
+                    runAction(
+                      `Deploy ${project.filename}`,
+                      () =>
+                        invoke<string>("deploy_class", {
+                          cfg: sshConfig,
+                          filename: project.filename,
+                          content: project.generatedCode,
+                        }),
+                      () => refreshClasses(sshConfig),
                     )
                   }
                 >
