@@ -68,7 +68,7 @@ export default function DeploySettingsPanel() {
     <div className="panel">
       <h2>Server connection</h2>
       <p className="hint">
-        Used to deploy generated class files to your server's <code>scripts/</code> folder, run
+        Used to deploy generated class files to your server's <code>bin/scripts/</code> folder, run
         the small SQL statements this tool needs, and restart the server.
       </p>
       <p className="hint">

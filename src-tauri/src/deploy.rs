@@ -21,8 +21,9 @@ pub struct SshConfig {
     /// Path to a private key file; empty means "use the default SSH agent/keys." Ignored in
     /// local mode.
     pub identity_file: String,
-    /// The server's own root folder (containing scripts/, data/, config/) - on the remote
-    /// machine if `host` is set, or directly on this machine if it's blank.
+    /// The server's own root folder (containing data/, config/, and bin/ where the server
+    /// executable itself lives) - on the remote machine if `host` is set, or directly on this
+    /// machine if it's blank.
     pub remote_server_dir: String,
     /// The server start/stop script's filename - configurable since it can be renamed
     /// (daoc-server.sh by default, but a server owner may have renamed it, e.g. startOthlyn.sh).
@@ -31,6 +32,22 @@ pub struct SshConfig {
 
 pub(crate) fn is_local(cfg: &SshConfig) -> bool {
     cfg.host.trim().is_empty()
+}
+
+/// The server's *real* scripts folder - confirmed directly in the server's own source
+/// (`GameServerConfiguration`'s constructor always resolves `RootDirectory` to wherever its own
+/// executable lives, with no config override path actually wired up), `RootDirectory` is always
+/// `bin/`, not the top-level server folder. `tools/build-release.sh` only symlinks `bin/config`,
+/// `bin/navmesh`, and `bin/logs` back out to the top-level folder - not `bin/scripts` - so
+/// `bin/scripts/` is a real, separate directory (pre-populated with the server's own shipped
+/// `dbupdater/` scripts), distinct from a top-level `scripts/` folder that the running server
+/// never actually looks at. A custom class deployed to the wrong one compiles fine in isolation
+/// and the server logs "Script compilation: True" either way (that's just "no files = trivial
+/// success" when the real folder doesn't contain it), but `ScriptMgr.FindCharacterClass` then
+/// can't find it at all - confirmed by reproducing exactly that "No CharacterClass with ID ...
+/// found" error against a real deployment.
+pub(crate) fn scripts_dir(remote_server_dir: &str) -> PathBuf {
+    Path::new(remote_server_dir).join("bin").join("scripts")
 }
 
 fn config_path() -> PathBuf {
@@ -128,14 +145,15 @@ pub fn test_connection(cfg: &SshConfig) -> Result<String, String> {
     run_command(cmd)
 }
 
-/// Writes `content` as `<server_dir>/scripts/<filename>`, either directly on disk (local mode)
-/// or via a temp file + `scp` (SSH mode).
+/// Writes `content` as `<server_dir>/bin/scripts/<filename>` (the server's real scripts folder -
+/// see `scripts_dir`'s doc comment), either directly on disk (local mode) or via a temp file +
+/// `scp` (SSH mode).
 pub fn deploy_class_file(cfg: &SshConfig, filename: &str, content: &str) -> Result<String, String> {
     if is_local(cfg) {
-        let scripts_dir = Path::new(&cfg.remote_server_dir).join("scripts");
-        std::fs::create_dir_all(&scripts_dir)
-            .map_err(|e| format!("could not create {}: {e}", scripts_dir.display()))?;
-        let target = scripts_dir.join(filename);
+        let dir = scripts_dir(&cfg.remote_server_dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        let target = dir.join(filename);
         std::fs::write(&target, content)
             .map_err(|e| format!("could not write {}: {e}", target.display()))?;
         return Ok(format!("wrote {}", target.display()));
@@ -146,28 +164,28 @@ pub fn deploy_class_file(cfg: &SshConfig, filename: &str, content: &str) -> Resu
         let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
     }
-    // Make sure the remote scripts/ folder exists first (the server also auto-creates it on
+    // Make sure the remote scripts folder exists first (the server also auto-creates it on
     // startup, but a stopped server that has never run with EnableCompilation won't have it yet).
     let mkdir_result = {
         let mut cmd = Command::new("ssh");
         cmd.args(ssh_base_args(cfg))
             .arg(format!("{}@{}", cfg.user, cfg.host))
             .arg(format!(
-                "mkdir -p '{}/scripts'",
+                "mkdir -p '{}/bin/scripts'",
                 shell_escape(&cfg.remote_server_dir)
             ));
         run_command(cmd)
     };
     if let Err(e) = mkdir_result {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not prepare remote scripts/ folder: {e}"));
+        return Err(format!("could not prepare remote scripts folder: {e}"));
     }
 
     let mut cmd = Command::new("scp");
     cmd.args(ssh_base_scp_args(cfg));
     cmd.arg(&tmp);
     cmd.arg(format!(
-        "{}@{}:{}/scripts/{}",
+        "{}@{}:{}/bin/scripts/{}",
         cfg.user, cfg.host, cfg.remote_server_dir, filename
     ));
     let result = run_command(cmd);
@@ -414,7 +432,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
         let result = deploy_class_file(&cfg("", tmp.to_str().unwrap()), "ClassTest.cs", "// hi");
         assert!(result.is_ok(), "{result:?}");
-        let written = std::fs::read_to_string(tmp.join("scripts/ClassTest.cs")).unwrap();
+        let written = std::fs::read_to_string(tmp.join("bin/scripts/ClassTest.cs")).unwrap();
         assert_eq!(written, "// hi");
         std::fs::remove_dir_all(&tmp).ok();
     }

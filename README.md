@@ -19,13 +19,18 @@ fields (stats, eligible races, profession text) - nothing else needs to change.
 
 Better still: the server has a **built-in runtime C# compiler**
 (`GameServer.CompileScripts`, enabled by default via `EnableCompilation=True`) that recompiles
-anything dropped into `<server-folder>/scripts/` **at every server startup** - completely
+anything dropped into `<server-folder>/bin/scripts/` **at every server startup** - completely
 separate from the server's own `dotnet build` pipeline. So a new class doesn't need a server
 rebuild or redeploy at all: this tool generates the `.cs` file, SCPs it to your server's
-`scripts/` folder, and restarts the server. That's it.
+`bin/scripts/` folder, and restarts the server. That's it. (Note: this is `bin/scripts/`, not a
+top-level `scripts/` folder - the server's own `RootDirectory` always resolves to wherever its own
+executable lives, confirmed directly in `GameServerConfiguration`'s constructor, and
+`tools/build-release.sh` doesn't symlink `scripts` back out to the top level the way it does for
+`config`/`navmesh`/`logs`.)
 
 This was verified for real, not just assumed: a generated file was compiled against the actual
-server source (`dotnet build`, 0 errors) before this tool's design was finalized.
+server source (`dotnet build`, 0 errors) before this tool's design was finalized, and the actual
+deployment path was confirmed against a real running server after an early mix-up (see history).
 
 ## What it can and can't automate
 
@@ -48,10 +53,10 @@ server source (`dotnet build`, 0 errors) before this tool's design was finalized
   same spec, shared with every class that already has it) or **clone & rename** (an independent
   copy - its own `Specialization` row, `SpellLine`(s), `LineXSpell` entries, and `Style` rows,
   with weapon/armor-class locks correctly repointed to the new class).
-- Deploying the generated file to your server's `scripts/` folder and restarting it, over SSH or
-  locally.
+- Deploying the generated file to your server's `bin/scripts/` folder and restarting it, over
+  SSH or locally.
 - **Listing, editing, and deleting already-deployed classes** - a "Deployed classes" tab lists
-  every custom class currently in `scripts/` (parsed straight from each file's
+  every custom class currently in `bin/scripts/` (parsed straight from each file's
   `[CharacterClass(id, "Name", "Base")]` attribute). **Edit** opens it back up in the clone wizard
   with its name/ID/filename locked (so redeploying overwrites the same file, not a new one) and
   every stat/profession/race field pre-filled with its *current* values, diffed against whatever

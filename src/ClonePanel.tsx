@@ -767,7 +767,7 @@ export default function ClonePanel() {
                 </p>
               )}
               <label className="field">
-                <span>Filename in the server's scripts/ folder</span>
+                <span>Filename in the server's bin/scripts/ folder</span>
                 <input
                   value={project.filename}
                   onChange={(e) => setProject((p) => ({ ...p, filename: e.target.value }))}

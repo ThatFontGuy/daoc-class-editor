@@ -1,5 +1,6 @@
-//! Lists and removes classes that have actually been deployed to a server's `scripts/` folder -
-//! for debugging a clone that didn't work, or general cleanup, per the owner's request.
+//! Lists and removes classes that have actually been deployed to the server's real scripts
+//! folder (`deploy::scripts_dir`, i.e. `bin/scripts/` - not a top-level `scripts/`) - for
+//! debugging a clone that didn't work, or general cleanup, per the owner's request.
 //!
 //! Unlike the vendored reference classes (classdata.rs), a deployed custom class's attribute
 //! carries a raw integer ID directly (`[CharacterClass(64, "Name", "Base")]`, from codegen.rs's
@@ -9,24 +10,25 @@
 
 use crate::classdata::ClassInfo;
 use crate::deploy::{
-    SshConfig, is_local, run_command, run_remote_sql, run_remote_sql_json, ssh_base_args,
+    SshConfig, is_local, run_command, run_remote_sql, run_remote_sql_json, scripts_dir,
+    ssh_base_args,
 };
 use serde_json::Value;
-use std::path::Path;
 use std::process::Command;
 
 const MARKER: &str = "===DAOC-CLASS-EDITOR-FILE===";
 
-/// Reads every `.cs` file's (filename, content) out of `<server_dir>/scripts/` - used by
-/// `fetch_deployed_class_infos` to parse each into a full `ClassInfo`.
+/// Reads every `.cs` file's (filename, content) out of the server's real scripts folder - see
+/// `deploy::scripts_dir`'s doc comment for why that's `bin/scripts/`, not a top-level `scripts/`.
+/// Used by `fetch_deployed_class_infos` to parse each into a full `ClassInfo`.
 fn read_script_files(cfg: &SshConfig) -> Result<Vec<(String, String)>, String> {
-    let scripts_dir = Path::new(&cfg.remote_server_dir).join("scripts");
+    let dir = scripts_dir(&cfg.remote_server_dir);
     if is_local(cfg) {
-        if !scripts_dir.is_dir() {
+        if !dir.is_dir() {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for entry in std::fs::read_dir(&scripts_dir).map_err(|e| e.to_string())? {
+        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("cs") {
@@ -40,7 +42,7 @@ fn read_script_files(cfg: &SshConfig) -> Result<Vec<(String, String)>, String> {
     }
 
     let remote_cmd = format!(
-        "cd '{}/scripts' 2>/dev/null && for f in *.cs; do [ -f \"$f\" ] || continue; echo '{MARKER}'\"$f\"; cat \"$f\"; done",
+        "cd '{}/bin/scripts' 2>/dev/null && for f in *.cs; do [ -f \"$f\" ] || continue; echo '{MARKER}'\"$f\"; cat \"$f\"; done",
         shell_escape(&cfg.remote_server_dir)
     );
     let mut cmd = Command::new("ssh");
@@ -98,9 +100,7 @@ pub fn delete_deployed_class(
 ) -> Result<String, String> {
     let mut log = String::new();
 
-    let script_path = Path::new(&cfg.remote_server_dir)
-        .join("scripts")
-        .join(filename);
+    let script_path = scripts_dir(&cfg.remote_server_dir).join(filename);
     if is_local(cfg) {
         std::fs::remove_file(&script_path)
             .map_err(|e| format!("could not remove {}: {e}", script_path.display()))?;
@@ -195,6 +195,7 @@ fn sql_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::process::Command;
 
     fn test_cfg(dir: &Path) -> SshConfig {
@@ -208,7 +209,8 @@ mod tests {
         }
     }
 
-    /// A fresh temp "server folder" with a `scripts/` folder holding one deployed custom class
+    /// A fresh temp "server folder" with `bin/scripts/` (the server's real scripts folder, not a
+    /// top-level `scripts/` - see `deploy::scripts_dir`) holding one deployed custom class
     /// (`GrovekeeperClass.cs`, id 64, cloned from "Acolyte") and one unrelated `.cs` file that
     /// should be skipped entirely, plus a database seeded with that class's `ClassXSpecialization`
     /// row and spec data both cloned for class 64 (`earthshatter_64` + its spell line) and a
@@ -217,15 +219,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("daoc-class-editor-deployed-test-{name}"));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("data")).unwrap();
-        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::create_dir_all(dir.join("bin/scripts")).unwrap();
 
         std::fs::write(
-            dir.join("scripts/GrovekeeperClass.cs"),
+            dir.join("bin/scripts/GrovekeeperClass.cs"),
             "using DOL.GS;\n\nnamespace DOL.GS\n{\n    [CharacterClass(64, \"Grovekeeper\", \"Acolyte\")]\n    public class ClassGrovekeeper : ClassAcolyte\n    {\n    }\n}\n",
         )
         .unwrap();
         std::fs::write(
-            dir.join("scripts/NotAClass.cs"),
+            dir.join("bin/scripts/NotAClass.cs"),
             "// just a helper file, no attribute here\n",
         )
         .unwrap();
@@ -279,7 +281,7 @@ mod tests {
 
         delete_deployed_class(&cfg, "GrovekeeperClass.cs", 64, false).unwrap();
 
-        assert!(!dir.join("scripts/GrovekeeperClass.cs").exists());
+        assert!(!dir.join("bin/scripts/GrovekeeperClass.cs").exists());
         let rows = run_remote_sql_json(
             &cfg,
             "SELECT * FROM ClassXSpecialization WHERE ClassID = 64;",

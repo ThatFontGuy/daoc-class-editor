@@ -150,9 +150,10 @@ pub fn generate(req: &CloneRequest) -> String {
  * specializations, spell eligibility, equipment rules, and anything else the base class defines.
  *
  * This file is not part of the normal Offline DAoC installation. Deploy it to your server's
- * <server-folder>/scripts/ folder and restart - the server's own runtime script compiler
- * (GameServer.CompileScripts, enabled by default via EnableCompilation) picks it up without
- * needing a full rebuild of the server itself.
+ * <server-folder>/bin/scripts/ folder (not a top-level scripts/ - the server's own
+ * RootDirectory always resolves to wherever its own executable lives) and restart - the
+ * server's own runtime script compiler (GameServer.CompileScripts, enabled by default via
+ * EnableCompilation) picks it up without needing a full rebuild of the server itself.
  */
 using System.Collections.Generic;
 using DOL.GS.Realm;

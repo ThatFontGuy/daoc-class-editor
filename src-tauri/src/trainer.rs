@@ -52,9 +52,11 @@ pub fn generate_trainer_code(req: &TrainerRequest) -> String {
  * offers to promote them once they reach level {min_level}, same as every other post-launch
  * class (see DOL.GS.Trainer.SluaghbinderTrainer for the real precedent this follows).
  *
- * Deploy to your server's <server-folder>/scripts/ folder and restart, then spawn an NPC with
- * Guild = "{guild_name}" and ClassType = "DOL.GS.Trainer.{trainer_class_ident}" for the server's
- * runtime script compiler and NPCGuildScript binding to pick this up.
+ * Deploy to your server's <server-folder>/bin/scripts/ folder (not a top-level scripts/ - the
+ * server's own RootDirectory always resolves to wherever its own executable lives) and restart,
+ * then spawn an NPC with Guild = "{guild_name}" and ClassType =
+ * "DOL.GS.Trainer.{trainer_class_ident}" for the server's runtime script compiler and
+ * NPCGuildScript binding to pick this up.
  */
 using DOL.GS.PacketHandler;
 

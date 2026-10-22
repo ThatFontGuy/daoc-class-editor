@@ -188,7 +188,7 @@ export default function TrainerPanel({
             <>
               <textarea className="code-preview" readOnly value={trainer.generatedCode} rows={16} />
               <label className="field">
-                <span>Filename in the server's scripts/ folder</span>
+                <span>Filename in the server's bin/scripts/ folder</span>
                 <input
                   value={trainer.filename}
                   onChange={(e) => setTrainer({ filename: e.target.value })}

@@ -33,7 +33,7 @@ export default function DeployedClassesPanel({ onEditDeployed }: { onEditDeploye
         result.deployed_error
           ? `Could not read deployed classes: ${result.deployed_error}`
           : deployed.length === 0
-            ? "No deployed custom classes found in scripts/."
+            ? "No deployed custom classes found in bin/scripts/."
             : "",
       );
     } catch (e) {
@@ -61,7 +61,7 @@ export default function DeployedClassesPanel({ onEditDeployed }: { onEditDeploye
     const cleanup = cleanupByFile[filename] ?? true;
     const warning =
       `Delete "${c.name}" (id ${c.id}, ${filename})?\n\n` +
-      "This removes the class file from scripts/ and its spec assignments" +
+      "This removes the class file from bin/scripts/ and its spec assignments" +
       (cleanup ? ", plus every spec line/spell line/style this tool cloned for it." : ".") +
       "\n\nAny existing character already using this class would be left in a broken state - " +
       "only delete classes with no characters on them, and stop the server first.";
@@ -89,7 +89,7 @@ export default function DeployedClassesPanel({ onEditDeployed }: { onEditDeploye
     <div className="panel">
       <h2>Deployed classes</h2>
       <p className="hint">
-        Lists custom classes currently in your server's <code>scripts/</code> folder (anything
+        Lists custom classes currently in your server's <code>bin/scripts/</code> folder (anything
         generated and deployed with this tool). Edit one to tweak its stats/races/etc and
         redeploy in place, or delete one to clean up a clone that didn't work out.
       </p>
