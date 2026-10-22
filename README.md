@@ -30,8 +30,11 @@ server source (`dotnet build`, 0 errors) before this tool's design was finalized
 ## What it can and can't automate
 
 **Fully automated:**
-- Browsing every existing class (all four realms + shared base classes), with their real stats,
-  specs, races, and profession text, parsed straight from the server's own source.
+- **Picking a class to clone, by realm then base class** - step 1 narrows to Albion, Midgard, or
+  Hibernia; step 2 shows only the archetypes actually used in that realm (Fighter, Acolyte,
+  Rogue, ...; most classes are realm-locked already, so there's no point browsing one you can't
+  use); step 3 lists the concrete classes descended from that archetype (e.g. Fighter →
+  Armsman/Paladin/Mercenary/Reaver/Mauler) to pick the actual clone source from.
 - Generating a new class file via literal inheritance from any existing one, with a live code
   preview before you deploy anything.
 - **Spec line assignment** - the real fix this needed: specializations are assigned per class by

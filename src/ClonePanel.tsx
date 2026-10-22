@@ -45,13 +45,63 @@ export default function ClonePanel() {
     [classes, project.sourceClassIdent],
   );
 
-  const byRealm = useMemo(() => {
-    const groups: Record<string, ClassInfo[]> = {};
-    for (const c of classes) {
-      (groups[c.realm] ??= []).push(c);
+  // The base archetype files (ClassFighter, ClassAcolyte, ClassViking, ...) parse into ClassInfo
+  // records too (classdata.rs needs them for the EligibleRaces inheritance fallback), but they
+  // aren't playable classes themselves - only concrete classes that subclass one of them are
+  // valid clone sources. "CharacterClassBase" is the literal C# parent every archetype file
+  // itself extends, so anything still pointing at it directly is an archetype, not a leaf class.
+  const leafClasses = useMemo(
+    () => classes.filter((c) => c.parent_ident !== "CharacterClassBase"),
+    [classes],
+  );
+
+  const REALM_ORDER = ["Albion", "Midgard", "Hibernia"];
+  const realms = useMemo(() => {
+    const present = new Set(leafClasses.map((c) => c.realm));
+    return REALM_ORDER.filter((r) => present.has(r)).concat(
+      [...present].filter((r) => !REALM_ORDER.includes(r)).sort(),
+    );
+  }, [leafClasses]);
+
+  const [pickerRealm, setPickerRealm] = useState<string | null>(null);
+  const [pickerBase, setPickerBase] = useState<string | null>(null);
+
+  // Keep the picker's realm/base-class context pointed at whatever is actually selected (e.g.
+  // right after loading a saved project), without resetting it just because the user clicks
+  // around between realms/base classes while still looking for something else to clone.
+  useEffect(() => {
+    if (source) {
+      setPickerRealm(source.realm);
+      setPickerBase(source.base_class_name);
     }
-    return groups;
-  }, [classes]);
+  }, [source]);
+
+  const baseClassesForRealm = useMemo(() => {
+    if (!pickerRealm) return [];
+    const counts = new Map<string, number>();
+    for (const c of leafClasses) {
+      if (c.realm === pickerRealm) {
+        counts.set(c.base_class_name, (counts.get(c.base_class_name) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b));
+  }, [leafClasses, pickerRealm]);
+
+  const classesForBase = useMemo(() => {
+    if (!pickerRealm || !pickerBase) return [];
+    return leafClasses
+      .filter((c) => c.realm === pickerRealm && c.base_class_name === pickerBase)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [leafClasses, pickerRealm, pickerBase]);
+
+  function onPickRealm(realm: string) {
+    setPickerRealm(realm);
+    setPickerBase(null);
+  }
+
+  function onPickBase(base: string) {
+    setPickerBase(base);
+  }
 
   function onPickSource(id: string) {
     setProject((p) => ({
@@ -218,18 +268,67 @@ export default function ClonePanel() {
   return (
     <div className="panel">
       <h2>1. Pick a class to clone</h2>
-      <select value={project.sourceClassIdent} onChange={(e) => onPickSource(e.target.value)}>
-        <option value="">-- choose a source class --</option>
-        {Object.entries(byRealm).map(([realm, list]) => (
-          <optgroup label={realm} key={realm}>
-            {list.map((c) => (
-              <option value={c.class_ident} key={c.class_ident}>
-                {c.name} (base: {c.base_class_name})
-              </option>
-            ))}
-          </optgroup>
+      {source && (
+        <div className="picker-breadcrumb">
+          Cloning <strong>{source.name}</strong> ({source.realm}, {source.base_class_name}). Browse
+          below to pick a different one, or continue to step 2.
+        </div>
+      )}
+
+      <div className="picker-step-label">Realm</div>
+      <div className="picker-row">
+        {realms.map((realm) => (
+          <button
+            key={realm}
+            className={`picker-btn ${pickerRealm === realm ? "active" : ""}`}
+            onClick={() => onPickRealm(realm)}
+          >
+            {realm}
+          </button>
         ))}
-      </select>
+      </div>
+
+      {pickerRealm && (
+        <>
+          <div className="picker-step-label">
+            Base class (every class below only sees races, specs, and abilities valid for{" "}
+            {pickerRealm})
+          </div>
+          <div className="picker-row">
+            {baseClassesForRealm.map(([base, count]) => (
+              <button
+                key={base}
+                className={`picker-btn ${pickerBase === base ? "active" : ""}`}
+                onClick={() => onPickBase(base)}
+              >
+                {base}
+                <span className="count">
+                  ({count} class{count === 1 ? "" : "es"})
+                </span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      {pickerRealm && pickerBase && (
+        <>
+          <div className="picker-step-label">
+            {pickerBase}-descended classes in {pickerRealm}
+          </div>
+          <div className="picker-row">
+            {classesForBase.map((c) => (
+              <button
+                key={c.class_ident}
+                className={`picker-btn ${project.sourceClassIdent === c.class_ident ? "active" : ""}`}
+                onClick={() => onPickSource(c.class_ident)}
+              >
+                {c.name}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
 
       {source && (
         <>
