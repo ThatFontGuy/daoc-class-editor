@@ -235,9 +235,52 @@ pub fn remote_server_control(cfg: &SshConfig, action: &str) -> Result<String, St
     }
     if is_local(cfg) {
         let script = Path::new(&cfg.remote_server_dir).join(&cfg.start_script_name);
+        if action == "start" {
+            // The server keeps running as a background process after "start" returns - if its
+            // stdout/stderr aren't redirected away from us, `.output()` below would block
+            // forever waiting for pipes that never close (observed in practice: a "Start
+            // server" click left the whole app stuck on *any* subsequent action, because this
+            // was a synchronous command handler blocking the thread it ran on). Redirecting
+            // before spawning, and not waiting on the child at all, avoids that regardless of
+            // whether the start script itself redirects its own output.
+            let mut cmd = Command::new(&script);
+            cmd.current_dir(&cfg.remote_server_dir)
+                .arg(action)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            cmd.spawn()
+                .map_err(|e| format!("failed to launch {}: {e}", script.display()))?;
+            return Ok(
+                "Start requested (not waiting for the server process - check status separately)"
+                    .to_string(),
+            );
+        }
         let mut cmd = Command::new(&script);
         cmd.current_dir(&cfg.remote_server_dir).arg(action);
         return run_command(cmd);
+    }
+    if action == "start" {
+        // Same reasoning as the local branch above, but the hang is even easier to hit over SSH:
+        // ssh itself won't return until every duplicated stdio stream from the remote session
+        // closes, which a background server process holding them open prevents indefinitely.
+        // `nohup ... </dev/null >/dev/null 2>&1 &` severs the backgrounded process from this
+        // session's streams entirely, so the remote shell (and therefore ssh) returns almost
+        // immediately regardless of how the start script itself handles its own output.
+        let remote_cmd = format!(
+            "cd '{}' && nohup ./{} start </dev/null >/dev/null 2>&1 &",
+            shell_escape(&cfg.remote_server_dir),
+            shell_escape(&cfg.start_script_name),
+        );
+        let mut cmd = Command::new("ssh");
+        cmd.args(ssh_base_args(cfg))
+            .arg(format!("{}@{}", cfg.user, cfg.host))
+            .arg(remote_cmd);
+        run_command(cmd)?;
+        return Ok(
+            "Start requested (not waiting for the server process - check status separately)"
+                .to_string(),
+        );
     }
     let remote_cmd = format!(
         "cd '{}' && ./{} {}",
@@ -335,6 +378,33 @@ mod tests {
 
         let result = remote_server_control(&cfg("", tmp.to_str().unwrap()), "status");
         assert_eq!(result.unwrap().trim(), "status ok");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn local_start_action_does_not_wait_for_a_backgrounded_child() {
+        let tmp = std::env::temp_dir().join("daoc-class-editor-test-start-script-dir");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = tmp.join("daoc-server.sh");
+        // Simulates a start script that backgrounds a long-running process without redirecting
+        // its own output - the real-world bug this guards against: a "Start server" click left
+        // the whole app stuck on every later action, because this command used to synchronously
+        // wait on pipes a backgrounded server process held open forever.
+        std::fs::write(&script, "#!/bin/sh\n(sleep 30) &\necho started\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = remote_server_control(&cfg("", tmp.to_str().unwrap()), "start");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "start action should return almost immediately, took {:?}",
+            start.elapsed()
+        );
+
         std::fs::remove_dir_all(&tmp).ok();
     }
 
