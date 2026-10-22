@@ -133,8 +133,29 @@ export function buildEditingProjectState(cls: ClassInfo, parent: ClassInfo): Pro
     ),
     class_type: differs(cls.class_type, parent.class_type),
     is_focus_caster: differs(cls.is_focus_caster, parent.is_focus_caster),
-    eligible_races: cls.eligible_races.length > 0 && !sameRaces(cls.eligible_races, parent.eligible_races),
+    eligible_races:
+      cls.eligible_races.length > 0 && !sameRaces(cls.eligible_races, parent.eligible_races),
   };
+
+  // Only seed `values` for fields that actually have their own override - otherwise the step 4
+  // form's "prefer the project's own value, falling back to the source class's" display would
+  // wrongly show this seeded value (e.g. 0, "") instead of correctly falling through to the
+  // parent's real one, for every field this class simply inherits untouched. This is exactly the
+  // bug that made base HP/weapon skill base/specialization multiplier look un-inherited when
+  // editing a class that never overrode them in the first place.
+  const values: ProjectState["values"] = {};
+  if (overrides.profession) values.profession = cls.profession ?? "";
+  if (overrides.primary_stat) values.primary_stat = cls.primary_stat ?? "";
+  if (overrides.secondary_stat) values.secondary_stat = cls.secondary_stat ?? "";
+  if (overrides.tertiary_stat) values.tertiary_stat = cls.tertiary_stat ?? "";
+  if (overrides.mana_stat) values.mana_stat = cls.mana_stat ?? "";
+  if (overrides.ws_base) values.ws_base = cls.ws_base ?? 0;
+  if (overrides.base_hp) values.base_hp = cls.base_hp ?? 0;
+  if (overrides.specialization_multiplier)
+    values.specialization_multiplier = cls.specialization_multiplier ?? 10;
+  if (overrides.class_type) values.class_type = cls.class_type ?? "";
+  if (overrides.is_focus_caster) values.is_focus_caster = cls.is_focus_caster ?? false;
+  if (overrides.eligible_races) values.eligible_races = cls.effective_eligible_races;
 
   return {
     ...emptyProjectState,
@@ -143,19 +164,7 @@ export function buildEditingProjectState(cls: ClassInfo, parent: ClassInfo): Pro
     newIdent: cls.class_ident,
     newId: cls.id,
     overrides,
-    values: {
-      profession: cls.profession ?? "",
-      primary_stat: cls.primary_stat ?? "",
-      secondary_stat: cls.secondary_stat ?? "",
-      tertiary_stat: cls.tertiary_stat ?? "",
-      mana_stat: cls.mana_stat ?? "",
-      ws_base: cls.ws_base ?? 0,
-      base_hp: cls.base_hp ?? 0,
-      specialization_multiplier: cls.specialization_multiplier ?? 10,
-      class_type: cls.class_type ?? "",
-      is_focus_caster: cls.is_focus_caster ?? false,
-      eligible_races: cls.effective_eligible_races,
-    },
+    values,
     filename: cls.filename ?? `${cls.class_ident}.cs`,
     editingDeployedClassId: cls.id,
   };
