@@ -367,6 +367,36 @@ fn clone_spec(
          FROM Style WHERE SpecKeyName = '{source_key_q}' GROUP BY Name, SpecLevelRequirement;\n"
     ));
 
+    // Style.ID is a *separate* field from the DB primary key StyleID - it's what a chain style's
+    // own OpeningRequirementValue references (AttackResultRequirement=7, "a style is required")
+    // to name its prerequisite, confirmed in the real server source and packet code
+    // (`it.Item1.ID == style.OpeningRequirementValue`). The INSERT above never set it (so every
+    // cloned style got the column's bare default, 0 - no two clones distinguishable at all), and
+    // even if it had just copied the source's own ID verbatim, that value belongs to the
+    // *un-cloned* prerequisite style, not whichever row this clone got - a real, reproduced bug
+    // found live: a cloned "Gale" style still pointed at the source class's "Snow Shower" (by its
+    // old ID), which doesn't exist in the new spec's own ID space, so the client showed no
+    // prerequisite for it at all.
+    //
+    // Fixed in two passes, both scoped to exactly the rows this clone just inserted - first, give
+    // every cloned style its own StyleID (the DB primary key, already guaranteed unique) as its
+    // ID too, which is all a plain, non-chain style needs. Then, for every chain style among
+    // them, look up its prerequisite by matching *names* between the original spec's styles and
+    // this clone's own (now-ID-correct) styles, and repoint OpeningRequirementValue at the
+    // clone's own prerequisite's new ID - never the original's.
+    batch.push_str(&format!(
+        "UPDATE Style SET ID = StyleID WHERE SpecKeyName = '{new_key_q}';\n"
+    ));
+    batch.push_str(&format!(
+        "UPDATE Style SET OpeningRequirementValue = COALESCE((\
+             SELECT new_style.StyleID FROM Style AS old_style \
+             JOIN Style AS new_style ON new_style.Name = old_style.Name AND new_style.SpecKeyName = '{new_key_q}' \
+             WHERE old_style.SpecKeyName = '{source_key_q}' AND old_style.ID = Style.OpeningRequirementValue \
+             LIMIT 1\
+         ), OpeningRequirementValue) \
+         WHERE SpecKeyName = '{new_key_q}' AND AttackResultRequirement = 7;\n"
+    ));
+
     // SpecXAbility: level-granted abilities (e.g. Stealth's "Safe Fall"/"Detect Hidden"/etc.,
     // or a "Career" spec's auto-trained bonuses like Evade) - a real, confirmed gap found live:
     // cloning a spec with these (any Implementation, not just plain combat specs) silently
@@ -445,7 +475,8 @@ mod tests {
                 SpecLevelRequirement INTEGER, Icon INTEGER, EnduranceCost INTEGER, StealthRequirement INTEGER,
                 OpeningRequirementType INTEGER, OpeningRequirementValue INTEGER, AttackResultRequirement INTEGER,
                 WeaponTypeRequirement INTEGER, GrowthOffset REAL, GrowthRate REAL, BonusToHit INTEGER,
-                BonusToDefense INTEGER, TwoHandAnimation INTEGER, RandomProc INTEGER, ArmorHitLocation INTEGER);
+                BonusToDefense INTEGER, TwoHandAnimation INTEGER, RandomProc INTEGER, ArmorHitLocation INTEGER,
+                ID INTEGER DEFAULT 0);
             CREATE TABLE SpecXAbility (SpecXabilityID INTEGER PRIMARY KEY AUTOINCREMENT, Spec TEXT, SpecLevel INTEGER,
                 AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
 
@@ -453,8 +484,8 @@ mod tests {
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL, 0);
             INSERT INTO ClassXSpecialization VALUES (1, 'slash', 0);
             INSERT INTO ClassXSpecialization VALUES (1, 'smite', 0);
-            INSERT INTO Style VALUES (NULL, 1, 'Pulverize', 'slash', 5, 300, 5, 0, 1, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
-            INSERT INTO Style VALUES (NULL, 0, 'Backlash', 'slash', 10, 301, 5, 1, 2, 1, 1, 1, 1.0, 1.0, 5, 0, 0, 0, 0);
+            INSERT INTO Style VALUES (NULL, 1, 'Pulverize', 'slash', 5, 300, 5, 0, 1, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);
+            INSERT INTO Style VALUES (NULL, 0, 'Backlash', 'slash', 10, 301, 5, 1, 2, 1, 1, 1, 1.0, 1.0, 5, 0, 0, 0, 0, 0);
             INSERT INTO SpellLine VALUES ('smite_base', 'Smiting Spells', 'smite', 0, 1);
             INSERT INTO LineXSpell VALUES ('smite_base', 9001, 1);
             INSERT INTO LineXSpell VALUES ('smite_base', 9002, 10);
@@ -625,9 +656,9 @@ mod tests {
         let cfg = test_cfg(&dir);
         let sql = "
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('dual', 'Celtic Dual', 'Dual wield', 300, NULL, 0);
-            INSERT INTO Style VALUES (NULL, 999, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
-            INSERT INTO Style VALUES (NULL, 888, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
-            INSERT INTO Style VALUES (NULL, 777, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
+            INSERT INTO Style VALUES (NULL, 999, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 400);
+            INSERT INTO Style VALUES (NULL, 888, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 400);
+            INSERT INTO Style VALUES (NULL, 777, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 400);
         ";
         let status = Command::new("sqlite3")
             .arg(dir.join("data/opendaoc.sqlite3.db"))
@@ -660,6 +691,73 @@ mod tests {
             int_field(&rows[0], "ClassId"),
             64,
             "a style locked to an unrelated third class must still repoint to the new class"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clone_remaps_a_chain_style_prerequisite_to_its_own_cloned_prerequisite() {
+        // Reproduces a real bug found live: "Gale" (a chain style requiring "Snow Shower" to
+        // have been used first) still pointed at Snow Shower's *original* ID after cloning -
+        // meaningless in the new spec's own ID space (every cloned style's ID was left at its
+        // bare default, 0, and nothing remapped OpeningRequirementValue in the first place), so
+        // the client showed no prerequisite for it at all. Both styles must be cloned together
+        // (same spec) for the remap to have something to resolve to - which it also confirms by
+        // asserting the two new IDs actually differ from both each other and the originals.
+        let dir = setup_test_db("clone-chain-style");
+        let cfg = test_cfg(&dir);
+        let sql = "
+            INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('dual', 'Celtic Dual', 'Dual wield', 300, NULL, 0);
+            INSERT INTO Style (StyleID, ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, EnduranceCost, StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, RandomProc, ArmorHitLocation, ID)
+                VALUES (NULL, 0, 'Snow Shower', 'dual', 2, 400, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 323);
+            INSERT INTO Style (StyleID, ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, EnduranceCost, StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, RandomProc, ArmorHitLocation, ID)
+                VALUES (NULL, 0, 'Gale', 'dual', 4, 401, 10, 0, 0, 323, 7, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 324);
+        ";
+        let status = Command::new("sqlite3")
+            .arg(dir.join("data/opendaoc.sqlite3.db"))
+            .arg(sql)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let assignments = vec![SpecAssignment {
+            source_key: "dual".to_string(),
+            new_key: "nosferatusclaw".to_string(),
+            new_name: "Nosferatu's Claw".to_string(),
+            level_acquired: 0,
+        }];
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
+
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT StyleID, ID, Name, OpeningRequirementValue FROM Style WHERE SpecKeyName='nosferatusclaw_64' ORDER BY Name;",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let gale = rows
+            .iter()
+            .find(|r| str_field(r, "Name") == "Gale")
+            .unwrap();
+        let snow_shower = rows
+            .iter()
+            .find(|r| str_field(r, "Name") == "Snow Shower")
+            .unwrap();
+
+        assert_ne!(
+            int_field(snow_shower, "ID"),
+            0,
+            "a cloned style must get its own real ID, not the column's bare default"
+        );
+        assert_ne!(
+            int_field(snow_shower, "ID"),
+            323,
+            "a cloned style's ID must not collide with the source's own ID either"
+        );
+        assert_eq!(
+            int_field(gale, "OpeningRequirementValue"),
+            int_field(snow_shower, "ID"),
+            "Gale's prerequisite must repoint to its own cloned Snow Shower, not the original"
         );
 
         std::fs::remove_dir_all(&dir).ok();
