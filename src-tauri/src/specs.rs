@@ -23,6 +23,118 @@ use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Mirrors `GlobalConstants.GetSpecToInternalIndex`'s hardcoded spec-name -> client-recognized
+/// style-category index table from the real server source, so a clone can automatically inherit
+/// its source spec's own category instead of needing a server-side code change for every new
+/// custom spec. Keep in sync with that switch statement if the server ever adds a real DAoC spec
+/// this tool doesn't know about yet (it only affects which "bucket" a style's icon/label is
+/// grouped under - harmless, cosmetic-only, if a name here goes stale).
+const CLIENT_STYLE_GROUPS: &[(&str, u8)] = &[
+    ("Slash", 0x01),
+    ("Thrust", 0x02),
+    ("Parry", 0x08),
+    ("Sword", 0x0E),
+    ("Hammer", 0x10),
+    ("Axe", 0x11),
+    ("Left Axe", 0x12),
+    ("Stealth", 0x13),
+    ("Spear", 0x1A),
+    ("Mending", 0x1D),
+    ("Augmentation", 0x1E),
+    ("Crush", 0x21),
+    ("Pacification", 0x22),
+    ("Darkness", 0x26),
+    ("Suppression", 0x27),
+    ("Runecarving", 0x2A),
+    ("Shields", 0x2B),
+    ("Flexible", 0x2E),
+    ("Staff", 0x2F),
+    ("Summoning", 0x30),
+    ("Stormcalling", 0x32),
+    ("Beastcraft", 0x3E),
+    ("Polearm", 0x40),
+    ("Two Handed", 0x41),
+    ("Fire Magic", 0x42),
+    ("Wind Magic", 0x43),
+    ("Cold Magic", 0x44),
+    ("Earth Magic", 0x45),
+    ("Light", 0x46),
+    ("Matter Magic", 0x47),
+    ("Body Magic", 0x48),
+    ("Spirit Magic", 0x49),
+    ("Mind Magic", 0x4A),
+    ("Void", 0x4B),
+    ("Mana", 0x4C),
+    ("Dual Wield", 0x4D),
+    ("Composite Bow", 0x4E),
+    ("Battlesongs", 0x52),
+    ("Enhancement", 0x53),
+    ("Enchantments", 0x54),
+    ("Rejuvenation", 0x58),
+    ("Smite", 0x59),
+    ("Longbows", 0x5A),
+    ("Crossbows", 0x5B),
+    ("Chants", 0x61),
+    ("Instruments", 0x62),
+    ("Blades", 0x65),
+    ("Blunt", 0x66),
+    ("Piercing", 0x67),
+    ("Large Weapons", 0x68),
+    ("Mentalism", 0x69),
+    ("Regrowth", 0x6A),
+    ("Nurture", 0x6B),
+    ("Nature", 0x6C),
+    ("Music", 0x6D),
+    ("Celtic Dual", 0x6E),
+    ("Celtic Spear", 0x70),
+    ("Recurve Bow", 0x71),
+    ("Valor", 0x72),
+    ("Pathfinding", 0x74),
+    ("Envenom", 0x75),
+    ("Critical Strike", 0x76),
+    ("Deathsight", 0x78),
+    ("Painworking", 0x79),
+    ("Death Servant", 0x7A),
+    ("Soulrending", 0x7B),
+    ("Hand to Hand", 0x7C),
+    ("Scythe", 0x7D),
+    ("Arboreal Path", 0x7F),
+    ("Creeping Path", 0x81),
+    ("Verdant Path", 0x82),
+    ("Odin's Will", 0x85),
+    ("Spectral Force", 0x86),
+    ("Phantasmal Wail", 0x87),
+    ("Ethereal Shriek", 0x88),
+    ("Shadow Mastery", 0x89),
+    ("Vampiiric Embrace", 0x8A),
+    ("Dementia", 0x8B),
+    ("Witchcraft", 0x8C),
+    ("Cursing", 0x8D),
+    ("Hexing", 0x8E),
+    ("Fist Wraps", 0x93),
+    ("Mauler Staff", 0x94),
+    ("Spectral Guard", 0x95),
+    ("Archery", 0x9B),
+];
+
+/// What `ClientStyleGroup` a clone should get, given its source spec's own KeyName and whatever
+/// override (if any) the source itself already carries. A non-zero `source_override` means the
+/// source is itself a previous clone that was already resolved - propagate it forward unchanged
+/// (keeps the chain correct through "clone of a clone"). Otherwise, if the source's own KeyName
+/// is one the client natively recognizes, copy that index explicitly, since the clone's own
+/// brand-new KeyName never will be. Falls back to 0 (no override - the same "generic Abilities
+/// bucket" behavior as any other unrecognized spec) only if neither applies.
+fn client_style_group_for(source_key: &str, source_override: u8) -> u8 {
+    if source_override != 0 {
+        return source_override;
+    }
+    CLIENT_STYLE_GROUPS
+        .iter()
+        .find(|(name, _)| *name == source_key)
+        .map(|(_, idx)| *idx)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecializationRow {
     pub key_name: String,
@@ -143,9 +255,23 @@ fn clone_spec(
     let new_key_q = sql_quote(new_key);
     let new_name_q = sql_quote(new_name);
 
+    // The source spec's own ClientStyleGroup (if it's itself a previous clone) decides whether
+    // this new clone inherits an explicit override or needs one computed fresh - see
+    // client_style_group_for's doc comment.
+    let source_rows = run_remote_sql_json(
+        cfg,
+        &format!("SELECT ClientStyleGroup FROM Specialization WHERE KeyName = '{source_key_q}';"),
+    )?;
+    let source_override = source_rows
+        .first()
+        .and_then(|r| r.get("ClientStyleGroup"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0) as u8;
+    let client_style_group = client_style_group_for(source_key, source_override);
+
     let mut batch = format!(
-        "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation) \
-         SELECT '{new_key_q}', '{new_name_q}', Description, Icon, Implementation \
+        "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+         SELECT '{new_key_q}', '{new_name_q}', Description, Icon, Implementation, {client_style_group} \
          FROM Specialization WHERE KeyName = '{source_key_q}';\n"
     );
 
@@ -212,6 +338,28 @@ mod tests {
     use crate::deploy::SshConfig;
     use std::process::Command;
 
+    #[test]
+    fn client_style_group_for_propagates_a_chained_override_unchanged() {
+        // "Celtic Dual" has its own recognized value (0x6E), but a non-zero source_override
+        // (meaning the source is itself already a resolved clone) must win regardless - a
+        // "clone of a clone" must keep whatever its immediate parent actually resolved to, not
+        // recompute a fresh lookup that might disagree with it.
+        assert_eq!(client_style_group_for("Celtic Dual", 0x50), 0x50);
+    }
+
+    #[test]
+    fn client_style_group_for_resolves_a_recognized_real_spec_name() {
+        assert_eq!(client_style_group_for("Celtic Dual", 0), 0x6E);
+        assert_eq!(client_style_group_for("Slash", 0), 0x01);
+    }
+
+    #[test]
+    fn client_style_group_for_falls_back_to_zero_for_an_unrecognized_name() {
+        // A brand-new custom KeyName the client was never taught - same "no override, generic
+        // bucket" behavior as the real server's own default case.
+        assert_eq!(client_style_group_for("nosferatusclaw_64", 0), 0);
+    }
+
     fn test_cfg(dir: &std::path::Path) -> SshConfig {
         SshConfig {
             host: String::new(),
@@ -233,7 +381,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("data")).unwrap();
         let db = dir.join("data/opendaoc.sqlite3.db");
         let sql = "
-            CREATE TABLE Specialization (KeyName TEXT, Name TEXT, Description TEXT, Icon INTEGER, Implementation TEXT);
+            CREATE TABLE Specialization (KeyName TEXT, Name TEXT, Description TEXT, Icon INTEGER, Implementation TEXT, ClientStyleGroup INTEGER DEFAULT 0);
             CREATE TABLE ClassXSpecialization (ClassID INTEGER, SpecKeyName TEXT, LevelAcquired INTEGER);
             CREATE TABLE SpellLine (KeyName TEXT, Name TEXT, Spec TEXT, IsBaseLine INTEGER, ClassIDHint INTEGER);
             CREATE TABLE LineXSpell (LineName TEXT, SpellID INTEGER, Level INTEGER);
@@ -243,8 +391,8 @@ mod tests {
                 WeaponTypeRequirement INTEGER, GrowthOffset REAL, GrowthRate REAL, BonusToHit INTEGER,
                 BonusToDefense INTEGER, TwoHandAnimation INTEGER, RandomProc INTEGER, ArmorHitLocation INTEGER);
 
-            INSERT INTO Specialization VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL);
-            INSERT INTO Specialization VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL);
+            INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL, 0);
+            INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL, 0);
             INSERT INTO ClassXSpecialization VALUES (1, 'slash', 0);
             INSERT INTO ClassXSpecialization VALUES (1, 'smite', 0);
             INSERT INTO Style VALUES (NULL, 1, 'Pulverize', 'slash', 5, 300, 5, 0, 1, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
@@ -367,6 +515,44 @@ mod tests {
     }
 
     #[test]
+    fn clone_of_a_recognized_spec_auto_populates_client_style_group() {
+        // The real-world Nosferatu's Claw scenario end-to-end: cloning "Celtic Dual" (a real,
+        // client-recognized spec name) under a brand-new KeyName must not leave the clone's
+        // styles grouped under the client's generic "Abilities" bucket - the clone should
+        // automatically inherit Celtic Dual's own recognized category (0x6E), with no server
+        // code change and no manual step needed.
+        let dir = setup_test_db("clone-recognized-name");
+        let cfg = test_cfg(&dir);
+        let sql = "
+            INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+                VALUES ('Celtic Dual', 'Celtic Dual', 'Dual wield', 300, NULL, 0);
+        ";
+        let status = Command::new("sqlite3")
+            .arg(dir.join("data/opendaoc.sqlite3.db"))
+            .arg(sql)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let assignments = vec![SpecAssignment {
+            source_key: "Celtic Dual".to_string(),
+            new_key: "nosferatusclaw".to_string(),
+            new_name: "Nosferatu's Claw".to_string(),
+            level_acquired: 0,
+        }];
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
+
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT ClientStyleGroup FROM Specialization WHERE KeyName='nosferatusclaw_64';",
+        )
+        .unwrap();
+        assert_eq!(int_field(&rows[0], "ClientStyleGroup"), 0x6E);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn clone_repoints_a_style_locked_to_an_unrelated_third_class_too() {
         // Reproduces a real bug found live: "Celtic Dual" was reused (not cloned) by a class
         // cloned from Shadowblade, but its styles were locked to three *other* classes entirely -
@@ -380,7 +566,7 @@ mod tests {
         let dir = setup_test_db("clone-third-party-lock");
         let cfg = test_cfg(&dir);
         let sql = "
-            INSERT INTO Specialization VALUES ('dual', 'Celtic Dual', 'Dual wield', 300, NULL);
+            INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('dual', 'Celtic Dual', 'Dual wield', 300, NULL, 0);
             INSERT INTO Style VALUES (NULL, 999, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
             INSERT INTO Style VALUES (NULL, 888, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
             INSERT INTO Style VALUES (NULL, 777, 'Misty Gloom', 'dual', 2, 400, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0);
