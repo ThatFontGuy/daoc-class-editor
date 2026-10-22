@@ -4,6 +4,11 @@
 //! "use only existing class features... cloned from existing classes." Only fields the user
 //! explicitly changes from the source's own values are emitted as overrides; a clone where
 //! nothing was changed produces an (almost) empty constructor body.
+//!
+//! The "base class" label (the attribute's third argument, e.g. "Rogue") is always taken from
+//! `source.base_class_name` directly - it's inherent to which concrete class was cloned, not a
+//! caller-supplied value, so there's no field on `CloneRequest` for it at all: cloning a
+//! Shadowblade can't produce anything other than a Rogue-base class, by construction.
 
 use crate::classdata::ClassInfo;
 use serde::{Deserialize, Serialize};
@@ -14,9 +19,6 @@ pub struct CloneRequest {
     pub new_name: String,
     pub new_class_ident: String,
     pub new_id: i32,
-    /// The "base class" label shown during character creation/promotion (e.g. "Acolyte").
-    /// Defaults to the source class's own base_class_name if not set by the caller.
-    pub base_class_name: String,
     pub profession: Option<String>,
     pub primary_stat: Option<String>,
     pub secondary_stat: Option<String>,
@@ -171,7 +173,7 @@ namespace DOL.GS.PlayerClass
         source_name = req.source.name,
         source_ident = req.source.class_ident,
         new_id = req.new_id,
-        base_class_name = req.base_class_name,
+        base_class_name = req.source.base_class_name,
         new_ident = req.new_class_ident,
         ctor_lines_text = ctor_lines_text,
         overrides_block = overrides_block,
@@ -202,7 +204,6 @@ mod tests {
             new_name: "Grovekeeper".to_string(),
             new_class_ident: "ClassGrovekeeper".to_string(),
             new_id: 64,
-            base_class_name: druid.base_class_name.clone(),
             profession: druid.profession.clone(),
             primary_stat: druid.primary_stat.clone(),
             secondary_stat: druid.secondary_stat.clone(),
@@ -240,7 +241,6 @@ mod tests {
             new_name: "Lightbringer".to_string(),
             new_class_ident: "ClassLightbringer".to_string(),
             new_id: 65,
-            base_class_name: cleric.base_class_name.clone(),
             profession: cleric.profession.clone(),
             primary_stat: cleric.primary_stat.clone(),
             secondary_stat: cleric.secondary_stat.clone(),
@@ -297,7 +297,6 @@ mod manual_preview {
             new_name: "Lightbringer".to_string(),
             new_class_ident: "ClassLightbringer".to_string(),
             new_id: 65,
-            base_class_name: cleric.base_class_name.clone(),
             profession: cleric.profession.clone(),
             primary_stat: cleric.primary_stat.clone(),
             secondary_stat: cleric.secondary_stat.clone(),

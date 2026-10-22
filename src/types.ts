@@ -41,7 +41,6 @@ export interface CloneRequest {
   new_name: string;
   new_class_ident: string;
   new_id: number;
-  base_class_name: string;
   profession: string | null;
   primary_stat: string | null;
   secondary_stat: string | null;

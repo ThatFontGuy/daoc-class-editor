@@ -179,7 +179,6 @@ export default function ClonePanel() {
       new_name: project.newName,
       new_class_ident: project.newIdent,
       new_id: project.newId,
-      base_class_name: source.base_class_name,
       profession: overrides.profession ? (values.profession as string) ?? null : null,
       primary_stat: overrides.primary_stat ? (values.primary_stat as string) ?? null : null,
       secondary_stat: overrides.secondary_stat ? (values.secondary_stat as string) ?? null : null,
