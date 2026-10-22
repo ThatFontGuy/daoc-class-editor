@@ -3,12 +3,14 @@ mod codegen;
 mod deploy;
 mod deployed;
 mod specs;
+mod trainer;
 
 use classdata::{ClassInfo, KnownOptions};
 use codegen::CloneRequest;
 use deploy::SshConfig;
 use specs::{ClassSpecRow, SpecAssignment, SpecializationRow};
 use tauri::Manager;
+use trainer::{TrainerNpcCandidate, TrainerRequest};
 
 fn resources_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     // In `tauri dev`, resources aren't copied into a bundle yet - fall back to the source tree's
@@ -68,10 +70,50 @@ fn suggest_next_id(app: tauri::AppHandle, cfg: SshConfig) -> Result<i32, String>
     Ok(classdata::next_free_id_from(&classes))
 }
 
+/// Takes the frontend's already-fetched combined class list (vendored + deployed) rather than
+/// refetching it, since the caller (the trainer-setup step) already has it in memory from
+/// `list_classes_with_deployed` - this just reuses `classdata::root_archetype`'s tested
+/// inheritance walk instead of duplicating it in TypeScript.
+#[tauri::command]
+fn root_archetype(classes: Vec<ClassInfo>, class_ident: String) -> Option<ClassInfo> {
+    classdata::root_archetype(&classes, &class_ident).cloned()
+}
+
 #[tauri::command]
 fn known_options(app: tauri::AppHandle) -> Result<KnownOptions, String> {
     let dir = resources_dir(&app)?;
     Ok(classdata::load_known_options(&dir))
+}
+
+#[tauri::command]
+fn generate_trainer_code(req: TrainerRequest) -> String {
+    trainer::generate_trainer_code(&req)
+}
+
+#[tauri::command]
+fn find_trainer_npcs(cfg: SshConfig, search: String) -> Result<Vec<TrainerNpcCandidate>, String> {
+    trainer::find_trainer_npcs(&cfg, &search)
+}
+
+#[tauri::command]
+fn spawn_trainer_npc(
+    cfg: SshConfig,
+    reference_mob_id: String,
+    npc_name: String,
+    guild_name: String,
+    class_type: String,
+    offset_x: i64,
+    offset_y: i64,
+) -> Result<String, String> {
+    trainer::spawn_trainer_npc(
+        &cfg,
+        &reference_mob_id,
+        &npc_name,
+        &guild_name,
+        &class_type,
+        offset_x,
+        offset_y,
+    )
 }
 
 #[tauri::command]
@@ -184,6 +226,10 @@ pub fn run() {
             save_project_file,
             load_project_file,
             delete_deployed_class,
+            root_archetype,
+            generate_trainer_code,
+            find_trainer_npcs,
+            spawn_trainer_npc,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

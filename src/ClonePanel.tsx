@@ -12,6 +12,7 @@ import {
   emptySshConfig,
 } from "./types";
 import { Overrides, SpecAssignmentUI, useProject } from "./ProjectContext";
+import TrainerPanel from "./TrainerPanel";
 
 export default function ClonePanel() {
   const [project, setProject] = useProject();
@@ -824,9 +825,10 @@ export default function ClonePanel() {
 
               <h3>Advanced: run SQL on the server (optional)</h3>
               <p className="hint">
-                For anything this tool doesn't have its own form for yet - e.g. a trainer NPC
-                spawn row, starter equipment, or a ServerProperty flag like the one that enabled
-                Sluaghbinder. Server should be stopped first for any write.
+                For anything this tool doesn't have its own form for yet - e.g. starter
+                equipment, a starting location, or a ServerProperty flag like the one that
+                enabled Sluaghbinder (a trainer NPC has its own step below). Server should be
+                stopped first for any write.
               </p>
               <textarea
                 className="sql-box"
@@ -849,6 +851,14 @@ export default function ClonePanel() {
                   {log.trim()}
                 </pre>
               )}
+
+              <TrainerPanel
+                classId={project.newId}
+                className={project.newName}
+                source={source}
+                classes={classes}
+                sshConfig={sshConfig}
+              />
             </>
           )}
         </>

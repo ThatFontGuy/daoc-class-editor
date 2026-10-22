@@ -64,14 +64,23 @@ server source (`dotnet build`, 0 errors) before this tool's design was finalized
 - **Save/Load a project** (top-right of the window) - designing a class is something you iterate
   into existence over multiple sessions, not finish in one sitting; a project file captures the
   source class, every override, and every spec assignment so far.
+- **A trainer, so the class is actually playable** (step 7, after deploying) - nothing beyond the
+  game client's built-in class list is directly selectable at character creation, so (exactly
+  like every real post-launch class, Sluaghbinder included) a player creates a character as the
+  realm-appropriate archetype your class ultimately descends from (resolved automatically, however
+  many clone generations deep - e.g. a class cloned from Shadowblade resolves to Midgard Rogue,
+  not Shadowblade itself) and a trainer NPC offers to promote them into your class at a level you
+  choose. Generates and deploys the trainer script, then spawns the actual NPC by deep-cloning an
+  existing trainer's full stats/model/position (search by name, e.g. "Shadowblade Trainer", pick
+  a location, done) - no hand-written C# or manual `Mob` row needed.
 
 **Not automated yet** (planned next, see the phased plan in project history/issues, or ask):
 - Individual spell and melee-style *details* (damage, duration, range, growth rate, procs, etc.) -
   currently you can only assign/clone whole spec lines, not edit what's inside them field by
   field yet.
-- A trainer NPC spawn, starter equipment, and a starting location are needed for a smooth
-  first-level experience - reuse an existing one via SQL (there's a "run SQL on the server" box
-  for exactly this) or extend the class-editing form later.
+- Starter equipment and a starting location aren't generated yet for a smooth first-level
+  experience - reuse an existing one via SQL (there's a "run SQL on the server" box for exactly
+  this) or extend the class-editing form later.
 - Genuinely new mechanics (a new spell effect, a new pet) still mean writing real C# by hand -
   this tool is about *cloning*, not *inventing*.
 - Bot AI quality for the new class: it'll play with the generic `BotBrain` and default to the

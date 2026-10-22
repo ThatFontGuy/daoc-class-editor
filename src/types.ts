@@ -94,3 +94,31 @@ export interface SpecAssignmentPayload {
   new_name: string | null;
   level_acquired: number;
 }
+
+// Mirrors src-tauri/src/trainer.rs.
+
+export interface TrainerRequest {
+  class_id: number;
+  class_name: string;
+  trainer_class_ident: string;
+  guild_name: string;
+  realm: string;
+  archetype_id: number;
+  archetype_name: string;
+  min_level: number;
+}
+
+export interface TrainerNpcCandidate {
+  mob_id: string;
+  name: string;
+  guild: string;
+  class_type: string;
+  x: number;
+  y: number;
+  z: number;
+  heading: number;
+  region: number;
+  realm: number;
+  model: number;
+  level: number;
+}

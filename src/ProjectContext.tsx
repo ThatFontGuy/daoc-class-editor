@@ -44,6 +44,34 @@ export interface SpecAssignmentUI {
   applied: boolean;
 }
 
+export interface TrainerState {
+  enabled: boolean;
+  guildName: string;
+  trainerClassIdent: string;
+  minLevel: number;
+  generatedCode: string;
+  filename: string;
+  referenceSearch: string;
+  selectedReferenceMobId: string | null;
+  npcName: string;
+  offsetX: number;
+  offsetY: number;
+}
+
+export const emptyTrainerState: TrainerState = {
+  enabled: false,
+  guildName: "",
+  trainerClassIdent: "",
+  minLevel: 5,
+  generatedCode: "",
+  filename: "",
+  referenceSearch: "",
+  selectedReferenceMobId: null,
+  npcName: "",
+  offsetX: 200,
+  offsetY: 0,
+};
+
 export interface ProjectState {
   sourceClassIdent: string;
   newName: string;
@@ -58,6 +86,7 @@ export interface ProjectState {
    * for a normal fresh clone. Locks identity fields (name/ident/ID/filename) in the UI, and
    * redirects the spec-lines step to read/write this class's own specs instead of a parent's. */
   editingDeployedClassId: number | null;
+  trainer: TrainerState;
 }
 
 export const emptyProjectState: ProjectState = {
@@ -71,6 +100,7 @@ export const emptyProjectState: ProjectState = {
   generatedCode: "",
   filename: "",
   editingDeployedClassId: null,
+  trainer: emptyTrainerState,
 };
 
 /** True if a child's own declared value differs from its parent's - `null` on the child's side

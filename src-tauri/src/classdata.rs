@@ -316,6 +316,26 @@ pub fn next_free_id_from(classes: &[ClassInfo]) -> i32 {
     classes.iter().map(|c| c.id).max().unwrap_or(0) + 1
 }
 
+/// Walks `parent_ident` up from `class_ident` until it reaches a true archetype (one whose own
+/// parent is `CharacterClassBase`) - e.g. Shadowblade *and* a Nosferatu cloned from Shadowblade
+/// both resolve to Midgard Rogue. A trainer's promotion gating needs this: in classic DAoC,
+/// nothing beyond the client's built-in class list is directly selectable at creation, so a
+/// player creates a character as this archetype and a trainer promotes them into the specific
+/// (possibly custom) class at some level - exactly how Sluaghbinder itself works from Acolyte.
+/// Bounded to 10 hops so a malformed/cyclical parent chain can't loop forever.
+pub fn root_archetype<'a>(classes: &'a [ClassInfo], class_ident: &str) -> Option<&'a ClassInfo> {
+    let mut current = classes.iter().find(|c| c.class_ident == class_ident)?;
+    for _ in 0..10 {
+        if current.parent_ident == "CharacterClassBase" {
+            return Some(current);
+        }
+        current = classes
+            .iter()
+            .find(|c| c.class_ident == current.parent_ident)?;
+    }
+    None
+}
+
 /// `EligibleRaces` is abstract in CharacterClassBase, so every concrete class gets it from
 /// somewhere in its inheritance chain - but most classes (Cleric, Druid, ...) don't override it
 /// themselves, inheriting it from a realm-specific base class (ClassAcolyte, ClassViking,
@@ -548,6 +568,29 @@ namespace DOL.GS
         assert_eq!(next_free_id_from(&combined), 201);
         // Without the deployed class folded in, it should just be one above the vendored max.
         assert!(next_free_id_from(&vendored) < 201);
+    }
+
+    #[test]
+    fn root_archetype_resolves_a_single_level_class() {
+        let classes = load_all_classes(&resources());
+        let archetype = root_archetype(&classes, "ClassShadowblade").expect("should resolve");
+        assert_eq!(archetype.class_ident, "ClassMidgardRogue");
+        assert_eq!(archetype.name, "Rogue");
+    }
+
+    #[test]
+    fn root_archetype_resolves_through_a_custom_class_two_levels_deep() {
+        let vendored = load_vendored_unfinalized(&resources());
+        let deployed = parse_deployed_source(
+            r#"[CharacterClass(64, "Nosferatu", "Rogue")]
+            public class ClassNosferatu : ClassShadowblade { }"#,
+        )
+        .unwrap();
+        let mut combined = vendored;
+        combined.push(deployed);
+
+        let archetype = root_archetype(&combined, "ClassNosferatu").expect("should resolve");
+        assert_eq!(archetype.class_ident, "ClassMidgardRogue");
     }
 
     #[test]
