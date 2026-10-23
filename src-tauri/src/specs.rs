@@ -238,13 +238,29 @@ pub fn apply_class_specs(
 
         // Make this idempotent/re-deployable - a real bug found live: editing an already-deployed
         // class resubmits *every* currently-assigned spec (not just newly changed ones, since the
-        // Edit flow has no way to know which ones are unchanged), and clone_spec always does a
+        // Edit flow has no way to know which ones are unchanged), and clone_spec always did a
         // fresh INSERT assuming its target key is brand new - so simply redeploying a class whose
         // specs hadn't actually changed (or changing one spec while leaving others as-is) hit a
         // UNIQUE constraint violation on every unchanged spec's own already-existing KeyName.
         // Deleting whatever this exact key already fully owns first (if anything) before
         // re-cloning makes every deploy produce the same correct result regardless of how many
         // times it runs, the same way redeploying the class's own .cs file already does.
+        //
+        // Critical exception, a real data-loss bug found live immediately after adding the above:
+        // when an unchanged spec is resubmitted, its own source_key *is* this same final_key (the
+        // Edit flow reads a spec's current own KeyName back as its "source" when nothing about it
+        // changed) - deleting it first, then trying to clone from it, deletes its only copy of
+        // the data before clone_spec can ever read it, leaving an empty, orphaned spec that then
+        // crashes any character's login (SkillBase.GetSpecialization null-derefs on a key with no
+        // matching row). There is nothing to safely redo in this case anyway - it already has
+        // everything a previous deploy gave it - so skip both steps entirely and leave it alone.
+        if a.source_key == final_key {
+            log.push_str(&format!(
+                "left '{}' untouched (already its own source - nothing to reclone)\n",
+                final_key
+            ));
+            continue;
+        }
         delete_existing_clone(cfg, &final_key)?;
         clone_spec(cfg, &a.source_key, &final_key, &a.new_name, new_class_id)?;
 
@@ -1081,6 +1097,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(int_field(&rows[0], "c"), 2, "{rows:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resubmitting_a_spec_with_itself_as_source_does_not_destroy_it() {
+        // A critical data-loss bug found live immediately after the fix above: the Edit flow's
+        // "load this class's current specs" reads an already-cloned spec's own current KeyName
+        // back as its "source" when nothing about it was changed, so source_key equals the exact
+        // same final_key being redeployed. The previous fix's "delete whatever this key already
+        // owns, then clone from it" sequence deleted the spec's only copy of its own data before
+        // clone_spec could ever read it - cloning "from itself" after deleting itself finds
+        // nothing to copy, leaving an empty, orphaned Specialization that then crashes any
+        // character's login entirely (confirmed live: SkillBase.GetSpecialization null-derefs on
+        // a key with no matching row). This must leave the spec's real data completely untouched.
+        let dir = setup_test_db("resubmit-self-source");
+        let cfg = test_cfg(&dir);
+
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+        }];
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
+
+        // Resubmit it exactly as the Edit flow would for an unchanged spec: source_key is now its
+        // own already-cloned key, not the original "smite".
+        let resubmit = vec![SpecAssignment {
+            source_key: "frostbolt_tree_64".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+        }];
+        apply_class_specs(&cfg, 64, &resubmit).unwrap();
+
+        let specs = list_specializations(&cfg).unwrap();
+        assert!(
+            specs.iter().any(|s| s.key_name == "frostbolt_tree_64"),
+            "the spec itself must still exist: {specs:?}"
+        );
+        let lines = run_remote_sql_json(
+            &cfg,
+            "SELECT KeyName FROM SpellLine WHERE Spec='frostbolt_tree_64';",
+        )
+        .unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "its spell line must not have been wiped out: {lines:?}"
+        );
+        let spells = run_remote_sql_json(
+            &cfg,
+            &format!(
+                "SELECT SpellID FROM LineXSpell WHERE LineName='{}';",
+                str_field(&lines[0], "KeyName")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            spells.len(),
+            2,
+            "its spells must not have been wiped out: {spells:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
