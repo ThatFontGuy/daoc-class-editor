@@ -361,15 +361,18 @@ fn clone_spec(
     )?;
     for line in &lines {
         let old_line_key = str_field(line, "KeyName");
-        let line_name = str_field(line, "Name");
         let is_base = line.get("IsBaseLine").and_then(Value::as_i64).unwrap_or(0);
         let new_line_key = format!("{new_key}_{}", old_line_key);
         let old_line_key_q = sql_quote(&old_line_key);
         let new_line_key_q = sql_quote(&new_line_key);
-        let line_name_q = sql_quote(&line_name);
+        // The line's own display Name (shown wherever spell lines are listed, e.g. the
+        // spellbook) must follow the caller's chosen rename too, not the source's own - a real
+        // bug found live: a spec cloned and renamed (e.g. "Dementia" -> "Fervor") still showed
+        // its spell line as "Dementia" everywhere, since this copied the source's Name verbatim
+        // instead of using new_name like the Specialization row itself already correctly does.
         batch.push_str(&format!(
             "INSERT INTO SpellLine (KeyName, Name, Spec, IsBaseLine, ClassIDHint) \
-             VALUES ('{new_line_key_q}', '{line_name_q}', '{new_key_q}', {is_base}, {new_class_id});\n"
+             VALUES ('{new_line_key_q}', '{new_name_q}', '{new_key_q}', {is_base}, {new_class_id});\n"
         ));
         batch.push_str(&format!(
             "INSERT INTO LineXSpell (LineName, SpellID, Level) \
@@ -989,7 +992,11 @@ mod tests {
             new_line_key, "smite_base",
             "cloned line must have its own unique key"
         );
-        assert_eq!(str_field(&lines[0], "Name"), "Smiting Spells");
+        assert_eq!(
+            str_field(&lines[0], "Name"),
+            "Frostbolt Tree",
+            "the cloned line's own display name must follow the rename, not the source's name"
+        );
 
         let spells = run_remote_sql_json(
             &cfg,
