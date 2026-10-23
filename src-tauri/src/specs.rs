@@ -235,6 +235,17 @@ pub fn apply_class_specs(
         // `delete_deployed_class` relies on exactly this to find and remove only what was cloned
         // for a given class, never a spec shared by other classes.
         let final_key = format!("{}_{new_class_id}", a.new_key);
+
+        // Make this idempotent/re-deployable - a real bug found live: editing an already-deployed
+        // class resubmits *every* currently-assigned spec (not just newly changed ones, since the
+        // Edit flow has no way to know which ones are unchanged), and clone_spec always does a
+        // fresh INSERT assuming its target key is brand new - so simply redeploying a class whose
+        // specs hadn't actually changed (or changing one spec while leaving others as-is) hit a
+        // UNIQUE constraint violation on every unchanged spec's own already-existing KeyName.
+        // Deleting whatever this exact key already fully owns first (if anything) before
+        // re-cloning makes every deploy produce the same correct result regardless of how many
+        // times it runs, the same way redeploying the class's own .cs file already does.
+        delete_existing_clone(cfg, &final_key)?;
         clone_spec(cfg, &a.source_key, &final_key, &a.new_name, new_class_id)?;
 
         // If this class already had the *source* spec assigned directly (this rename is meant to
@@ -290,6 +301,56 @@ pub fn apply_class_specs(
     log.push_str(&grant_respec_to_characters(cfg, new_class_id)?);
 
     Ok(log)
+}
+
+/// Fully removes whatever an exact spec KeyName already owns (Specialization, its SpellLine(s)
+/// and their LineXSpell entries, Style, SpecXAbility, and its ClassXSpecialization assignment) -
+/// everything clone_spec creates - if it exists at all. A clean no-op otherwise. Lets
+/// apply_class_specs call this unconditionally right before re-cloning so a redeploy is always
+/// idempotent instead of colliding with whatever the same key already owns from a previous one.
+fn delete_existing_clone(cfg: &SshConfig, key: &str) -> Result<(), String> {
+    let key_q = sql_quote(key);
+
+    let exists = run_remote_sql_json(
+        cfg,
+        &format!("SELECT 1 FROM Specialization WHERE KeyName = '{key_q}';"),
+    )?;
+    if exists.is_empty() {
+        return Ok(());
+    }
+
+    let lines = run_remote_sql_json(
+        cfg,
+        &format!("SELECT KeyName FROM SpellLine WHERE Spec = '{key_q}';"),
+    )?;
+    for line in &lines {
+        let line_key_q = sql_quote(&str_field(line, "KeyName"));
+        run_remote_sql(
+            cfg,
+            &format!("DELETE FROM LineXSpell WHERE LineName = '{line_key_q}';"),
+        )?;
+    }
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM SpellLine WHERE Spec = '{key_q}';"),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM Style WHERE SpecKeyName = '{key_q}';"),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM SpecXAbility WHERE Spec = '{key_q}';"),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM ClassXSpecialization WHERE SpecKeyName = '{key_q}';"),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM Specialization WHERE KeyName = '{key_q}';"),
+    )?;
+    Ok(())
 }
 
 /// Grants every character currently playing `class_id` one free full-respec token
@@ -964,6 +1025,62 @@ mod tests {
             0,
             "a character on a different class must be untouched"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_class_specs_is_idempotent_across_redeploys() {
+        // Reproduces a real bug found live: editing an already-deployed class resubmits *every*
+        // currently-assigned spec, not just ones that actually changed - the Edit flow has no way
+        // to know which are unchanged. Redeploying (even to drop one unrelated spec, or with
+        // nothing changed at all) therefore hit a UNIQUE constraint violation on every spec's own
+        // already-existing KeyName, since clone_spec always did a fresh INSERT assuming it was
+        // brand new. A second call with the exact same assignments must succeed and produce the
+        // same correct result, not error.
+        let dir = setup_test_db("idempotent-redeploy");
+        let cfg = test_cfg(&dir);
+
+        let assignments = vec![SpecAssignment {
+            source_key: "slash".to_string(),
+            new_key: "earthshatter".to_string(),
+            new_name: "Earthshatter".to_string(),
+            level_acquired: 0,
+        }];
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        // Redeploy with the exact same assignment, simulating an Edit-mode resubmit.
+        apply_class_specs(&cfg, 64, &assignments).unwrap();
+
+        let specs = list_specializations(&cfg).unwrap();
+        let matching: Vec<_> = specs
+            .iter()
+            .filter(|s| s.key_name == "earthshatter_64")
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "redeploying must not leave duplicate Specialization rows: {matching:?}"
+        );
+
+        let class_specs = list_class_specs(&cfg, 64).unwrap();
+        let assigned: Vec<_> = class_specs
+            .iter()
+            .filter(|s| s.spec_key_name == "earthshatter_64")
+            .collect();
+        assert_eq!(
+            assigned.len(),
+            1,
+            "redeploying must not leave duplicate ClassXSpecialization rows: {assigned:?}"
+        );
+
+        // The clone's own data (styles in this case) must still be intact after the redeploy,
+        // not silently dropped by the cleanup-then-reclone pass.
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT COUNT(*) as c FROM Style WHERE SpecKeyName='earthshatter_64';",
+        )
+        .unwrap();
+        assert_eq!(int_field(&rows[0], "c"), 2, "{rows:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
