@@ -277,7 +277,45 @@ pub fn apply_class_specs(
             a.source_key, final_key, a.new_name, a.level_acquired
         ));
     }
+
+    // Real classic-server/freeshard practice: a class's spec lineup changing (exactly what this
+    // function just did) can invalidate how an already-playing character already spent their
+    // points - what was a legal build a moment ago might reference a spec the class no longer
+    // has, or no longer matches how points were meant to be distributed. Rather than leave that
+    // silently stale, grant every character currently on this class a free full respec token
+    // (the same RespecAmountAllSkill the real `/respec all` command consumes) - they keep playing
+    // with their current build uninterrupted, and can freely reallocate every point next time
+    // they choose to, with nothing lost. Adds to (never overwrites) any respec tokens a character
+    // already had saved up.
+    log.push_str(&grant_respec_to_characters(cfg, new_class_id)?);
+
     Ok(log)
+}
+
+/// Grants every character currently playing `class_id` one free full-respec token
+/// (RespecAmountAllSkill, consumed by the real `/respec all` command) - called after any class
+/// spec change, since that can invalidate a character's existing build. Harmless/no-op for a
+/// brand-new class with no characters on it yet.
+fn grant_respec_to_characters(cfg: &SshConfig, class_id: i64) -> Result<String, String> {
+    let affected = run_remote_sql_json(
+        cfg,
+        &format!("SELECT Name FROM DOLCharacters WHERE Class = {class_id};"),
+    )?;
+    if affected.is_empty() {
+        return Ok(String::new());
+    }
+    run_remote_sql(
+        cfg,
+        &format!(
+            "UPDATE DOLCharacters SET RespecAmountAllSkill = RespecAmountAllSkill + 1 WHERE Class = {class_id};"
+        ),
+    )?;
+    let names: Vec<String> = affected.iter().map(|r| str_field(r, "Name")).collect();
+    Ok(format!(
+        "granted a free full respec to {} character(s) already on this class: {}\n",
+        names.len(),
+        names.join(", ")
+    ))
 }
 
 /// Deep-clones one specialization: the Specialization row itself, every SpellLine attached to it
@@ -479,6 +517,7 @@ mod tests {
                 ID INTEGER DEFAULT 0);
             CREATE TABLE SpecXAbility (SpecXabilityID INTEGER PRIMARY KEY AUTOINCREMENT, Spec TEXT, SpecLevel INTEGER,
                 AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
+            CREATE TABLE DOLCharacters (Name TEXT, Class INTEGER, RespecAmountAllSkill INTEGER DEFAULT 0);
 
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL, 0);
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL, 0);
@@ -858,6 +897,70 @@ mod tests {
             "the old 'slash' assignment must be removed, not left alongside the rename: {rows:?}"
         );
         assert_eq!(rows[0].spec_key_name, "earthshatter_64");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn applying_class_specs_grants_a_free_respec_to_existing_characters() {
+        // Real classic-server/freeshard practice: a class's spec lineup changing can invalidate
+        // how an already-playing character already spent their points, so every character on
+        // that class should get a free full respec token instead of being silently left with a
+        // stale/invalid build. A character on a *different* class must be untouched, and any
+        // respec tokens a character already had saved up must be added to, not overwritten.
+        let dir = setup_test_db("grant-respec");
+        let cfg = test_cfg(&dir);
+        let sql = "
+            INSERT INTO DOLCharacters (Name, Class, RespecAmountAllSkill) VALUES ('Aeligord', 64, 0);
+            INSERT INTO DOLCharacters (Name, Class, RespecAmountAllSkill) VALUES ('Savaen', 64, 2);
+            INSERT INTO DOLCharacters (Name, Class, RespecAmountAllSkill) VALUES ('SomeoneElse', 23, 0);
+        ";
+        let status = Command::new("sqlite3")
+            .arg(dir.join("data/opendaoc.sqlite3.db"))
+            .arg(sql)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let assignments = vec![SpecAssignment {
+            source_key: "slash".to_string(),
+            new_key: "earthshatter".to_string(),
+            new_name: "Earthshatter".to_string(),
+            level_acquired: 0,
+        }];
+        let log = apply_class_specs(&cfg, 64, &assignments).unwrap();
+        assert!(log.contains("Aeligord"), "{log}");
+        assert!(log.contains("Savaen"), "{log}");
+        assert!(!log.contains("SomeoneElse"), "{log}");
+
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT Name, RespecAmountAllSkill FROM DOLCharacters ORDER BY Name;",
+        )
+        .unwrap();
+        let aeligord = rows
+            .iter()
+            .find(|r| str_field(r, "Name") == "Aeligord")
+            .unwrap();
+        let savaen = rows
+            .iter()
+            .find(|r| str_field(r, "Name") == "Savaen")
+            .unwrap();
+        let other = rows
+            .iter()
+            .find(|r| str_field(r, "Name") == "SomeoneElse")
+            .unwrap();
+        assert_eq!(int_field(aeligord, "RespecAmountAllSkill"), 1);
+        assert_eq!(
+            int_field(savaen, "RespecAmountAllSkill"),
+            3,
+            "an existing respec token must be added to, not overwritten"
+        );
+        assert_eq!(
+            int_field(other, "RespecAmountAllSkill"),
+            0,
+            "a character on a different class must be untouched"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
