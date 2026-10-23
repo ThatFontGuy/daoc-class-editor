@@ -31,6 +31,7 @@
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 /// Mirrors `GlobalConstants.GetSpecToInternalIndex`'s hardcoded spec-name -> client-recognized
 /// style-category index table from the real server source, so a clone can automatically inherit
@@ -451,10 +452,28 @@ fn clone_spec(
             "INSERT INTO SpellLine (KeyName, Name, Spec, IsBaseLine, ClassIDHint) \
              VALUES ('{new_line_key_q}', '{new_name_q}', '{new_key_q}', {is_base}, {new_class_id});\n"
         ));
-        batch.push_str(&format!(
-            "INSERT INTO LineXSpell (LineName, SpellID, Level) \
-             SELECT '{new_line_key_q}', SpellID, Level FROM LineXSpell WHERE LineName = '{old_line_key_q}';\n"
-        ));
+
+        // LineXSpell_ID is a GUID-style primary key the real schema requires explicitly (not an
+        // autoincrement DB rowid like Style's or SpecXAbility's) - a real bug found live: cloning
+        // any spec whose spell line has more than one spell (the common case; it only went
+        // unnoticed this long because every spec cloned so far happened to have at most one)
+        // failed with "UNIQUE constraint failed: LineXSpell.LineXSpell_ID", since every row an
+        // INSERT...SELECT produced shared the column's bare default ('') and collided with each
+        // other from the second row on. Fetch the rows to clone first, then insert each with its
+        // own freshly generated GUID.
+        let spells = run_remote_sql_json(
+            cfg,
+            &format!("SELECT SpellID, Level FROM LineXSpell WHERE LineName = '{old_line_key_q}';"),
+        )?;
+        for spell in &spells {
+            let spell_id = int_field(spell, "SpellID");
+            let level = int_field(spell, "Level");
+            let row_guid = Uuid::new_v4();
+            batch.push_str(&format!(
+                "INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
+                 VALUES ('{new_line_key_q}', {spell_id}, {level}, '{row_guid}');\n"
+            ));
+        }
     }
 
     // Styles: any non-zero ClassId locks a style to that *exact* class only - confirmed in the
@@ -588,7 +607,7 @@ mod tests {
             CREATE TABLE Specialization (KeyName TEXT, Name TEXT, Description TEXT, Icon INTEGER, Implementation TEXT, ClientStyleGroup INTEGER DEFAULT 0);
             CREATE TABLE ClassXSpecialization (ClassID INTEGER, SpecKeyName TEXT, LevelAcquired INTEGER);
             CREATE TABLE SpellLine (KeyName TEXT, Name TEXT, Spec TEXT, IsBaseLine INTEGER, ClassIDHint INTEGER);
-            CREATE TABLE LineXSpell (LineName TEXT, SpellID INTEGER, Level INTEGER);
+            CREATE TABLE LineXSpell (LineName TEXT, SpellID INTEGER, Level INTEGER, LineXSpell_ID TEXT PRIMARY KEY DEFAULT '');
             CREATE TABLE Style (StyleID INTEGER PRIMARY KEY AUTOINCREMENT, ClassId INTEGER, Name TEXT, SpecKeyName TEXT,
                 SpecLevelRequirement INTEGER, Icon INTEGER, EnduranceCost INTEGER, StealthRequirement INTEGER,
                 OpeningRequirementType INTEGER, OpeningRequirementValue INTEGER, AttackResultRequirement INTEGER,
@@ -606,8 +625,8 @@ mod tests {
             INSERT INTO Style VALUES (NULL, 1, 'Pulverize', 'slash', 5, 300, 5, 0, 1, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);
             INSERT INTO Style VALUES (NULL, 0, 'Backlash', 'slash', 10, 301, 5, 1, 2, 1, 1, 1, 1.0, 1.0, 5, 0, 0, 0, 0, 0);
             INSERT INTO SpellLine VALUES ('smite_base', 'Smiting Spells', 'smite', 0, 1);
-            INSERT INTO LineXSpell VALUES ('smite_base', 9001, 1);
-            INSERT INTO LineXSpell VALUES ('smite_base', 9002, 10);
+            INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_base', 9001, 1, 'seed-smite-1');
+            INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_base', 9002, 10, 'seed-smite-2');
         ";
         let status = Command::new("sqlite3")
             .arg(&db)
