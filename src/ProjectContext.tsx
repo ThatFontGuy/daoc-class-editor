@@ -78,6 +78,12 @@ export interface ProjectState {
   overrides: Overrides;
   values: Record<string, string | number | boolean | string[]>;
   specAssignments: SpecAssignmentUI[];
+  /** The exact SpecKeyName values this class had assigned the last time its own specs were read
+   * from the server (only meaningful while editing an already-deployed class in place - empty
+   * for a brand-new clone). Lets `apply_class_specs` tell "removed from the list on purpose" from
+   * "never submitted in the first place" apart, so a spec deleted from the list here and
+   * redeployed is actually removed from the server too, not left behind. */
+  originalAssignedSpecKeys: string[];
   generatedCode: string;
   filename: string;
   /** Set while editing an already-deployed custom class in place (its own numeric ID) - `null`
@@ -95,6 +101,7 @@ export const emptyProjectState: ProjectState = {
   overrides: noOverrides,
   values: {},
   specAssignments: [],
+  originalAssignedSpecKeys: [],
   generatedCode: "",
   filename: "",
   editingDeployedClassId: null,

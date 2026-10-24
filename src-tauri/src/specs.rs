@@ -27,6 +27,16 @@
 //! name (e.g. "Stealth" -> "stealth_64") leaves *both* assigned, so the same ability shows twice
 //! (and any points already trained stay split across both keys). The caller must explicitly
 //! remove the old assignment itself if a rename is meant to replace it, not just add to it.
+//!
+//! Deleting a spec's row from the Edit flow's list (not renaming it, just dropping it) did
+//! nothing at all until `previous_keys` was added - a real, reproduced bug found live: removing
+//! "Nosferatu's Bane"/"Nosferatu's Claw" from the list and redeploying left both fully assigned
+//! and untouched, since `apply_class_specs` only ever acted on the keys it was told about *this*
+//! call, with no notion of "used to be assigned, now isn't." `apply_class_specs` now diffs
+//! `previous_keys` (the exact assignment snapshot the Edit flow read before the user started
+//! editing) against this deploy's own final keys and fully removes anything genuinely dropped -
+//! but only for keys carrying this class's own clone suffix, never a plain/shared key, since
+//! those may still be in active use by other classes.
 
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use serde::{Deserialize, Serialize};
@@ -224,10 +234,16 @@ fn sql_quote(s: &str) -> String {
 /// assignment (sqlite3 accepts semicolon-separated statements in a single invocation), so a
 /// clone's several INSERTs either all land or the batch fails visibly - not a silent partial
 /// clone.
+///
+/// `previous_keys` is the exact set of SpecKeyName values this class had assigned when the Edit
+/// flow last read its specs (empty for a brand-new clone, which has nothing to diff against) -
+/// see the module doc comment for why a key the caller dropped from `assignments` needs this to
+/// actually be removed.
 pub fn apply_class_specs(
     cfg: &SshConfig,
     new_class_id: i64,
     assignments: &[SpecAssignment],
+    previous_keys: &[String],
 ) -> Result<String, String> {
     let mut log = String::new();
     for a in assignments {
@@ -303,6 +319,36 @@ pub fn apply_class_specs(
         log.push_str(&format!(
             "cloned {} -> {} ('{}') at level {}\n",
             a.source_key, final_key, a.new_name, a.level_acquired
+        ));
+    }
+
+    // Remove whatever this class had previously but no longer does - a real bug found live:
+    // removing a spec's row from the Edit flow's list and redeploying left its
+    // ClassXSpecialization assignment (and all its cloned data) completely untouched, so it kept
+    // showing on every character's sheet forever. `previous_keys` is the exact assignment
+    // snapshot the Edit flow read before the user started editing, so anything in it that isn't
+    // one of this deploy's own final keys is something the user genuinely removed.
+    //
+    // Only ever auto-deletes a key carrying this exact class's own clone suffix (`_<class_id>`,
+    // the same convention `delete_deployed_class`'s cleanup already scopes to) - a plain/shared
+    // key (e.g. "Stealth", assigned directly with no suffix) is never touched here, since the
+    // same KeyName may still be in active use by other classes; only this class's own
+    // ClassXSpecialization row for it would ever be safe to drop automatically, and the editor
+    // has no current way to assign a shared key like that in the first place, so there's nothing
+    // meaningful to clean up for it.
+    let keep_keys: std::collections::HashSet<String> = assignments
+        .iter()
+        .map(|a| format!("{}_{new_class_id}", a.new_key))
+        .collect();
+    let suffix = format!("_{new_class_id}");
+    for key in previous_keys {
+        if keep_keys.contains(key) || !key.ends_with(&suffix) {
+            continue;
+        }
+        delete_existing_clone(cfg, key)?;
+        log.push_str(&format!(
+            "removed '{}' - no longer in this class's spec assignments\n",
+            key
         ));
     }
 
@@ -673,7 +719,7 @@ mod tests {
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         // The new Specialization row exists, independent from the source.
         let all_specs = list_specializations(&cfg).unwrap();
@@ -767,7 +813,7 @@ mod tests {
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         let rows = run_remote_sql_json(
             &cfg,
@@ -813,7 +859,7 @@ mod tests {
         }];
         // 999/888/777 are neither a class involved in the clone request at all - exactly the
         // real-world case this guards against.
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         let rows = run_remote_sql_json(
             &cfg,
@@ -865,7 +911,7 @@ mod tests {
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         let rows = run_remote_sql_json(
             &cfg,
@@ -931,7 +977,7 @@ mod tests {
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         let rows = run_remote_sql_json(
             &cfg,
@@ -987,7 +1033,7 @@ mod tests {
             new_name: "Earthshatter".to_string(),
             level_acquired: -9,
         }];
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         let rows = list_class_specs(&cfg, 64).unwrap();
         assert_eq!(
@@ -1027,7 +1073,7 @@ mod tests {
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
         }];
-        let log = apply_class_specs(&cfg, 64, &assignments).unwrap();
+        let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
         assert!(log.contains("Aeligord"), "{log}");
         assert!(log.contains("Savaen"), "{log}");
         assert!(!log.contains("SomeoneElse"), "{log}");
@@ -1082,9 +1128,9 @@ mod tests {
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
         // Redeploy with the exact same assignment, simulating an Edit-mode resubmit.
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         let specs = list_specializations(&cfg).unwrap();
         let matching: Vec<_> = specs
@@ -1140,7 +1186,7 @@ mod tests {
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         // Resubmit it exactly as the Edit flow would for an unchanged spec: source_key is now its
         // own already-cloned key, not the original "smite".
@@ -1150,7 +1196,7 @@ mod tests {
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, &resubmit).unwrap();
+        apply_class_specs(&cfg, 64, &resubmit, &[]).unwrap();
 
         let specs = list_specializations(&cfg).unwrap();
         assert!(
@@ -1195,7 +1241,7 @@ mod tests {
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
         }];
-        apply_class_specs(&cfg, 64, &assignments).unwrap();
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
         let lines = run_remote_sql_json(
             &cfg,
@@ -1232,6 +1278,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(original_spells.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_spec_removed_from_the_assignment_list_is_fully_deleted() {
+        // Reproduces a real bug found live: removing a spec's row from the Edit flow's list (not
+        // renaming it, just dropping it) and redeploying left it fully assigned and untouched -
+        // apply_class_specs had no way to know a previously-assigned key wasn't being resubmitted
+        // on purpose versus simply forgotten about. Deploy two specs, then redeploy with only one
+        // of them and the other's key in `previous_keys` (exactly what the Edit flow's own load
+        // would have captured) - the dropped one must be completely gone: its
+        // ClassXSpecialization assignment, its Specialization row, and its cloned Style.
+        let dir = setup_test_db("remove-from-list");
+        let cfg = test_cfg(&dir);
+
+        let assignments = vec![
+            SpecAssignment {
+                source_key: "slash".to_string(),
+                new_key: "earthshatter".to_string(),
+                new_name: "Earthshatter".to_string(),
+                level_acquired: 0,
+            },
+            SpecAssignment {
+                source_key: "smite".to_string(),
+                new_key: "frostbolt_tree".to_string(),
+                new_name: "Frostbolt Tree".to_string(),
+                level_acquired: 0,
+            },
+        ];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        // Redeploy with only "Earthshatter" kept; "Frostbolt Tree" was removed from the list in
+        // the UI, and its previously-assigned key is passed back as the Edit flow would.
+        let kept = vec![assignments[0].clone()];
+        let previous_keys = vec!["earthshatter_64".to_string(), "frostbolt_tree_64".to_string()];
+        let log = apply_class_specs(&cfg, 64, &kept, &previous_keys).unwrap();
+        assert!(
+            log.contains("removed 'frostbolt_tree_64'"),
+            "log should mention the removal: {log}"
+        );
+
+        let class_specs = list_class_specs(&cfg, 64).unwrap();
+        assert!(
+            class_specs.iter().any(|c| c.spec_key_name == "earthshatter_64"),
+            "the kept spec must still be assigned: {class_specs:?}"
+        );
+        assert!(
+            !class_specs.iter().any(|c| c.spec_key_name == "frostbolt_tree_64"),
+            "the removed spec must no longer be assigned: {class_specs:?}"
+        );
+
+        let specs = list_specializations(&cfg).unwrap();
+        assert!(
+            !specs.iter().any(|s| s.key_name == "frostbolt_tree_64"),
+            "the removed spec's own row must be fully deleted, not just unassigned: {specs:?}"
+        );
+        let lines = run_remote_sql_json(
+            &cfg,
+            "SELECT 1 FROM SpellLine WHERE Spec='frostbolt_tree_64';",
+        )
+        .unwrap();
+        assert!(lines.is_empty(), "its spell line must be cleaned up too");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_plain_shared_key_in_previous_keys_is_never_auto_removed() {
+        // A plain/shared key (no class-suffix, e.g. a spec assigned by its original real KeyName
+        // rather than one of this tool's clones) must never be auto-deleted by the removal pass,
+        // even if it's absent from the current assignment list - it may still be in active use by
+        // other classes, and the editor has no path that produces such a key as a "clone" to
+        // safely reverse in the first place.
+        let dir = setup_test_db("plain-key-untouched");
+        let cfg = test_cfg(&dir);
+
+        apply_class_specs(&cfg, 64, &[], &["slash".to_string()]).unwrap();
+
+        // "slash" (the real, unsuffixed shared spec) must be completely unaffected.
+        let specs = list_specializations(&cfg).unwrap();
+        assert!(
+            specs.iter().any(|s| s.key_name == "slash"),
+            "a plain shared key must never be deleted by this pass: {specs:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

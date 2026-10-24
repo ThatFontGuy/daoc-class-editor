@@ -259,6 +259,12 @@ export default function ClonePanel() {
             level_acquired: m.level_acquired,
             applied: false,
           })),
+          // Only meaningful while editing an already-deployed class in place (reading its own
+          // specs back, not a parent's to copy from) - this snapshot is what apply_class_specs
+          // diffs against to tell "removed from the list on purpose" apart from "never submitted
+          // in the first place", so a spec dropped from the list here and redeployed is actually
+          // removed on the server too, not left behind.
+          originalAssignedSpecKeys: isEditing ? mine.map((m) => m.spec_key_name) : [],
         }));
       }
       setSpecLog(`found ${mine.length} spec(s) on ${specsOwnerName}`);
@@ -321,11 +327,19 @@ export default function ClonePanel() {
         cfg: sshConfig,
         newClassId: specsWriteToId,
         assignments: payload,
+        previousKeys: project.originalAssignedSpecKeys,
       });
       setSpecLog(result || "done");
       setProject((p) => ({
         ...p,
         specAssignments: p.specAssignments.map((a) => ({ ...a, applied: true })),
+        // Refresh the baseline to what's now actually assigned, so a second apply in the same
+        // session (without reloading from the server first) diffs against reality instead of
+        // the pre-first-apply snapshot - harmless either way (delete_existing_clone is a no-op
+        // for a key that's already gone), but keeps the log free of redundant "removed" lines.
+        originalAssignedSpecKeys: isEditing
+          ? payload.map((p) => `${p.new_key}_${specsWriteToId}`)
+          : p.originalAssignedSpecKeys,
       }));
     } catch (e) {
       setSpecLog(`error: ${e}`);
