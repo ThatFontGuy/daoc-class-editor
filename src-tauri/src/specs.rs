@@ -155,6 +155,100 @@ fn client_style_group_for(source_key: &str, source_override: u8) -> u8 {
         .unwrap_or(0)
 }
 
+/// Spec KeyNames the real server hardcodes a mechanic to by their exact, literal name - cloning
+/// any of these under a new key doesn't just lose cosmetic flexibility, it silently breaks the
+/// actual gameplay mechanic while still looking correct on the character sheet, since the server
+/// looks the real name up directly instead of reading it generically from whatever key a
+/// character actually trained under. Confirmed live and by exact citation in the real server
+/// source (not a guess) - a real, reproduced bug: cloning "Stealth"/"Sword" for Nosferatu left
+/// both showing fully trained, but the character could not actually stealth and had lost her
+/// weapon's entire spec-driven damage bonus, because:
+///
+/// - Every weapon-type spec (every value `SkillBase.InitializeObjectTypeToSpec` ever assigns) is
+///   resolved generically from a weapon's own `Object_Type` via `SkillBase.ObjectTypeToSpec`, then
+///   `GamePlayer.GetWeaponSkill`/`WeaponBaseSpecLevel` and
+///   `AbstractServerRules.GetObject(Base)SpecLevel` call `GetModifiedSpecLevel`/`GetBaseSpecLevel`
+///   on that exact resolved name - never on the class's own cloned key, which this lookup has no
+///   way to know about. A class-specific clone is therefore invisible to the damage formula
+///   entirely: Staff, Shortbow, Fist Wraps, Mauler Staff, Crush, Slash, Thrust, Two Handed,
+///   Polearm, Flexible, Crossbows, Longbows, Archery, Hammer, Sword, Left Axe, Axe, Hand to Hand,
+///   Spear, Thrown Weapons, Composite Bow, Blunt, Blades, Piercing, Large Weapons, Celtic Spear,
+///   Scythe, Shields, Envenom, Recurve Bow.
+/// - A handful of other mechanics have their own direct, hardcoded `GetModifiedSpecLevel(Specs.X)`
+///   call sites that bypass a player's own trained key the exact same way (`StealthSpecHandler.cs`,
+///   `MaxSpeedCalculator.cs`, `AttackComponent.cs`, `ParryChanceCalculator.cs`): Stealth, Parry,
+///   Dual Wield, Celtic Dual, Savagery.
+///
+/// This is why Vampiir's caster specs (Dementia/Shadow Mastery/Vampiiric Embrace) were safe to
+/// clone and rename for Nosferatu but Stealth/Sword were not: a caster spec's spell power comes
+/// from `GamePlayer.GetModifiedSpecLevel` reading the player's *own* trained key generically (see
+/// its doc comment) - cloning only loses minor item/RA bonus stacking (`SkillBase.SpecToSkill`'s
+/// own hardcoded map), never the core mechanic itself.
+const NEVER_CLONE_SPECS: &[&str] = &[
+    "Staff",
+    "Shortbow",
+    "Fist Wraps",
+    "Mauler Staff",
+    "Crush",
+    "Slash",
+    "Thrust",
+    "Two Handed",
+    "Polearm",
+    "Flexible",
+    "Crossbows",
+    "Longbows",
+    "Archery",
+    "Hammer",
+    "Sword",
+    "Left Axe",
+    "Axe",
+    "Hand to Hand",
+    "Spear",
+    "Thrown Weapons",
+    "Composite Bow",
+    "Blunt",
+    "Blades",
+    "Piercing",
+    "Large Weapons",
+    "Celtic Spear",
+    "Scythe",
+    "Shields",
+    "Envenom",
+    "Recurve Bow",
+    "Stealth",
+    "Parry",
+    "Dual Wield",
+    "Celtic Dual",
+    "Savagery",
+];
+
+/// Same normalization `deriveSpecKey` on the frontend applies to a chosen name before appending
+/// the class suffix - needed here to recognize a key like "sword_64" as a previous (mistaken)
+/// clone of "Sword" once the suffix is stripped off.
+fn normalize_for_match(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// If `key` is - or is a previous clone of - one of `NEVER_CLONE_SPECS`, returns its one real
+/// canonical name, the only KeyName it can ever actually function under. Checks a direct match
+/// (the common case: assigning straight from the real spec) and a suffix-stripped match (healing
+/// a key like "sword_64" this tool itself mistakenly cloned before this fix existed).
+fn resolve_uncloneable_spec(key: &str, class_id: i64) -> Option<&'static str> {
+    if let Some(name) = NEVER_CLONE_SPECS.iter().find(|n| **n == key) {
+        return Some(name);
+    }
+    let suffix = format!("_{class_id}");
+    let stripped = key.strip_suffix(&suffix)?;
+    let stripped_norm = normalize_for_match(stripped);
+    NEVER_CLONE_SPECS
+        .iter()
+        .find(|n| normalize_for_match(n) == stripped_norm)
+        .copied()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecializationRow {
     pub key_name: String,
@@ -247,6 +341,23 @@ pub fn apply_class_specs(
 ) -> Result<String, String> {
     let mut log = String::new();
     for a in assignments {
+        // Some spec keys can never safely be cloned/renamed at all (NEVER_CLONE_SPECS's own doc
+        // comment has the full citations) - the server hardcodes their actual mechanic to their
+        // exact literal name, so a clone only ever looks right on the character sheet while
+        // silently not working in play. Handle this before any of the normal clone machinery
+        // below even runs, and move on to the next assignment.
+        if let Some(real_name) = resolve_uncloneable_spec(&a.source_key, new_class_id) {
+            log.push_str(&ensure_uncloneable_spec_assigned(
+                cfg,
+                new_class_id,
+                real_name,
+                &a.source_key,
+                &a.new_name,
+                a.level_acquired,
+            )?);
+            continue;
+        }
+
         // Embedding the new class's ID directly in the stored KeyName (not just the spell lines
         // under it) gives every row this clone creates a reliable, greppable suffix -
         // `delete_deployed_class` relies on exactly this to find and remove only what was cloned
@@ -338,7 +449,11 @@ pub fn apply_class_specs(
     // meaningful to clean up for it.
     let keep_keys: std::collections::HashSet<String> = assignments
         .iter()
-        .map(|a| format!("{}_{new_class_id}", a.new_key))
+        .map(|a| {
+            resolve_uncloneable_spec(&a.source_key, new_class_id)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("{}_{new_class_id}", a.new_key))
+        })
         .collect();
     let suffix = format!("_{new_class_id}");
     for key in previous_keys {
@@ -474,6 +589,166 @@ fn scrub_spec_from_characters(cfg: &SshConfig, class_id: i64, key: &str) -> Resu
         changed.len(),
         changed.join(", ")
     ))
+}
+
+/// Migrates a character's own trained points from one SpecKeyName to another in their saved
+/// SerializedSpecs, for every character currently on `class_id` - renames the token's key but
+/// keeps its exact value. Used to heal a spec this tool mistakenly cloned before
+/// `NEVER_CLONE_SPECS` existed (e.g. "sword_64") back onto its real, mechanically-functional name
+/// ("Sword") without losing whatever a character already invested under the old key - unlike
+/// `scrub_spec_from_characters`, nothing is actually being removed from the class here, only its
+/// real identity restored.
+fn rename_spec_in_characters(
+    cfg: &SshConfig,
+    class_id: i64,
+    from_key: &str,
+    to_key: &str,
+) -> Result<String, String> {
+    let rows = run_remote_sql_json(
+        cfg,
+        &format!("SELECT Name, SerializedSpecs FROM DOLCharacters WHERE Class = {class_id};"),
+    )?;
+    let mut changed = Vec::new();
+    for row in &rows {
+        let name = str_field(row, "Name");
+        let serialized_specs = str_field(row, "SerializedSpecs");
+        if serialized_specs.is_empty() {
+            continue;
+        }
+        let mut touched = false;
+        let tokens: Vec<String> = serialized_specs
+            .split(';')
+            .map(|t| {
+                let mut parts = t.splitn(2, '|');
+                let key = parts.next().unwrap_or("");
+                let rest = parts.next();
+                if key == from_key {
+                    touched = true;
+                    match rest {
+                        Some(r) => format!("{to_key}|{r}"),
+                        None => to_key.to_string(),
+                    }
+                } else {
+                    t.to_string()
+                }
+            })
+            .collect();
+        if !touched {
+            continue;
+        }
+        run_remote_sql(
+            cfg,
+            &format!(
+                "UPDATE DOLCharacters SET SerializedSpecs = '{}' WHERE Name = '{}' AND Class = {class_id};",
+                sql_quote(&tokens.join(";")),
+                sql_quote(&name)
+            ),
+        )?;
+        changed.push(name);
+    }
+    if changed.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "migrated '{}' points to '{}' for {} character(s): {}\n",
+        from_key,
+        to_key,
+        changed.len(),
+        changed.join(", ")
+    ))
+}
+
+/// Moves a stale clone's own Style and SpecXAbility rows onto `real_name` (UPDATE, never DELETE),
+/// then removes only the clone's now-empty identity (its Specialization row, any SpellLine/
+/// LineXSpell, and its own ClassXSpecialization row). A real, reproduced case this exists for:
+/// "sword_64" (a previous clone of "Sword", before `NEVER_CLONE_SPECS` existed) still carried its
+/// own genuinely class-exclusive combat styles, and "stealth_64" carried Nosferatu's own
+/// SpecXAbility grants (Safe Fall, Climb Walls, Danger Sense, Detect Hidden, Distraction) - those
+/// are real, class-specific content worth keeping, locked to the same ClassId either way, so they
+/// move onto the real spec's own row (exactly how the real game already lets several classes
+/// share one base spec with their own distinct, ClassId-locked style sets) rather than being
+/// thrown away just because the spec's own *identity* has to be the real one.
+fn reparent_onto_real_spec(cfg: &SshConfig, stale_key: &str, real_name: &str) -> Result<(), String> {
+    let stale_key_q = sql_quote(stale_key);
+    let real_name_q = sql_quote(real_name);
+
+    run_remote_sql(
+        cfg,
+        &format!(
+            "UPDATE Style SET SpecKeyName = '{real_name_q}' WHERE SpecKeyName = '{stale_key_q}';"
+        ),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!("UPDATE SpecXAbility SET Spec = '{real_name_q}' WHERE Spec = '{stale_key_q}';"),
+    )?;
+
+    let lines = run_remote_sql_json(
+        cfg,
+        &format!("SELECT KeyName FROM SpellLine WHERE Spec = '{stale_key_q}';"),
+    )?;
+    for line in &lines {
+        let line_key_q = sql_quote(&str_field(line, "KeyName"));
+        run_remote_sql(
+            cfg,
+            &format!("DELETE FROM LineXSpell WHERE LineName = '{line_key_q}';"),
+        )?;
+    }
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM SpellLine WHERE Spec = '{stale_key_q}';"),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM ClassXSpecialization WHERE SpecKeyName = '{stale_key_q}';"),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM Specialization WHERE KeyName = '{stale_key_q}';"),
+    )?;
+    Ok(())
+}
+
+/// Ensures `class_id` has `real_name` (one of `NEVER_CLONE_SPECS`) assigned directly, un-cloned,
+/// at `level`. If `source_key` differs from `real_name` - a previous deploy, before this fix
+/// existed, cloned it under its own suffixed key (e.g. "sword_64") - heals that: migrates every
+/// affected character's trained points from the old key onto the real one, and moves the stale
+/// clone's own Style/SpecXAbility content onto the real spec's row too, so nothing real is lost
+/// and nothing lingers duplicated.
+fn ensure_uncloneable_spec_assigned(
+    cfg: &SshConfig,
+    class_id: i64,
+    real_name: &str,
+    source_key: &str,
+    new_name: &str,
+    level: i64,
+) -> Result<String, String> {
+    let mut log = String::new();
+    if source_key != real_name {
+        log.push_str(&rename_spec_in_characters(cfg, class_id, source_key, real_name)?);
+        reparent_onto_real_spec(cfg, source_key, real_name)?;
+    }
+    let real_name_q = sql_quote(real_name);
+    run_remote_sql(
+        cfg,
+        &format!(
+            "DELETE FROM ClassXSpecialization WHERE ClassID = {class_id} AND SpecKeyName = '{real_name_q}';"
+        ),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!(
+            "INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) VALUES ({class_id}, '{real_name_q}', {level});"
+        ),
+    )?;
+    log.push_str(&format!(
+        "kept '{}' assigned under its own real name at level {} - the server hardcodes this \
+         spec's actual mechanic to its exact literal KeyName, so cloning or renaming it (you \
+         asked for '{}') would only ever look right on the character sheet while silently not \
+         working in play; see NEVER_CLONE_SPECS\n",
+        real_name, level, new_name
+    ));
+    Ok(log)
 }
 
 /// Grants every character currently playing `class_id` one free full-respec token
@@ -849,16 +1124,19 @@ mod tests {
 
     #[test]
     fn clone_of_a_recognized_spec_auto_populates_client_style_group() {
-        // The real-world Nosferatu's Claw scenario end-to-end: cloning "Celtic Dual" (a real,
-        // client-recognized spec name) under a brand-new KeyName must not leave the clone's
-        // styles grouped under the client's generic "Abilities" bucket - the clone should
-        // automatically inherit Celtic Dual's own recognized category (0x6E), with no server
-        // code change and no manual step needed.
+        // A real, client-recognized spec name (one of CLIENT_STYLE_GROUPS's own entries) must not
+        // leave its clone's styles grouped under the client's generic "Abilities" bucket - the
+        // clone should automatically inherit the source's own recognized category, with no server
+        // code change and no manual step needed. Uses "Mentalism" (a pure caster spec, not in
+        // NEVER_CLONE_SPECS) rather than "Celtic Dual" - a real bug found live used that for
+        // Nosferatu's Claw originally, which silently broke her actual dual-wield damage bonus
+        // (see NEVER_CLONE_SPECS's own doc comment); this test only needs a recognized name that
+        // is actually safe to clone.
         let dir = setup_test_db("clone-recognized-name");
         let cfg = test_cfg(&dir);
         let sql = "
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
-                VALUES ('Celtic Dual', 'Celtic Dual', 'Dual wield', 300, NULL, 0);
+                VALUES ('Mentalism', 'Mentalism', 'Mental spells', 300, NULL, 0);
         ";
         let status = Command::new("sqlite3")
             .arg(dir.join("data/opendaoc.sqlite3.db"))
@@ -868,7 +1146,7 @@ mod tests {
         assert!(status.success());
 
         let assignments = vec![SpecAssignment {
-            source_key: "Celtic Dual".to_string(),
+            source_key: "Mentalism".to_string(),
             new_key: "nosferatusclaw".to_string(),
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
@@ -880,7 +1158,7 @@ mod tests {
             "SELECT ClientStyleGroup FROM Specialization WHERE KeyName='nosferatusclaw_64';",
         )
         .unwrap();
-        assert_eq!(int_field(&rows[0], "ClientStyleGroup"), 0x6E);
+        assert_eq!(int_field(&rows[0], "ClientStyleGroup"), 0x69);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1498,6 +1776,118 @@ mod tests {
         assert!(
             specs.iter().any(|s| s.key_name == "slash"),
             "a plain shared key must never be deleted by this pass: {specs:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assigning_a_never_clone_spec_keeps_its_real_name_uncloned() {
+        // Reproduces a real bug found live: cloning "Stealth"/"Sword" for Nosferatu under new
+        // KeyNames left both fully trained on the character sheet, but the character could not
+        // actually stealth and had lost her weapon's entire spec-driven damage bonus - the server
+        // hardcodes these mechanics to the exact literal name (NEVER_CLONE_SPECS's own doc
+        // comment has the citations). Assigning straight from a real, denylisted spec must keep
+        // it assigned under its own real name - never clone/rename it, no matter what new_name
+        // was requested.
+        let dir = setup_test_db("never-clone-fresh-assign");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+             VALUES ('Sword', 'Sword', 'Sword weapons', 400, NULL, 0);",
+        )
+        .unwrap();
+
+        let assignments = vec![SpecAssignment {
+            source_key: "Sword".to_string(),
+            new_key: "earthshatterblade".to_string(),
+            new_name: "Earthshatter Blade".to_string(),
+            level_acquired: 3,
+        }];
+        let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+        assert!(
+            log.contains("kept 'Sword' assigned under its own real name"),
+            "log should explain why: {log}"
+        );
+
+        let class_specs = list_class_specs(&cfg, 64).unwrap();
+        assert_eq!(class_specs.len(), 1, "{class_specs:?}");
+        assert_eq!(class_specs[0].spec_key_name, "Sword");
+        assert_eq!(class_specs[0].level_acquired, 3);
+
+        let specs = list_specializations(&cfg).unwrap();
+        assert!(
+            !specs.iter().any(|s| s.key_name == "earthshatterblade_64"),
+            "no clone must ever be created for a denylisted spec: {specs:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assigning_a_never_clone_spec_heals_a_previous_bad_clone() {
+        // The exact live incident this fix recovered from: a previous deploy (before
+        // NEVER_CLONE_SPECS existed) cloned "Sword" into "sword_64", carrying its own
+        // class-exclusive combat style along, and a character had already trained points under
+        // that broken clone. Redeploying today (the Edit flow reading back "sword_64" as the
+        // current source, same as it would for any other already-assigned spec) must heal this:
+        // migrate the character's points onto the real "Sword" key (preserving the exact value),
+        // move the clone's own style onto "Sword" too (never just discard it), and leave the
+        // class assigned to "Sword" only.
+        let dir = setup_test_db("never-clone-heal");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+             VALUES ('Sword', 'Sword', 'Sword weapons', 400, NULL, 0);\
+             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+             VALUES ('sword_64', 'Sword', 'Sword weapons', 400, NULL, 0);\
+             INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) VALUES (64, 'sword_64', 0);\
+             INSERT INTO Style VALUES (NULL, 64, 'Bloodrage', 'sword_64', 10, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);\
+             INSERT INTO DOLCharacters (Name, Class, SerializedSpecs) VALUES ('Lillith', 64, 'sword_64|9;stealth_64|1');",
+        )
+        .unwrap();
+
+        let assignments = vec![SpecAssignment {
+            source_key: "sword_64".to_string(),
+            new_key: "sword".to_string(),
+            new_name: "Sword".to_string(),
+            level_acquired: 0,
+        }];
+        let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+        assert!(log.contains("migrated 'sword_64' points to 'Sword'"), "{log}");
+
+        let class_specs = list_class_specs(&cfg, 64).unwrap();
+        assert_eq!(class_specs.len(), 1, "{class_specs:?}");
+        assert_eq!(class_specs[0].spec_key_name, "Sword");
+
+        let specs = list_specializations(&cfg).unwrap();
+        assert!(
+            !specs.iter().any(|s| s.key_name == "sword_64"),
+            "the stale clone's own row must be fully deleted: {specs:?}"
+        );
+
+        // The clone's own style must survive - moved onto the real spec's row, not discarded,
+        // still locked to this exact class.
+        let styles = run_remote_sql_json(
+            &cfg,
+            "SELECT Name, ClassId FROM Style WHERE SpecKeyName = 'Sword';",
+        )
+        .unwrap();
+        assert_eq!(styles.len(), 1, "{styles:?}");
+        assert_eq!(str_field(&styles[0], "Name"), "Bloodrage");
+        assert_eq!(int_field(&styles[0], "ClassId"), 64);
+
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT SerializedSpecs FROM DOLCharacters WHERE Name = 'Lillith';",
+        )
+        .unwrap();
+        assert_eq!(
+            str_field(&rows[0], "SerializedSpecs"),
+            "Sword|9;stealth_64|1",
+            "the real spec's points must survive the migration, untouched specs must be left alone"
         );
 
         std::fs::remove_dir_all(&dir).ok();
