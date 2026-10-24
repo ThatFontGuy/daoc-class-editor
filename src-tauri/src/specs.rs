@@ -345,6 +345,14 @@ pub fn apply_class_specs(
         if keep_keys.contains(key) || !key.ends_with(&suffix) {
             continue;
         }
+        // Must run before delete_existing_clone, not after - a real, reproduced crash found live
+        // immediately after this feature shipped: deleting the spec correctly removes it from
+        // Specialization, but a character who already had points in it still references that now
+        // -gone KeyName in their own saved SerializedSpecs - SkillBase.GetSpecialization
+        // null-derefs on a key with no matching row, crashing login entirely before the character
+        // ever reaches the free respec token granted below. Scrub it from every character on this
+        // class first so nobody can log in to a dangling reference.
+        log.push_str(&scrub_spec_from_characters(cfg, new_class_id, key)?);
         delete_existing_clone(cfg, key)?;
         log.push_str(&format!(
             "removed '{}' - no longer in this class's spec assignments\n",
@@ -414,6 +422,58 @@ fn delete_existing_clone(cfg: &SshConfig, key: &str) -> Result<(), String> {
         &format!("DELETE FROM Specialization WHERE KeyName = '{key_q}';"),
     )?;
     Ok(())
+}
+
+/// Strips a now-deleted spec key from every character currently on `class_id`'s own saved
+/// SerializedSpecs - a real, reproduced crash found live immediately after the removal feature
+/// above shipped: deleting a spec correctly removes its Specialization row, but a character who
+/// already had points in it still carries that now-gone KeyName in their own saved
+/// SerializedSpecs string. SkillBase.GetSpecialization null-derefs on a key with no matching row,
+/// crashing login entirely (the exact signature from the self-source-deletion bug found earlier
+/// in this file) - before the character ever gets anywhere near the free respec token this same
+/// deploy grants. SerializedSpecs is a `;`-joined list of `KeyName|points` tokens; this drops only
+/// the exact matching token (never a partial/substring match) and writes back only characters
+/// whose string actually changed, leaving every other spec's points untouched.
+fn scrub_spec_from_characters(cfg: &SshConfig, class_id: i64, key: &str) -> Result<String, String> {
+    let rows = run_remote_sql_json(
+        cfg,
+        &format!("SELECT Name, SerializedSpecs FROM DOLCharacters WHERE Class = {class_id};"),
+    )?;
+    let mut changed = Vec::new();
+    for row in &rows {
+        let name = str_field(row, "Name");
+        let serialized_specs = str_field(row, "SerializedSpecs");
+        if serialized_specs.is_empty() {
+            continue;
+        }
+        let tokens: Vec<&str> = serialized_specs.split(';').collect();
+        let kept: Vec<&str> = tokens
+            .iter()
+            .copied()
+            .filter(|t| t.split('|').next() != Some(key))
+            .collect();
+        if kept.len() == tokens.len() {
+            continue;
+        }
+        run_remote_sql(
+            cfg,
+            &format!(
+                "UPDATE DOLCharacters SET SerializedSpecs = '{}' WHERE Name = '{}' AND Class = {class_id};",
+                sql_quote(&kept.join(";")),
+                sql_quote(&name)
+            ),
+        )?;
+        changed.push(name);
+    }
+    if changed.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "removed stale '{}' points from {} character(s) so they can still log in: {}\n",
+        key,
+        changed.len(),
+        changed.join(", ")
+    ))
 }
 
 /// Grants every character currently playing `class_id` one free full-respec token
@@ -662,7 +722,7 @@ mod tests {
                 ID INTEGER DEFAULT 0);
             CREATE TABLE SpecXAbility (SpecXabilityID INTEGER PRIMARY KEY AUTOINCREMENT, Spec TEXT, SpecLevel INTEGER,
                 AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
-            CREATE TABLE DOLCharacters (Name TEXT, Class INTEGER, RespecAmountAllSkill INTEGER DEFAULT 0);
+            CREATE TABLE DOLCharacters (Name TEXT, Class INTEGER, RespecAmountAllSkill INTEGER DEFAULT 0, SerializedSpecs TEXT DEFAULT '');
 
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL, 0);
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL, 0);
@@ -1341,6 +1401,82 @@ mod tests {
         )
         .unwrap();
         assert!(lines.is_empty(), "its spell line must be cleaned up too");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removing_a_spec_scrubs_it_from_characters_so_they_can_still_log_in() {
+        // Reproduces a real crash found live immediately after the removal feature shipped: a
+        // character who already had points in a spec that gets removed still carries its now
+        // -deleted KeyName in their own saved SerializedSpecs - SkillBase.GetSpecialization
+        // null-derefs on a key with no matching row, crashing login entirely, before the
+        // character ever reaches the free respec token this same deploy grants. The dangling
+        // token must be stripped (and only that exact token - every other spec's own points,
+        // and any other character's data entirely, must survive untouched).
+        let dir = setup_test_db("scrub-on-removal");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO DOLCharacters (Name, Class, SerializedSpecs) VALUES ('Aeligord', 64, '');\
+             INSERT INTO DOLCharacters (Name, Class, SerializedSpecs) VALUES ('SomeoneElse', 23, '');",
+        )
+        .unwrap();
+
+        let assignments = vec![
+            SpecAssignment {
+                source_key: "slash".to_string(),
+                new_key: "earthshatter".to_string(),
+                new_name: "Earthshatter".to_string(),
+                level_acquired: 0,
+            },
+            SpecAssignment {
+                source_key: "smite".to_string(),
+                new_key: "frostbolt_tree".to_string(),
+                new_name: "Frostbolt Tree".to_string(),
+                level_acquired: 0,
+            },
+        ];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        run_remote_sql(
+            &cfg,
+            "UPDATE DOLCharacters SET SerializedSpecs = 'earthshatter_64|3;frostbolt_tree_64|2' WHERE Name = 'Aeligord';",
+        )
+        .unwrap();
+        run_remote_sql(
+            &cfg,
+            "UPDATE DOLCharacters SET SerializedSpecs = 'somethingelse_23|5' WHERE Name = 'SomeoneElse';",
+        )
+        .unwrap();
+
+        // Redeploy with "Frostbolt Tree" removed from the list.
+        let kept = vec![assignments[0].clone()];
+        let previous_keys = vec!["earthshatter_64".to_string(), "frostbolt_tree_64".to_string()];
+        let log = apply_class_specs(&cfg, 64, &kept, &previous_keys).unwrap();
+        assert!(
+            log.contains("removed stale 'frostbolt_tree_64' points from"),
+            "log should mention the scrub: {log}"
+        );
+
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT SerializedSpecs FROM DOLCharacters WHERE Name = 'Aeligord';",
+        )
+        .unwrap();
+        assert_eq!(
+            str_field(&rows[0], "SerializedSpecs"),
+            "earthshatter_64|3",
+            "the removed spec's token must be gone, the kept spec's points must survive untouched"
+        );
+
+        // A character on a different class entirely must never be touched.
+        let other = run_remote_sql_json(
+            &cfg,
+            "SELECT SerializedSpecs FROM DOLCharacters WHERE Name = 'SomeoneElse';",
+        )
+        .unwrap();
+        assert_eq!(str_field(&other[0], "SerializedSpecs"), "somethingelse_23|5");
 
         std::fs::remove_dir_all(&dir).ok();
     }
