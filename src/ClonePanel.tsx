@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ClassInfo,
@@ -6,7 +6,9 @@ import {
   ClassSpecRow,
   CloneRequest,
   KnownOptions,
+  LineSpellRow,
   SpecAssignmentPayload,
+  SpecSpellLineRow,
   SpecializationRow,
   SshConfig,
   emptySshConfig,
@@ -287,6 +289,131 @@ export default function ClonePanel() {
       ...p,
       specAssignments: p.specAssignments.filter((_, i) => i !== index),
     }));
+    if (expandedSpecIndex === index) closeSpellLineCustomizer();
+  }
+
+  // Which assignment row's "customize spell lines" picker is open, if any - only one at a time
+  // keeps the UI simple, and `expandedLineKey` nests one level further (which of that row's own
+  // lines is showing its individual spell checklist).
+  const [expandedSpecIndex, setExpandedSpecIndex] = useState<number | null>(null);
+  const [expandedLineKey, setExpandedLineKey] = useState<string | null>(null);
+
+  function closeSpellLineCustomizer() {
+    setExpandedSpecIndex(null);
+    setExpandedLineKey(null);
+  }
+
+  // Opens the picker for assignment `i`, fetching its source spec's own SpellLines the first
+  // time (defaulting every line to included, so doing nothing after opening it reproduces the
+  // original "clone everything" behavior exactly). A real, reported problem this whole feature
+  // exists for: several real specs span multiple SpellLines shared across different classes
+  // (e.g. "Mind Magic" has both "Mind Twisting" and "Domination"; "Enhancement" has five) -
+  // cloning the whole spec previously pulled in every one of them, with no way to pick just the
+  // one actually wanted.
+  async function openSpellLineCustomizer(i: number) {
+    const a = project.specAssignments[i];
+    if (!a.spellLineSelection) {
+      try {
+        const lines = await invoke<SpecSpellLineRow[]>("list_spec_spell_lines", {
+          cfg: sshConfig,
+          specKey: a.source_key,
+        });
+        updateSpecAssignment(i, {
+          spellLineSelection: lines.map((l) => ({
+            source_line_key: l.key_name,
+            line_name: l.name,
+            included: true,
+            spells: [],
+          })),
+        });
+      } catch (e) {
+        setSpecLog(`error loading spell lines: ${e}`);
+        return;
+      }
+    }
+    setExpandedSpecIndex(i);
+  }
+
+  function resetSpellLineCustomization(i: number) {
+    updateSpecAssignment(i, { spellLineSelection: undefined });
+    if (expandedSpecIndex === i) closeSpellLineCustomizer();
+  }
+
+  function toggleLineIncluded(specIndex: number, lineKey: string) {
+    setProject((p) => ({
+      ...p,
+      specAssignments: p.specAssignments.map((a, i) =>
+        i !== specIndex || !a.spellLineSelection
+          ? a
+          : {
+              ...a,
+              applied: false,
+              spellLineSelection: a.spellLineSelection.map((l) =>
+                l.source_line_key === lineKey ? { ...l, included: !l.included } : l,
+              ),
+            },
+      ),
+    }));
+  }
+
+  // Opens a line's own spell checklist, fetching its spells the first time (defaulting every
+  // spell to included) - "I would like to be able to remove specific spells from the line we
+  // copy over as well."
+  async function openSpellPicker(specIndex: number, lineKey: string) {
+    const line = project.specAssignments[specIndex]?.spellLineSelection?.find(
+      (l) => l.source_line_key === lineKey,
+    );
+    if (line && line.spells.length === 0) {
+      try {
+        const spells = await invoke<LineSpellRow[]>("list_line_spells", {
+          cfg: sshConfig,
+          lineKey,
+        });
+        setProject((p) => ({
+          ...p,
+          specAssignments: p.specAssignments.map((asn, i) =>
+            i !== specIndex || !asn.spellLineSelection
+              ? asn
+              : {
+                  ...asn,
+                  spellLineSelection: asn.spellLineSelection.map((l) =>
+                    l.source_line_key === lineKey
+                      ? { ...l, spells: spells.map((s) => ({ ...s, included: true })) }
+                      : l,
+                  ),
+                },
+          ),
+        }));
+      } catch (e) {
+        setSpecLog(`error loading spells: ${e}`);
+        return;
+      }
+    }
+    setExpandedLineKey(lineKey);
+  }
+
+  function toggleSpellIncluded(specIndex: number, lineKey: string, spellId: number) {
+    setProject((p) => ({
+      ...p,
+      specAssignments: p.specAssignments.map((a, i) =>
+        i !== specIndex || !a.spellLineSelection
+          ? a
+          : {
+              ...a,
+              applied: false,
+              spellLineSelection: a.spellLineSelection.map((l) =>
+                l.source_line_key !== lineKey
+                  ? l
+                  : {
+                      ...l,
+                      spells: l.spells.map((s) =>
+                        s.spell_id === spellId ? { ...s, included: !s.included } : s,
+                      ),
+                    },
+              ),
+            },
+      ),
+    }));
   }
 
   function addBlankAssignment() {
@@ -322,6 +449,13 @@ export default function ClonePanel() {
         new_key: deriveSpecKey(a.new_name),
         new_name: a.new_name,
         level_acquired: a.level_acquired,
+        // Undefined (never customized) sends an empty list - apply_class_specs treats that as
+        // "clone every line and every spell in full", the original, still-default behavior.
+        spell_line_selection: (a.spellLineSelection ?? []).map((l) => ({
+          source_line_key: l.source_line_key,
+          included: l.included,
+          excluded_spell_ids: l.spells.filter((s) => !s.included).map((s) => s.spell_id),
+        })),
       }));
       const result = await invoke<string>("apply_class_specs", {
         cfg: sshConfig,
@@ -520,57 +654,158 @@ export default function ClonePanel() {
                     <th>Source spec</th>
                     <th>New name</th>
                     <th>Level acquired</th>
+                    <th>Spell lines</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {project.specAssignments.map((a, i) => (
-                    <tr key={i}>
-                      <td>
-                        <select
-                          value={a.source_key}
-                          onChange={(e) => {
-                            const picked = allSpecs.find((s) => s.key_name === e.target.value);
-                            updateSpecAssignment(i, {
-                              source_key: e.target.value,
-                              source_name: picked?.name ?? e.target.value,
-                            });
-                          }}
-                        >
-                          {allSpecs.map((s) => (
-                            <option value={s.key_name} key={s.key_name}>
-                              {s.name}
-                            </option>
-                          ))}
-                        </select>
-                      </td>
-                      <td>
-                        <input
-                          value={a.new_name}
-                          placeholder="e.g. Nosferatu's Claw"
-                          onChange={(e) => updateSpecAssignment(i, { new_name: e.target.value })}
-                        />
-                      </td>
-                      <td>
-                        <input
-                          type="number"
-                          value={a.level_acquired}
-                          onChange={(e) =>
-                            updateSpecAssignment(i, { level_acquired: Number(e.target.value) })
-                          }
-                        />
-                      </td>
-                      <td>
-                        {a.applied ? (
-                          <span className="mode-badge" style={{ marginBottom: 0 }}>
-                            applied
-                          </span>
-                        ) : (
-                          <button onClick={() => removeSpecAssignment(i)}>Remove</button>
+                  {project.specAssignments.map((a, i) => {
+                    const included = a.spellLineSelection?.filter((l) => l.included).length;
+                    const total = a.spellLineSelection?.length;
+                    return (
+                      <Fragment key={i}>
+                        <tr>
+                          <td>
+                            <select
+                              value={a.source_key}
+                              onChange={(e) => {
+                                const picked = allSpecs.find((s) => s.key_name === e.target.value);
+                                updateSpecAssignment(i, {
+                                  source_key: e.target.value,
+                                  source_name: picked?.name ?? e.target.value,
+                                  // A previous customization belonged to the old source spec's own
+                                  // lines - meaningless (and possibly wrong) against a different one.
+                                  spellLineSelection: undefined,
+                                });
+                                if (expandedSpecIndex === i) closeSpellLineCustomizer();
+                              }}
+                            >
+                              {allSpecs.map((s) => (
+                                <option value={s.key_name} key={s.key_name}>
+                                  {s.name}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                          <td>
+                            <input
+                              value={a.new_name}
+                              placeholder="e.g. Nosferatu's Claw"
+                              onChange={(e) =>
+                                updateSpecAssignment(i, { new_name: e.target.value })
+                              }
+                            />
+                          </td>
+                          <td>
+                            <input
+                              type="number"
+                              value={a.level_acquired}
+                              onChange={(e) =>
+                                updateSpecAssignment(i, { level_acquired: Number(e.target.value) })
+                              }
+                            />
+                          </td>
+                          <td>
+                            {a.spellLineSelection ? (
+                              <>
+                                <span className="hint" style={{ marginRight: 6 }}>
+                                  {included}/{total} line{total === 1 ? "" : "s"}
+                                </span>
+                                <button
+                                  onClick={() =>
+                                    expandedSpecIndex === i
+                                      ? closeSpellLineCustomizer()
+                                      : openSpellLineCustomizer(i)
+                                  }
+                                >
+                                  {expandedSpecIndex === i ? "Close" : "Edit"}
+                                </button>{" "}
+                                <button onClick={() => resetSpellLineCustomization(i)}>
+                                  Reset
+                                </button>
+                              </>
+                            ) : (
+                              <button onClick={() => openSpellLineCustomizer(i)}>
+                                All lines (customize)
+                              </button>
+                            )}
+                          </td>
+                          <td>
+                            {a.applied ? (
+                              <span className="mode-badge" style={{ marginBottom: 0 }}>
+                                applied
+                              </span>
+                            ) : (
+                              <button onClick={() => removeSpecAssignment(i)}>Remove</button>
+                            )}
+                          </td>
+                        </tr>
+                        {expandedSpecIndex === i && a.spellLineSelection && (
+                          <tr key={`${i}-customizer`}>
+                            <td colSpan={5}>
+                              <div className="spell-line-customizer">
+                                <p className="hint">
+                                  Uncheck a line to leave it out entirely, or keep it checked and
+                                  remove specific spells from inside it below.
+                                </p>
+                                {a.spellLineSelection.map((line) => (
+                                  <div key={line.source_line_key} className="spell-line-row">
+                                    <label>
+                                      <input
+                                        type="checkbox"
+                                        checked={line.included}
+                                        onChange={() =>
+                                          toggleLineIncluded(i, line.source_line_key)
+                                        }
+                                      />{" "}
+                                      {line.line_name}
+                                    </label>{" "}
+                                    {line.included && (
+                                      <button
+                                        onClick={() =>
+                                          expandedLineKey === line.source_line_key
+                                            ? setExpandedLineKey(null)
+                                            : openSpellPicker(i, line.source_line_key)
+                                        }
+                                      >
+                                        {expandedLineKey === line.source_line_key
+                                          ? "Hide spells"
+                                          : "Spells..."}
+                                      </button>
+                                    )}
+                                    {line.included && expandedLineKey === line.source_line_key && (
+                                      <div className="spell-picker">
+                                        {line.spells.length === 0 ? (
+                                          <span className="hint">loading...</span>
+                                        ) : (
+                                          line.spells.map((s) => (
+                                            <label key={s.spell_id} className="spell-checkbox">
+                                              <input
+                                                type="checkbox"
+                                                checked={s.included}
+                                                onChange={() =>
+                                                  toggleSpellIncluded(
+                                                    i,
+                                                    line.source_line_key,
+                                                    s.spell_id,
+                                                  )
+                                                }
+                                              />{" "}
+                                              {s.name} (lvl {s.level})
+                                            </label>
+                                          ))
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            </td>
+                          </tr>
                         )}
-                      </td>
-                    </tr>
-                  ))}
+                      </Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
               <div className="actions">

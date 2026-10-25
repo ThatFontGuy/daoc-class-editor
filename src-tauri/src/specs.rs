@@ -264,12 +264,47 @@ pub struct ClassSpecRow {
     pub level_acquired: i64,
 }
 
+/// One SpellLine the user chose to include or exclude when cloning a spec, plus any individual
+/// spells to leave out of an included line. Lets a spec spanning several real SpellLines (e.g.
+/// "Mind Magic" has both "Mind Twisting" and "Domination"; "Enhancement" has five, one per real
+/// class that shares it) be cloned down to just the one line actually wanted, rather than always
+/// pulling in every line the source spec has - a real, reproduced problem: cloning "Mind Magic"
+/// for just its "Mind Twisting" spells also silently brought "Domination" along for the ride.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpellLineSelection {
+    pub source_line_key: String,
+    pub included: bool,
+    #[serde(default)]
+    pub excluded_spell_ids: Vec<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecAssignment {
     pub source_key: String,
     pub new_key: String,
     pub new_name: String,
     pub level_acquired: i64,
+    /// Empty means "no customization was made - clone every SpellLine and every spell in it, in
+    /// full" (the original, still-default behavior, and what every pre-existing saved project or
+    /// test keeps getting via `#[serde(default)]`). Non-empty is the authoritative, explicit list
+    /// of what to do with the source spec's own lines - any line of the source's that isn't
+    /// mentioned in it at all is excluded.
+    #[serde(default)]
+    pub spell_line_selection: Vec<SpellLineSelection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecSpellLineRow {
+    pub key_name: String,
+    pub name: String,
+    pub is_base_line: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineSpellRow {
+    pub spell_id: i64,
+    pub name: String,
+    pub level: i64,
 }
 
 fn str_field(row: &Value, key: &str) -> String {
@@ -315,6 +350,49 @@ pub fn list_class_specs(cfg: &SshConfig, class_id: i64) -> Result<Vec<ClassSpecR
             spec_key_name: str_field(r, "SpecKeyName"),
             spec_name: str_field(r, "SpecName"),
             level_acquired: int_field(r, "LevelAcquired"),
+        })
+        .collect())
+}
+
+/// Every SpellLine attached to `spec_key` - the source list for the Edit flow's "customize which
+/// lines to include" picker (see `SpellLineSelection`'s own doc comment for why this exists).
+pub fn list_spec_spell_lines(
+    cfg: &SshConfig,
+    spec_key: &str,
+) -> Result<Vec<SpecSpellLineRow>, String> {
+    let spec_key_q = sql_quote(spec_key);
+    let rows = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT KeyName, Name, IsBaseLine FROM SpellLine WHERE Spec = '{spec_key_q}' ORDER BY Name;"
+        ),
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| SpecSpellLineRow {
+            key_name: str_field(r, "KeyName"),
+            name: str_field(r, "Name"),
+            is_base_line: int_field(r, "IsBaseLine") != 0,
+        })
+        .collect())
+}
+
+/// Every spell in `line_key` (joining `LineXSpell` to `Spell` for a real display name) - the
+/// source list for the Edit flow's "remove specific spells from the line we copy over" picker.
+pub fn list_line_spells(cfg: &SshConfig, line_key: &str) -> Result<Vec<LineSpellRow>, String> {
+    let line_key_q = sql_quote(line_key);
+    let sql = format!(
+        "SELECT lxs.SpellID AS SpellID, lxs.Level AS Level, s.Name AS Name \
+         FROM LineXSpell lxs JOIN Spell s ON s.SpellID = lxs.SpellID \
+         WHERE lxs.LineName = '{line_key_q}' ORDER BY lxs.Level;"
+    );
+    let rows = run_remote_sql_json(cfg, &sql)?;
+    Ok(rows
+        .iter()
+        .map(|r| LineSpellRow {
+            spell_id: int_field(r, "SpellID"),
+            name: str_field(r, "Name"),
+            level: int_field(r, "Level"),
         })
         .collect())
 }
@@ -390,7 +468,14 @@ pub fn apply_class_specs(
             continue;
         }
         delete_existing_clone(cfg, &final_key)?;
-        clone_spec(cfg, &a.source_key, &final_key, &a.new_name, new_class_id)?;
+        clone_spec(
+            cfg,
+            &a.source_key,
+            &final_key,
+            &a.new_name,
+            new_class_id,
+            &a.spell_line_selection,
+        )?;
 
         // If this class already had the *source* spec assigned directly (this rename is meant to
         // replace it, not just add alongside it), remove that old assignment - a real bug found
@@ -668,7 +753,11 @@ fn rename_spec_in_characters(
 /// move onto the real spec's own row (exactly how the real game already lets several classes
 /// share one base spec with their own distinct, ClassId-locked style sets) rather than being
 /// thrown away just because the spec's own *identity* has to be the real one.
-fn reparent_onto_real_spec(cfg: &SshConfig, stale_key: &str, real_name: &str) -> Result<(), String> {
+fn reparent_onto_real_spec(
+    cfg: &SshConfig,
+    stale_key: &str,
+    real_name: &str,
+) -> Result<(), String> {
     let stale_key_q = sql_quote(stale_key);
     let real_name_q = sql_quote(real_name);
 
@@ -725,7 +814,9 @@ fn ensure_uncloneable_spec_assigned(
 ) -> Result<String, String> {
     let mut log = String::new();
     if source_key != real_name {
-        log.push_str(&rename_spec_in_characters(cfg, class_id, source_key, real_name)?);
+        log.push_str(&rename_spec_in_characters(
+            cfg, class_id, source_key, real_name,
+        )?);
         reparent_onto_real_spec(cfg, source_key, real_name)?;
     }
     let real_name_q = sql_quote(real_name);
@@ -779,13 +870,17 @@ fn grant_respec_to_characters(cfg: &SshConfig, class_id: i64) -> Result<String, 
 
 /// Deep-clones one specialization: the Specialization row itself, every SpellLine attached to it
 /// (plus their LineXSpell entries), and every Style attached to it - all under the new KeyName,
-/// as a single SQL batch.
+/// as a single SQL batch. `spell_line_selection` narrows which of the source's own SpellLines (and
+/// which spells within an included one) actually get cloned - see `SpellLineSelection`'s own doc
+/// comment; an empty slice clones every line and every spell in full, unchanged from before this
+/// existed.
 fn clone_spec(
     cfg: &SshConfig,
     source_key: &str,
     new_key: &str,
     new_name: &str,
     new_class_id: i64,
+    spell_line_selection: &[SpellLineSelection],
 ) -> Result<(), String> {
     let source_key_q = sql_quote(source_key);
     let new_key_q = sql_quote(new_key);
@@ -820,6 +915,26 @@ fn clone_spec(
     )?;
     for line in &lines {
         let old_line_key = str_field(line, "KeyName");
+
+        // A real, reproduced problem this exists for: several real specs span multiple
+        // SpellLines shared across different classes ("Mind Magic" has both "Mind Twisting" and
+        // "Domination"; "Enhancement" has five, one per real class that shares it) - cloning the
+        // whole spec previously pulled in every single one of the source's lines with no way to
+        // pick just the one actually wanted. An empty selection preserves that original
+        // behavior exactly (clone every line); a non-empty one is authoritative - a line of the
+        // source's own that isn't mentioned in it at all, or is mentioned but marked excluded, is
+        // skipped entirely.
+        let selection = spell_line_selection
+            .iter()
+            .find(|s| s.source_line_key == old_line_key);
+        if !spell_line_selection.is_empty() {
+            match selection {
+                None => continue,
+                Some(s) if !s.included => continue,
+                _ => {}
+            }
+        }
+
         let is_base = line.get("IsBaseLine").and_then(Value::as_i64).unwrap_or(0);
         let new_line_key = format!("{new_key}_{}", old_line_key);
         let old_line_key_q = sql_quote(&old_line_key);
@@ -848,6 +963,14 @@ fn clone_spec(
         )?;
         for spell in &spells {
             let spell_id = int_field(spell, "SpellID");
+            // "Remove specific spells from the line we copy over" - a selected line can still
+            // exclude individual spells within it, independent of whether whole other lines were
+            // excluded above.
+            if let Some(s) = selection {
+                if s.excluded_spell_ids.contains(&spell_id) {
+                    continue;
+                }
+            }
             let level = int_field(spell, "Level");
             let row_guid = Uuid::new_v4();
             batch.push_str(&format!(
@@ -998,6 +1121,7 @@ mod tests {
             CREATE TABLE SpecXAbility (SpecXabilityID INTEGER PRIMARY KEY AUTOINCREMENT, Spec TEXT, SpecLevel INTEGER,
                 AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
             CREATE TABLE DOLCharacters (Name TEXT, Class INTEGER, RespecAmountAllSkill INTEGER DEFAULT 0, SerializedSpecs TEXT DEFAULT '');
+            CREATE TABLE Spell (SpellID INTEGER PRIMARY KEY, Name TEXT);
 
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL, 0);
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL, 0);
@@ -1008,6 +1132,9 @@ mod tests {
             INSERT INTO SpellLine VALUES ('smite_base', 'Smiting Spells', 'smite', 0, 1);
             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_base', 9001, 1, 'seed-smite-1');
             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_base', 9002, 10, 'seed-smite-2');
+            INSERT INTO Spell (SpellID, Name) VALUES (9001, 'Smite');
+            INSERT INTO Spell (SpellID, Name) VALUES (9002, 'Greater Smite');
+            INSERT INTO Spell (SpellID, Name) VALUES (9099, 'Blinding Light');
         ";
         let status = Command::new("sqlite3")
             .arg(&db)
@@ -1053,6 +1180,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
@@ -1150,6 +1278,7 @@ mod tests {
             new_key: "nosferatusclaw".to_string(),
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
@@ -1194,6 +1323,7 @@ mod tests {
             new_key: "nosferatusclaw".to_string(),
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         // 999/888/777 are neither a class involved in the clone request at all - exactly the
         // real-world case this guards against.
@@ -1248,6 +1378,7 @@ mod tests {
             new_key: "nosferatusclaw".to_string(),
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
@@ -1314,6 +1445,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
@@ -1370,6 +1502,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: -9,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
@@ -1410,6 +1543,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
         assert!(log.contains("Aeligord"), "{log}");
@@ -1465,6 +1599,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
         // Redeploy with the exact same assignment, simulating an Edit-mode resubmit.
@@ -1523,6 +1658,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
@@ -1533,6 +1669,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &resubmit, &[]).unwrap();
 
@@ -1578,6 +1715,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
@@ -1621,6 +1759,111 @@ mod tests {
     }
 
     #[test]
+    fn spell_line_selection_excludes_an_entire_line() {
+        // Reproduces a real, reported problem: "Mind Magic" has two real SpellLines ("Mind
+        // Twisting" and "Domination"), and "Enhancement" has five, one per real class that
+        // shares it - cloning the whole spec previously pulled in every single line, with no way
+        // to pick just the one actually wanted. A non-empty selection that only lists one of the
+        // source's lines (and marks it included) must clone only that one; the other line, never
+        // mentioned at all, must not be cloned.
+        let dir = setup_test_db("spell-line-select-exclude");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('smite_advanced', 'Advanced Smiting', 'smite', 0, 1);\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_advanced', 9099, 5, 'seed-advanced-1');",
+        )
+        .unwrap();
+
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: vec![SpellLineSelection {
+                source_line_key: "smite_base".to_string(),
+                included: true,
+                excluded_spell_ids: Vec::new(),
+            }],
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        let lines = run_remote_sql_json(
+            &cfg,
+            "SELECT KeyName FROM SpellLine WHERE Spec='frostbolt_tree_64';",
+        )
+        .unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the selected line must be cloned, the unmentioned one must not: {lines:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spell_line_selection_excludes_specific_spells_within_an_included_line() {
+        // "I would like to be able to remove specific spells from the line we copy over as
+        // well" - an included line can still drop individual spells, independent of whether
+        // whole other lines were excluded.
+        let dir = setup_test_db("spell-line-select-exclude-spell");
+        let cfg = test_cfg(&dir);
+
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: vec![SpellLineSelection {
+                source_line_key: "smite_base".to_string(),
+                included: true,
+                excluded_spell_ids: vec![9002],
+            }],
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        let lines = run_remote_sql_json(
+            &cfg,
+            "SELECT KeyName FROM SpellLine WHERE Spec='frostbolt_tree_64';",
+        )
+        .unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let new_line_key = str_field(&lines[0], "KeyName");
+
+        let spells = run_remote_sql_json(
+            &cfg,
+            &format!("SELECT SpellID FROM LineXSpell WHERE LineName='{new_line_key}';"),
+        )
+        .unwrap();
+        assert_eq!(spells.len(), 1, "{spells:?}");
+        assert_eq!(int_field(&spells[0], "SpellID"), 9001, "9002 must be excluded");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lists_a_specs_spell_lines_and_a_lines_spells() {
+        let dir = setup_test_db("list-spell-lines");
+        let cfg = test_cfg(&dir);
+
+        let lines = list_spec_spell_lines(&cfg, "smite").unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].key_name, "smite_base");
+        assert_eq!(lines[0].name, "Smiting Spells");
+        assert!(!lines[0].is_base_line, "the fixture's own smite_base row has IsBaseLine=0");
+
+        let spells = list_line_spells(&cfg, "smite_base").unwrap();
+        assert_eq!(spells.len(), 2, "{spells:?}");
+        assert_eq!(spells[0].spell_id, 9001);
+        assert_eq!(spells[0].level, 1);
+        assert_eq!(spells[1].spell_id, 9002);
+        assert_eq!(spells[1].level, 10);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_spec_removed_from_the_assignment_list_is_fully_deleted() {
         // Reproduces a real bug found live: removing a spec's row from the Edit flow's list (not
         // renaming it, just dropping it) and redeploying left it fully assigned and untouched -
@@ -1638,12 +1881,14 @@ mod tests {
                 new_key: "earthshatter".to_string(),
                 new_name: "Earthshatter".to_string(),
                 level_acquired: 0,
+                spell_line_selection: Vec::new(),
             },
             SpecAssignment {
                 source_key: "smite".to_string(),
                 new_key: "frostbolt_tree".to_string(),
                 new_name: "Frostbolt Tree".to_string(),
                 level_acquired: 0,
+                spell_line_selection: Vec::new(),
             },
         ];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -1651,7 +1896,10 @@ mod tests {
         // Redeploy with only "Earthshatter" kept; "Frostbolt Tree" was removed from the list in
         // the UI, and its previously-assigned key is passed back as the Edit flow would.
         let kept = vec![assignments[0].clone()];
-        let previous_keys = vec!["earthshatter_64".to_string(), "frostbolt_tree_64".to_string()];
+        let previous_keys = vec![
+            "earthshatter_64".to_string(),
+            "frostbolt_tree_64".to_string(),
+        ];
         let log = apply_class_specs(&cfg, 64, &kept, &previous_keys).unwrap();
         assert!(
             log.contains("removed 'frostbolt_tree_64'"),
@@ -1660,11 +1908,15 @@ mod tests {
 
         let class_specs = list_class_specs(&cfg, 64).unwrap();
         assert!(
-            class_specs.iter().any(|c| c.spec_key_name == "earthshatter_64"),
+            class_specs
+                .iter()
+                .any(|c| c.spec_key_name == "earthshatter_64"),
             "the kept spec must still be assigned: {class_specs:?}"
         );
         assert!(
-            !class_specs.iter().any(|c| c.spec_key_name == "frostbolt_tree_64"),
+            !class_specs
+                .iter()
+                .any(|c| c.spec_key_name == "frostbolt_tree_64"),
             "the removed spec must no longer be assigned: {class_specs:?}"
         );
 
@@ -1707,12 +1959,14 @@ mod tests {
                 new_key: "earthshatter".to_string(),
                 new_name: "Earthshatter".to_string(),
                 level_acquired: 0,
+                spell_line_selection: Vec::new(),
             },
             SpecAssignment {
                 source_key: "smite".to_string(),
                 new_key: "frostbolt_tree".to_string(),
                 new_name: "Frostbolt Tree".to_string(),
                 level_acquired: 0,
+                spell_line_selection: Vec::new(),
             },
         ];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -1730,7 +1984,10 @@ mod tests {
 
         // Redeploy with "Frostbolt Tree" removed from the list.
         let kept = vec![assignments[0].clone()];
-        let previous_keys = vec!["earthshatter_64".to_string(), "frostbolt_tree_64".to_string()];
+        let previous_keys = vec![
+            "earthshatter_64".to_string(),
+            "frostbolt_tree_64".to_string(),
+        ];
         let log = apply_class_specs(&cfg, 64, &kept, &previous_keys).unwrap();
         assert!(
             log.contains("removed stale 'frostbolt_tree_64' points from"),
@@ -1754,7 +2011,10 @@ mod tests {
             "SELECT SerializedSpecs FROM DOLCharacters WHERE Name = 'SomeoneElse';",
         )
         .unwrap();
-        assert_eq!(str_field(&other[0], "SerializedSpecs"), "somethingelse_23|5");
+        assert_eq!(
+            str_field(&other[0], "SerializedSpecs"),
+            "somethingelse_23|5"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1804,6 +2064,7 @@ mod tests {
             new_key: "earthshatterblade".to_string(),
             new_name: "Earthshatter Blade".to_string(),
             level_acquired: 3,
+            spell_line_selection: Vec::new(),
         }];
         let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
         assert!(
@@ -1854,9 +2115,13 @@ mod tests {
             new_key: "sword".to_string(),
             new_name: "Sword".to_string(),
             level_acquired: 0,
+            spell_line_selection: Vec::new(),
         }];
         let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
-        assert!(log.contains("migrated 'sword_64' points to 'Sword'"), "{log}");
+        assert!(
+            log.contains("migrated 'sword_64' points to 'Sword'"),
+            "{log}"
+        );
 
         let class_specs = list_class_specs(&cfg, 64).unwrap();
         assert_eq!(class_specs.len(), 1, "{class_specs:?}");

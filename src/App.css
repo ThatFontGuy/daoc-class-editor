@@ -329,3 +329,30 @@ button.danger {
   border-radius: 6px;
   border: 1px solid #8886;
 }
+
+.spell-line-customizer {
+  padding: 0.5rem;
+  background: #8881;
+  border-radius: 6px;
+}
+
+.spell-line-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.2rem 0;
+  flex-wrap: wrap;
+}
+
+.spell-picker {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 1rem;
+  padding: 0.3rem 0 0.3rem 1.5rem;
+}
+
+.spell-checkbox {
+  font-size: 0.8rem;
+  white-space: nowrap;
+}

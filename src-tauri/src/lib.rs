@@ -8,7 +8,7 @@ mod trainer;
 use classdata::{ClassInfo, KnownOptions};
 use codegen::CloneRequest;
 use deploy::SshConfig;
-use specs::{ClassSpecRow, SpecAssignment, SpecializationRow};
+use specs::{ClassSpecRow, LineSpellRow, SpecAssignment, SpecSpellLineRow, SpecializationRow};
 use tauri::Manager;
 use trainer::{TrainerNpcCandidate, TrainerRequest};
 
@@ -172,6 +172,16 @@ fn list_class_specs(cfg: SshConfig, class_id: i64) -> Result<Vec<ClassSpecRow>, 
 }
 
 #[tauri::command]
+fn list_spec_spell_lines(cfg: SshConfig, spec_key: String) -> Result<Vec<SpecSpellLineRow>, String> {
+    specs::list_spec_spell_lines(&cfg, &spec_key)
+}
+
+#[tauri::command]
+fn list_line_spells(cfg: SshConfig, line_key: String) -> Result<Vec<LineSpellRow>, String> {
+    specs::list_line_spells(&cfg, &line_key)
+}
+
+#[tauri::command]
 fn apply_class_specs(
     cfg: SshConfig,
     new_class_id: i64,
@@ -222,6 +232,8 @@ pub fn run() {
             server_control,
             list_specializations,
             list_class_specs,
+            list_spec_spell_lines,
+            list_line_spells,
             apply_class_specs,
             save_project_file,
             load_project_file,

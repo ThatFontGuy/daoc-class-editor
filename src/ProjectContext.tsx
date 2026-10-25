@@ -33,6 +33,26 @@ export const noOverrides: Overrides = {
   eligible_races: false,
 };
 
+/** One spell within a SpellLine shown by the Edit flow's "customize this spec's lines" picker -
+ * unchecking one excludes just that spell, independent of whether whole other lines are excluded. */
+export interface SpellSelectionUI {
+  spell_id: number;
+  name: string;
+  level: number;
+  included: boolean;
+}
+
+/** One SpellLine the user can include/exclude when cloning a spec, plus its own spells to
+ * individually include/exclude - see specs.rs's SpellLineSelection doc comment for why this
+ * exists (several real specs, e.g. "Mind Magic"/"Enhancement", span multiple SpellLines shared
+ * across different classes; cloning the whole spec previously pulled in every single one). */
+export interface SpellLineSelectionUI {
+  source_line_key: string;
+  line_name: string;
+  included: boolean;
+  spells: SpellSelectionUI[];
+}
+
 export interface SpecAssignmentUI {
   source_key: string;
   source_name: string;
@@ -40,6 +60,10 @@ export interface SpecAssignmentUI {
   level_acquired: number;
   /** Set once "Apply to server" has run for this assignment, so re-applying is a visible choice. */
   applied: boolean;
+  /** Undefined/empty = not customized, clone every SpellLine and every spell in full (the
+   * original, still-default behavior). Populated once the user opens this assignment's "customize
+   * spell lines" picker. */
+  spellLineSelection?: SpellLineSelectionUI[];
 }
 
 export interface TrainerState {

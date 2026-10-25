@@ -87,11 +87,30 @@ export interface ClassSpecRow {
   level_acquired: number;
 }
 
+export interface SpecSpellLineRow {
+  key_name: string;
+  name: string;
+  is_base_line: boolean;
+}
+
+export interface LineSpellRow {
+  spell_id: number;
+  name: string;
+  level: number;
+}
+
+export interface SpellLineSelectionPayload {
+  source_line_key: string;
+  included: boolean;
+  excluded_spell_ids: number[];
+}
+
 export interface SpecAssignmentPayload {
   source_key: string;
   new_key: string;
   new_name: string;
   level_acquired: number;
+  spell_line_selection: SpellLineSelectionPayload[];
 }
 
 // Mirrors src-tauri/src/trainer.rs.
