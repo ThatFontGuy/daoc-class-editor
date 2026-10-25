@@ -920,7 +920,7 @@ fn clone_spec(
     // the new spec key plus the new class ID).
     let lines = run_remote_sql_json(
         cfg,
-        &format!("SELECT KeyName, Name, IsBaseLine FROM SpellLine WHERE Spec = '{source_key_q}';"),
+        &format!("SELECT KeyName, Name FROM SpellLine WHERE Spec = '{source_key_q}';"),
     )?;
     for line in &lines {
         let old_line_key = str_field(line, "KeyName");
@@ -944,7 +944,18 @@ fn clone_spec(
             }
         }
 
-        let is_base = line.get("IsBaseLine").and_then(Value::as_i64).unwrap_or(0);
+        // A cloned line is always a regular, spec-point-gated line - never a base line, no
+        // matter what the source's own IsBaseLine was. A real, reproduced bug found live:
+        // cloning "Mind Twisting" (a genuine base line for the real Sorcerer, whose own class
+        // design grants it free based on character level alone, needing no spec investment)
+        // carried that flag over verbatim - Specialization.cs's own real granting logic sets a
+        // base line's effective level straight to the player's *character* level
+        // (`ls.Item1.Level = player.Level`), completely ignoring however many points were
+        // actually trained in the spec. The clone's spec points showed correctly on the
+        // character sheet, but every spell up to the character's own level was silently granted
+        // regardless, and the in-game trainer window had nothing to preview/train at all (there
+        // was never anything point-gated to show). Every other spec this tool clones is meant to
+        // unlock progressively as points are trained, so this is forced to 0 unconditionally.
         let new_line_key = format!("{new_key}_{}", old_line_key);
         let old_line_key_q = sql_quote(&old_line_key);
         let new_line_key_q = sql_quote(&new_line_key);
@@ -955,7 +966,7 @@ fn clone_spec(
         // instead of using new_name like the Specialization row itself already correctly does.
         batch.push_str(&format!(
             "INSERT INTO SpellLine (KeyName, Name, Spec, IsBaseLine, ClassIDHint) \
-             VALUES ('{new_line_key_q}', '{new_name_q}', '{new_key_q}', {is_base}, {new_class_id});\n"
+             VALUES ('{new_line_key_q}', '{new_name_q}', '{new_key_q}', 0, {new_class_id});\n"
         ));
 
         // LineXSpell_ID is a GUID-style primary key the real schema requires explicitly (not an
@@ -1763,6 +1774,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(original_spells.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_clone_of_a_base_line_is_never_itself_a_base_line() {
+        // A real, reproduced bug found live: cloning "Mind Twisting" (a genuine base line for
+        // the real Sorcerer - that class's own design grants it free by character level alone,
+        // needing no spec investment) carried IsBaseLine=1 over verbatim. The real server's own
+        // granting logic (Specialization.cs) sets a base line's effective level straight to the
+        // player's *character* level, completely ignoring whatever was actually trained in the
+        // spec - so the clone's spec points showed correctly on the character sheet, but every
+        // spell up to the character's own level was silently granted regardless, and the
+        // in-game trainer window had nothing to preview/train (there was never anything
+        // point-gated to show in the first place). A clone must always be a regular, point-gated
+        // line, no matter what the source's own IsBaseLine was.
+        let dir = setup_test_db("clone-of-base-line");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(&cfg, "UPDATE SpellLine SET IsBaseLine = 1 WHERE KeyName = 'smite_base';")
+            .unwrap();
+
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: Vec::new(),
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        let lines = run_remote_sql_json(
+            &cfg,
+            "SELECT IsBaseLine FROM SpellLine WHERE Spec='frostbolt_tree_64';",
+        )
+        .unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            int_field(&lines[0], "IsBaseLine"),
+            0,
+            "the clone must never be a base line, even though its source is: {lines:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
