@@ -323,11 +323,16 @@ button.danger {
 }
 
 .spec-table select,
-.spec-table input {
+.spec-table input:not([type="checkbox"]) {
   width: 100%;
   padding: 0.3rem;
   border-radius: 6px;
   border: 1px solid #8886;
+}
+
+.spec-table input[type="checkbox"] {
+  width: auto;
+  flex: none;
 }
 
 .spell-line-customizer {
@@ -344,6 +349,12 @@ button.danger {
   flex-wrap: wrap;
 }
 
+.spell-line-row label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
 .spell-picker {
   flex-basis: 100%;
   display: flex;
@@ -353,6 +364,9 @@ button.danger {
 }
 
 .spell-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
   font-size: 0.8rem;
   white-space: nowrap;
 }
