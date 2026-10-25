@@ -97,6 +97,7 @@ export interface LineSpellRow {
   spell_id: number;
   name: string;
   level: number;
+  spell_group: number;
 }
 
 export interface SpellLineSelectionPayload {

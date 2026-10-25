@@ -305,6 +305,14 @@ pub struct LineSpellRow {
     pub spell_id: i64,
     pub name: String,
     pub level: i64,
+    /// The real server's own `Spell.SpellGroup` - nonzero links together every level of what's
+    /// really one spell's progression (e.g. a Sorcerer's "Inflict Minor Forgetfulness" ->
+    /// "Inflict Forgetfulness" -> "Inflict Minor Amnesia" -> "Inflict Amnesia" ->
+    /// "Inflict Oblivion" all share one SpellGroup, confirmed live) even though each level's own
+    /// display Name changes along the way - 0 means "not part of any progression, stands alone."
+    /// Lets the picker group a progression onto one row the same way real character planners
+    /// (e.g. eden-daoc.net's) do, instead of a flat list ordered only by level.
+    pub spell_group: i64,
 }
 
 fn str_field(row: &Value, key: &str) -> String {
@@ -382,7 +390,7 @@ pub fn list_spec_spell_lines(
 pub fn list_line_spells(cfg: &SshConfig, line_key: &str) -> Result<Vec<LineSpellRow>, String> {
     let line_key_q = sql_quote(line_key);
     let sql = format!(
-        "SELECT lxs.SpellID AS SpellID, lxs.Level AS Level, s.Name AS Name \
+        "SELECT lxs.SpellID AS SpellID, lxs.Level AS Level, s.Name AS Name, s.SpellGroup AS SpellGroup \
          FROM LineXSpell lxs JOIN Spell s ON s.SpellID = lxs.SpellID \
          WHERE lxs.LineName = '{line_key_q}' ORDER BY lxs.Level;"
     );
@@ -393,6 +401,7 @@ pub fn list_line_spells(cfg: &SshConfig, line_key: &str) -> Result<Vec<LineSpell
             spell_id: int_field(r, "SpellID"),
             name: str_field(r, "Name"),
             level: int_field(r, "Level"),
+            spell_group: int_field(r, "SpellGroup"),
         })
         .collect())
 }
@@ -1121,7 +1130,7 @@ mod tests {
             CREATE TABLE SpecXAbility (SpecXabilityID INTEGER PRIMARY KEY AUTOINCREMENT, Spec TEXT, SpecLevel INTEGER,
                 AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
             CREATE TABLE DOLCharacters (Name TEXT, Class INTEGER, RespecAmountAllSkill INTEGER DEFAULT 0, SerializedSpecs TEXT DEFAULT '');
-            CREATE TABLE Spell (SpellID INTEGER PRIMARY KEY, Name TEXT);
+            CREATE TABLE Spell (SpellID INTEGER PRIMARY KEY, Name TEXT, SpellGroup INTEGER DEFAULT 0);
 
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL, 0);
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL, 0);
@@ -1132,9 +1141,9 @@ mod tests {
             INSERT INTO SpellLine VALUES ('smite_base', 'Smiting Spells', 'smite', 0, 1);
             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_base', 9001, 1, 'seed-smite-1');
             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_base', 9002, 10, 'seed-smite-2');
-            INSERT INTO Spell (SpellID, Name) VALUES (9001, 'Smite');
-            INSERT INTO Spell (SpellID, Name) VALUES (9002, 'Greater Smite');
-            INSERT INTO Spell (SpellID, Name) VALUES (9099, 'Blinding Light');
+            INSERT INTO Spell (SpellID, Name, SpellGroup) VALUES (9001, 'Smite', 500);
+            INSERT INTO Spell (SpellID, Name, SpellGroup) VALUES (9002, 'Greater Smite', 500);
+            INSERT INTO Spell (SpellID, Name, SpellGroup) VALUES (9099, 'Blinding Light', 0);
         ";
         let status = Command::new("sqlite3")
             .arg(&db)
@@ -1857,8 +1866,10 @@ mod tests {
         assert_eq!(spells.len(), 2, "{spells:?}");
         assert_eq!(spells[0].spell_id, 9001);
         assert_eq!(spells[0].level, 1);
+        assert_eq!(spells[0].spell_group, 500, "shares a progression with Greater Smite");
         assert_eq!(spells[1].spell_id, 9002);
         assert_eq!(spells[1].level, 10);
+        assert_eq!(spells[1].spell_group, 500);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -39,6 +39,7 @@ export interface SpellSelectionUI {
   spell_id: number;
   name: string;
   level: number;
+  spell_group: number;
   included: boolean;
 }
 

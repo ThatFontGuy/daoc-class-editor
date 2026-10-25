@@ -13,7 +13,12 @@ import {
   SshConfig,
   emptySshConfig,
 } from "./types";
-import { Overrides, SpecAssignmentUI, useProject } from "./ProjectContext";
+import {
+  Overrides,
+  SpecAssignmentUI,
+  SpellSelectionUI,
+  useProject,
+} from "./ProjectContext";
 import TrainerPanel from "./TrainerPanel";
 
 export default function ClonePanel() {
@@ -439,6 +444,27 @@ export default function ClonePanel() {
     return name.replace(/[^A-Za-z0-9]/g, "").toLowerCase() || "spec";
   }
 
+  // Groups a line's spells the same way real character planners (e.g. eden-daoc.net's) show
+  // them: every level of what's really one spell's progression on its own row, instead of a flat
+  // list ordered only by level - the real server's own Spell.SpellGroup links them even though
+  // each level's own display Name can change along the way (e.g. a Sorcerer's "Inflict Minor
+  // Forgetfulness" -> "Inflict Forgetfulness" -> "Inflict Minor Amnesia" -> "Inflict Amnesia" ->
+  // "Inflict Oblivion" all share one SpellGroup). A SpellGroup of 0 means "stands alone," so each
+  // of those gets its own single-spell row rather than being merged together. Rows are ordered by
+  // their earliest level, matching how a planner reads top to bottom.
+  function groupSpellsByProgression(spells: SpellSelectionUI[]): SpellSelectionUI[][] {
+    const groups = new Map<string, SpellSelectionUI[]>();
+    spells.forEach((s, i) => {
+      const key = s.spell_group !== 0 ? `g${s.spell_group}` : `standalone${i}`;
+      const existing = groups.get(key);
+      if (existing) existing.push(s);
+      else groups.set(key, [s]);
+    });
+    return Array.from(groups.values())
+      .map((g) => [...g].sort((a, b) => a.level - b.level))
+      .sort((a, b) => a[0].level - b[0].level);
+  }
+
   async function applySpecsToServer() {
     if (specsReadFromId === undefined) return;
     setBusy(true);
@@ -778,21 +804,28 @@ export default function ClonePanel() {
                                         {line.spells.length === 0 ? (
                                           <span className="hint">loading...</span>
                                         ) : (
-                                          line.spells.map((s) => (
-                                            <label key={s.spell_id} className="spell-checkbox">
-                                              <input
-                                                type="checkbox"
-                                                checked={s.included}
-                                                onChange={() =>
-                                                  toggleSpellIncluded(
-                                                    i,
-                                                    line.source_line_key,
-                                                    s.spell_id,
-                                                  )
-                                                }
-                                              />{" "}
-                                              {s.name} (lvl {s.level})
-                                            </label>
+                                          groupSpellsByProgression(line.spells).map((group) => (
+                                            <div
+                                              key={group[0].spell_id}
+                                              className="spell-progression-row"
+                                            >
+                                              {group.map((s) => (
+                                                <label key={s.spell_id} className="spell-checkbox">
+                                                  <input
+                                                    type="checkbox"
+                                                    checked={s.included}
+                                                    onChange={() =>
+                                                      toggleSpellIncluded(
+                                                        i,
+                                                        line.source_line_key,
+                                                        s.spell_id,
+                                                      )
+                                                    }
+                                                  />{" "}
+                                                  {s.name} (lvl {s.level})
+                                                </label>
+                                              ))}
+                                            </div>
                                           ))
                                         )}
                                       </div>
