@@ -807,12 +807,100 @@ fn reparent_onto_real_spec(
     Ok(())
 }
 
+/// Grants `new_class_id` its own copy of a `NEVER_CLONE_SPECS` spec's already-existing combat
+/// styles - a real, reproduced gap found live: a class built by cloning a parent that directly
+/// uses real weapon-type specs (e.g. a Viking-descended class inheriting Warrior's own direct
+/// Sword/Axe/Hammer/Shields/Spear assignments) trains those specs correctly on the character
+/// sheet (the weapon-skill math is resolved generically by exact KeyName, confirmed in
+/// `NEVER_CLONE_SPECS`'s own doc comment) but saw *zero* combat styles for any of them in the
+/// in-game trainer window. Confirmed in the real server source:
+/// `Specialization.GetStylesForLiving` resolves styles by the player's own exact
+/// `CharacterClass.ID` (`SkillBase.GetStyleList(KeyName, classId)`), falling back to a
+/// `ClassId = 0` "universal" bucket only if the player's own class has zero styles at all - and a
+/// brand-new custom class's ID was obviously never one of the handful of real classes a shared
+/// weapon spec's styles happen to be locked to, nor does a universal bucket exist for any weapon
+/// spec checked live (Spear's styles are locked to Hunter only; Sword/Axe/Hammer/Shields are each
+/// locked to a handful of other specific real classes - no `ClassId = 0` fallback exists for any
+/// of them).
+///
+/// Confirmed live, by direct comparison across several real classes that already share one of
+/// these specs, that every class's own locked copy of conceptually the same style carries the
+/// *exact same* `Style.ID` value (e.g. Sword's "Whirling Blade" is `ID` 146 for both Warrior and
+/// Hunter alike) - this is how the real game's own chain-style `OpeningRequirementValue`
+/// references already stay correct across every class that shares a spec, with no per-class
+/// remapping at all. So this copies every field unchanged except `ClassId` (and the autoincrement
+/// `StyleID` itself) - no chain-prerequisite remap is needed here, unlike `clone_spec`'s own
+/// (which only needs one because it generates a *new*, not-yet-existing style set under a
+/// brand-new `SpecKeyName`).
+///
+/// A clean no-op if the spec has no styles at all (e.g. Parry/Envenom/Thrown Weapons, which don't
+/// grant styles), already has a `ClassId = 0` universal bucket (nothing to grant - already
+/// visible to every class), or `new_class_id` already has its own copy (idempotent across
+/// redeploys).
+fn grant_styles_for_uncloneable_spec(
+    cfg: &SshConfig,
+    real_name: &str,
+    new_class_id: i64,
+) -> Result<String, String> {
+    let real_name_q = sql_quote(real_name);
+
+    let already_has_own = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT 1 FROM Style WHERE SpecKeyName = '{real_name_q}' AND ClassId = {new_class_id};"
+        ),
+    )?;
+    if !already_has_own.is_empty() {
+        return Ok(String::new());
+    }
+
+    let has_universal = run_remote_sql_json(
+        cfg,
+        &format!("SELECT 1 FROM Style WHERE SpecKeyName = '{real_name_q}' AND ClassId = 0;"),
+    )?;
+    if !has_universal.is_empty() {
+        return Ok(String::new());
+    }
+
+    run_remote_sql(
+        cfg,
+        &format!(
+            "INSERT INTO Style (ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, EnduranceCost, \
+             StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
+             WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, \
+             RandomProc, ArmorHitLocation, ID) \
+             SELECT {new_class_id}, Name, '{real_name_q}', SpecLevelRequirement, Icon, EnduranceCost, \
+             StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
+             WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, \
+             RandomProc, ArmorHitLocation, ID \
+             FROM Style WHERE SpecKeyName = '{real_name_q}' AND ClassId != 0 \
+             GROUP BY Name, SpecLevelRequirement;"
+        ),
+    )?;
+
+    let granted = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT COUNT(*) as c FROM Style WHERE SpecKeyName = '{real_name_q}' AND ClassId = {new_class_id};"
+        ),
+    )?;
+    let count = granted.first().map(|r| int_field(r, "c")).unwrap_or(0);
+    if count == 0 {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "granted {count} of '{real_name}'s own combat style(s) to this class (it had none of its own locked copies before)\n"
+    ))
+}
+
 /// Ensures `class_id` has `real_name` (one of `NEVER_CLONE_SPECS`) assigned directly, un-cloned,
 /// at `level`. If `source_key` differs from `real_name` - a previous deploy, before this fix
 /// existed, cloned it under its own suffixed key (e.g. "sword_64") - heals that: migrates every
 /// affected character's trained points from the old key onto the real one, and moves the stale
 /// clone's own Style/SpecXAbility content onto the real spec's row too, so nothing real is lost
-/// and nothing lingers duplicated.
+/// and nothing lingers duplicated. Also grants this class its own copy of the spec's combat
+/// styles if it has none yet - see `grant_styles_for_uncloneable_spec`'s own doc comment for the
+/// real, reproduced bug this fixes.
 fn ensure_uncloneable_spec_assigned(
     cfg: &SshConfig,
     class_id: i64,
@@ -848,6 +936,7 @@ fn ensure_uncloneable_spec_assigned(
          working in play; see NEVER_CLONE_SPECS\n",
         real_name, level, new_name
     ));
+    log.push_str(&grant_styles_for_uncloneable_spec(cfg, real_name, class_id)?);
     Ok(log)
 }
 
@@ -2113,12 +2202,27 @@ mod tests {
         // comment has the citations). Assigning straight from a real, denylisted spec must keep
         // it assigned under its own real name - never clone/rename it, no matter what new_name
         // was requested.
+        //
+        // Also reproduces a second, separate real bug found live immediately after the first fix
+        // shipped: a brand-new class assigned "Sword" this way trained it correctly on the
+        // character sheet, but the in-game trainer window showed zero combat styles at all - real
+        // weapon specs lock their styles to specific existing real ClassIds
+        // (confirmed live: Sword's are locked to Warrior/Hunter/Thane/etc., Spear's to Hunter
+        // only), and `Specialization.GetStylesForLiving` resolves by the player's own *exact*
+        // ClassId with no inheritance - a brand-new class's ID was never going to be one of them.
+        // The style set already locked to "Warrior" (ClassId 22 here) must be duplicated onto
+        // this new class (64), with every chain-style ID preserved unchanged (confirmed live:
+        // every real class's own copy of the same conceptual style shares the same Style.ID).
         let dir = setup_test_db("never-clone-fresh-assign");
         let cfg = test_cfg(&dir);
         run_remote_sql(
             &cfg,
             "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
-             VALUES ('Sword', 'Sword', 'Sword weapons', 400, NULL, 0);",
+             VALUES ('Sword', 'Sword', 'Sword weapons', 400, NULL, 0);\
+             INSERT INTO Style VALUES (NULL, 22, 'Whirling Blade', 'Sword', 2, 500, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 146);\
+             INSERT INTO Style VALUES (NULL, 22, 'Northern Lights', 'Sword', 8, 501, 5, 2, 1, 146, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 149);\
+             INSERT INTO Style VALUES (NULL, 25, 'Whirling Blade', 'Sword', 2, 500, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 146);\
+             INSERT INTO Style VALUES (NULL, 25, 'Northern Lights', 'Sword', 8, 501, 5, 2, 1, 146, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 149);",
         )
         .unwrap();
 
@@ -2134,6 +2238,10 @@ mod tests {
             log.contains("kept 'Sword' assigned under its own real name"),
             "log should explain why: {log}"
         );
+        assert!(
+            log.contains("granted 2 of 'Sword's own combat style(s)"),
+            "log should mention the style grant: {log}"
+        );
 
         let class_specs = list_class_specs(&cfg, 64).unwrap();
         assert_eq!(class_specs.len(), 1, "{class_specs:?}");
@@ -2145,6 +2253,99 @@ mod tests {
             !specs.iter().any(|s| s.key_name == "earthshatterblade_64"),
             "no clone must ever be created for a denylisted spec: {specs:?}"
         );
+
+        let styles = run_remote_sql_json(
+            &cfg,
+            "SELECT Name, ID, OpeningRequirementValue FROM Style WHERE SpecKeyName='Sword' AND ClassId=64 ORDER BY Name;",
+        )
+        .unwrap();
+        assert_eq!(
+            styles.len(),
+            2,
+            "the new class must get its own locked copy of every style: {styles:?}"
+        );
+        assert_eq!(int_field(&styles[0], "ID"), 149, "Northern Lights");
+        assert_eq!(
+            int_field(&styles[0], "OpeningRequirementValue"),
+            146,
+            "the chain prerequisite must still resolve - the same ID convention real classes already share, no remap needed"
+        );
+        assert_eq!(int_field(&styles[1], "ID"), 146, "Whirling Blade");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn granting_styles_for_an_uncloneable_spec_is_a_no_op_once_the_class_has_its_own() {
+        // Redeploying (the Edit flow resubmits every currently-assigned spec every time) must not
+        // duplicate the class's own style rows a second time.
+        let dir = setup_test_db("grant-styles-idempotent");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+             VALUES ('Sword', 'Sword', 'Sword weapons', 400, NULL, 0);\
+             INSERT INTO Style VALUES (NULL, 22, 'Whirling Blade', 'Sword', 2, 500, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 146);",
+        )
+        .unwrap();
+
+        let first = grant_styles_for_uncloneable_spec(&cfg, "Sword", 64).unwrap();
+        assert!(first.contains("granted 1"), "{first}");
+        let second = grant_styles_for_uncloneable_spec(&cfg, "Sword", 64).unwrap();
+        assert_eq!(second, "", "a second call must be a silent no-op: {second}");
+
+        let count = run_remote_sql_json(
+            &cfg,
+            "SELECT COUNT(*) as c FROM Style WHERE SpecKeyName='Sword' AND ClassId=64;",
+        )
+        .unwrap();
+        assert_eq!(int_field(&count[0], "c"), 1, "must not duplicate on a second call");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn granting_styles_for_an_uncloneable_spec_is_a_no_op_if_a_universal_bucket_already_exists() {
+        // A spec whose styles already have a ClassId=0 "universal" row needs nothing granted -
+        // every class, including a brand-new one, already falls back to seeing it.
+        let dir = setup_test_db("grant-styles-universal-noop");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+             VALUES ('Flexible', 'Flexible', 'Flexible weapons', 400, NULL, 0);\
+             INSERT INTO Style VALUES (NULL, 0, 'Some Universal Style', 'Flexible', 2, 500, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 1);",
+        )
+        .unwrap();
+
+        let log = grant_styles_for_uncloneable_spec(&cfg, "Flexible", 64).unwrap();
+        assert_eq!(log, "", "no grant needed when a universal bucket exists: {log}");
+
+        let count = run_remote_sql_json(
+            &cfg,
+            "SELECT COUNT(*) as c FROM Style WHERE SpecKeyName='Flexible' AND ClassId=64;",
+        )
+        .unwrap();
+        assert_eq!(int_field(&count[0], "c"), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn granting_styles_for_an_uncloneable_spec_is_a_no_op_if_it_has_no_styles_at_all() {
+        // Real weapon-adjacent specs like Parry/Envenom/Thrown Weapons grant no combat styles at
+        // all - nothing to do, and no error, if the spec simply has zero Style rows.
+        let dir = setup_test_db("grant-styles-no-styles-noop");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+             VALUES ('Parry', 'Parry', 'Parry chance', 400, NULL, 0);",
+        )
+        .unwrap();
+
+        let log = grant_styles_for_uncloneable_spec(&cfg, "Parry", 64).unwrap();
+        assert_eq!(log, "", "{log}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
