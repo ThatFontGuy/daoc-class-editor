@@ -2,6 +2,7 @@ mod classdata;
 mod codegen;
 mod deploy;
 mod deployed;
+mod realm_abilities;
 mod specs;
 mod trainer;
 
@@ -192,6 +193,15 @@ fn apply_class_specs(
 }
 
 #[tauri::command]
+fn clone_realm_abilities(
+    cfg: SshConfig,
+    source_class_id: i64,
+    new_class_id: i64,
+) -> Result<String, String> {
+    realm_abilities::clone_realm_abilities(&cfg, source_class_id, new_class_id)
+}
+
+#[tauri::command]
 fn save_project_file(path: String, json: String) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("could not write {path}: {e}"))
 }
@@ -235,6 +245,7 @@ pub fn run() {
             list_spec_spell_lines,
             list_line_spells,
             apply_class_specs,
+            clone_realm_abilities,
             save_project_file,
             load_project_file,
             delete_deployed_class,

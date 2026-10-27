@@ -1112,12 +1112,25 @@ export default function ClonePanel() {
                   onClick={() =>
                     runAction(
                       `Deploy ${project.filename}`,
-                      () =>
-                        invoke<string>("deploy_class", {
+                      async () => {
+                        const deployResult = await invoke<string>("deploy_class", {
                           cfg: sshConfig,
                           filename: project.filename,
                           content: project.generatedCode,
-                        }),
+                        });
+                        // Realm Abilities have zero inheritance in the DB, exactly like specs -
+                        // a real, reported gap found live: a class cloned from an existing one
+                        // (e.g. Drengr from Warrior) otherwise ends up with none at all. A
+                        // one-time copy from the source class; idempotent, so it never overwrites
+                        // a class that already has its own Realm Abilities (e.g. once a future
+                        // picker lets that be customized).
+                        const raResult = await invoke<string>("clone_realm_abilities", {
+                          cfg: sshConfig,
+                          sourceClassId: source.id,
+                          newClassId: project.newId,
+                        });
+                        return raResult ? `${deployResult}\n${raResult}` : deployResult;
+                      },
                       () => refreshClasses(sshConfig),
                     )
                   }
