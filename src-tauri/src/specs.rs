@@ -534,13 +534,20 @@ pub fn apply_class_specs(
     // snapshot the Edit flow read before the user started editing, so anything in it that isn't
     // one of this deploy's own final keys is something the user genuinely removed.
     //
-    // Only ever auto-deletes a key carrying this exact class's own clone suffix (`_<class_id>`,
-    // the same convention `delete_deployed_class`'s cleanup already scopes to) - a plain/shared
-    // key (e.g. "Stealth", assigned directly with no suffix) is never touched here, since the
-    // same KeyName may still be in active use by other classes; only this class's own
-    // ClassXSpecialization row for it would ever be safe to drop automatically, and the editor
-    // has no current way to assign a shared key like that in the first place, so there's nothing
-    // meaningful to clean up for it.
+    // A key carrying this exact class's own clone suffix (`_<class_id>`, the same convention
+    // `delete_deployed_class`'s cleanup already scopes to) is fully deleted - nothing else ever
+    // owns it. A plain/shared key (e.g. "Sword", assigned directly via `NEVER_CLONE_SPECS` with
+    // no suffix at all) is handled differently - a real, reproduced bug found live: removing
+    // "Sword"/"Axe"/"Hammer"/"Thrown Weapons" from a class's list and redeploying left every one
+    // of them still fully offered by the class (still on the character sheet, still in the
+    // in-game trainer window) - this loop previously skipped *any* unsuffixed key entirely,
+    // reasoning (correctly) that the same KeyName might still be shared by other classes, but
+    // wrongly concluding from that there was nothing safe to clean up at all. There is: this
+    // class's own `ClassXSpecialization` row for it, and any `Style` rows
+    // `grant_styles_for_uncloneable_spec` duplicated specifically for this class (`ClassId =
+    // new_class_id`, which by construction can only ever belong to this one class) - never the
+    // spec's own shared `Specialization`/`SpellLine`/`SpecXAbility` rows, nor any other class's
+    // own locked styles.
     let keep_keys: std::collections::HashSet<String> = assignments
         .iter()
         .map(|a| {
@@ -551,22 +558,37 @@ pub fn apply_class_specs(
         .collect();
     let suffix = format!("_{new_class_id}");
     for key in previous_keys {
-        if keep_keys.contains(key) || !key.ends_with(&suffix) {
+        if keep_keys.contains(key) {
             continue;
         }
-        // Must run before delete_existing_clone, not after - a real, reproduced crash found live
-        // immediately after this feature shipped: deleting the spec correctly removes it from
-        // Specialization, but a character who already had points in it still references that now
-        // -gone KeyName in their own saved SerializedSpecs - SkillBase.GetSpecialization
-        // null-derefs on a key with no matching row, crashing login entirely before the character
-        // ever reaches the free respec token granted below. Scrub it from every character on this
-        // class first so nobody can log in to a dangling reference.
+        // Must run before delete_existing_clone/unassign_shared_spec_from_class, not after - a
+        // real, reproduced crash found live immediately after this removal feature shipped:
+        // deleting a spec correctly removes it from Specialization, but a character who already
+        // had points in it still references that now-gone KeyName in their own saved
+        // SerializedSpecs - SkillBase.GetSpecialization null-derefs on a key with no matching
+        // row, crashing login entirely before the character ever reaches the free respec token
+        // granted below. A plain/shared key's own Specialization row is never actually deleted
+        // here, so that specific crash can't happen for it - but it still needs scrubbing for an
+        // entirely separate reason: GamePlayer.HandleCharacterSkills blindly re-adds *every*
+        // key in a character's own saved SerializedSpecs on every login, with no regard at all
+        // for whether the class's own current ClassXSpecialization still offers it - so a
+        // character who already trained "Sword" keeps seeing and using it forever otherwise,
+        // regardless of what this class's data says now.
         log.push_str(&scrub_spec_from_characters(cfg, new_class_id, key)?);
-        delete_existing_clone(cfg, key)?;
-        log.push_str(&format!(
-            "removed '{}' - no longer in this class's spec assignments\n",
-            key
-        ));
+        if key.ends_with(&suffix) {
+            delete_existing_clone(cfg, key)?;
+            log.push_str(&format!(
+                "removed '{}' - no longer in this class's spec assignments\n",
+                key
+            ));
+        } else {
+            unassign_shared_spec_from_class(cfg, new_class_id, key)?;
+            log.push_str(&format!(
+                "unassigned '{}' from this class only - its real Specialization/SpellLine/Style \
+                 data (shared by other classes) was left untouched\n",
+                key
+            ));
+        }
     }
 
     // Real classic-server/freeshard practice: a class's spec lineup changing (exactly what this
@@ -683,6 +705,30 @@ fn scrub_spec_from_characters(cfg: &SshConfig, class_id: i64, key: &str) -> Resu
         changed.len(),
         changed.join(", ")
     ))
+}
+
+/// Unassigns a plain/shared spec `key` (one with no class-suffix at all - the convention
+/// `NEVER_CLONE_SPECS` assigns under) from exactly `class_id`, and nothing else: its own
+/// `ClassXSpecialization` row, and any `Style` rows locked specifically to this class
+/// (`ClassId = class_id` - by construction, from `grant_styles_for_uncloneable_spec`, that
+/// `ClassId` can only ever be this one class's own duplicate copies, never another class's or the
+/// spec's shared originals). Deliberately never touches the spec's own shared
+/// `Specialization`/`SpellLine`/`LineXSpell`/`SpecXAbility` rows, nor any other class's own locked
+/// `Style` rows - a real, reproduced real-world case this matters for: removing "Sword" from a
+/// custom class must never affect the real Warrior/Hunter/etc. who also train it.
+fn unassign_shared_spec_from_class(cfg: &SshConfig, class_id: i64, key: &str) -> Result<(), String> {
+    let key_q = sql_quote(key);
+    run_remote_sql(
+        cfg,
+        &format!(
+            "DELETE FROM ClassXSpecialization WHERE ClassID = {class_id} AND SpecKeyName = '{key_q}';"
+        ),
+    )?;
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM Style WHERE SpecKeyName = '{key_q}' AND ClassId = {class_id};"),
+    )?;
+    Ok(())
 }
 
 /// Migrates a character's own trained points from one SpecKeyName to another in their saved
@@ -2172,23 +2218,109 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_shared_key_in_previous_keys_is_never_auto_removed() {
-        // A plain/shared key (no class-suffix, e.g. a spec assigned by its original real KeyName
-        // rather than one of this tool's clones) must never be auto-deleted by the removal pass,
-        // even if it's absent from the current assignment list - it may still be in active use by
-        // other classes, and the editor has no path that produces such a key as a "clone" to
-        // safely reverse in the first place.
-        let dir = setup_test_db("plain-key-untouched");
+    fn a_plain_shared_keys_own_specialization_row_is_never_deleted_by_the_removal_pass() {
+        // A plain/shared key's own Specialization row (e.g. "Sword", a real spec assigned
+        // directly via NEVER_CLONE_SPECS, with no class-suffix at all) must never be deleted,
+        // even when it's dropped from this class's own assignment list - the same KeyName is very
+        // likely still in active use by other real classes. Only this one class's own assignment
+        // of it is ever safe to undo (see the dedicated test below for that).
+        let dir = setup_test_db("plain-key-specialization-untouched");
         let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);",
+        )
+        .unwrap();
 
         apply_class_specs(&cfg, 64, &[], &["slash".to_string()]).unwrap();
 
-        // "slash" (the real, unsuffixed shared spec) must be completely unaffected.
+        // "slash" (the real, unsuffixed shared spec) must still exist - other classes may use it.
         let specs = list_specializations(&cfg).unwrap();
         assert!(
             specs.iter().any(|s| s.key_name == "slash"),
-            "a plain shared key must never be deleted by this pass: {specs:?}"
+            "a plain shared key's own Specialization row must never be deleted: {specs:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removing_a_plain_shared_key_unassigns_it_from_only_this_class() {
+        // Reproduces a real bug found live: removing "Sword"/"Axe"/"Hammer"/"Thrown Weapons"
+        // (all assigned via NEVER_CLONE_SPECS under their real, unsuffixed KeyName) from a
+        // class's own assignment list and redeploying left every one of them still fully offered
+        // by the class - still on every character's sheet, still in the in-game trainer window.
+        // The old removal pass skipped *any* key without this class's own clone suffix entirely,
+        // reasoning (correctly) that the spec might be shared by other classes, but wrongly
+        // concluding there was nothing at all safe to clean up. There is: this class's own
+        // ClassXSpecialization row, and any Style rows locked specifically to this class by
+        // grant_styles_for_uncloneable_spec - just never the spec's own shared data, and never
+        // another class's own locked styles.
+        //
+        // Also reproduces a second, related bug found live: even after fixing the removal itself,
+        // an existing character who already trained points in "Sword" kept seeing and using it
+        // forever regardless - GamePlayer.HandleCharacterSkills blindly re-adds *every* key in a
+        // character's own saved SerializedSpecs on login, with no regard at all for whether the
+        // class's current ClassXSpecialization still offers it. The removed key must be scrubbed
+        // from affected characters too, the same as a removed clone already is.
+        let dir = setup_test_db("remove-plain-shared-key");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);\
+             INSERT INTO Style VALUES (NULL, 9, 'Some Other Class Style', 'slash', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 900);\
+             INSERT INTO Style VALUES (NULL, 64, 'This Class Own Style', 'slash', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 901);\
+             INSERT INTO DOLCharacters (Name, Class, SerializedSpecs) VALUES ('Grolf', 64, 'slash|8;smite|3');",
+        )
+        .unwrap();
+
+        let log = apply_class_specs(&cfg, 64, &[], &["slash".to_string()]).unwrap();
+        assert!(
+            log.contains("unassigned 'slash' from this class only"),
+            "log should explain the unassignment: {log}"
+        );
+        assert!(
+            log.contains("removed stale 'slash' points from 1 character"),
+            "log should mention the scrub: {log}"
+        );
+
+        let class_specs = list_class_specs(&cfg, 64).unwrap();
+        assert!(
+            !class_specs.iter().any(|c| c.spec_key_name == "slash"),
+            "this class must no longer offer 'slash': {class_specs:?}"
+        );
+
+        // The spec's own shared row, and the OTHER class's own locked style, must survive.
+        let specs = list_specializations(&cfg).unwrap();
+        assert!(specs.iter().any(|s| s.key_name == "slash"), "{specs:?}");
+        let other_class_style = run_remote_sql_json(
+            &cfg,
+            "SELECT 1 FROM Style WHERE SpecKeyName='slash' AND ClassId=9;",
+        )
+        .unwrap();
+        assert!(
+            !other_class_style.is_empty(),
+            "another class's own locked style must never be touched"
+        );
+
+        // This class's own locked style duplicate must be gone.
+        let own_style = run_remote_sql_json(
+            &cfg,
+            "SELECT 1 FROM Style WHERE SpecKeyName='slash' AND ClassId=64;",
+        )
+        .unwrap();
+        assert!(
+            own_style.is_empty(),
+            "this class's own granted style duplicate must be cleaned up"
+        );
+
+        // The character's stale points must be scrubbed, but an unrelated spec's points survive.
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT SerializedSpecs FROM DOLCharacters WHERE Name='Grolf';",
+        )
+        .unwrap();
+        assert_eq!(str_field(&rows[0], "SerializedSpecs"), "smite|3");
 
         std::fs::remove_dir_all(&dir).ok();
     }
