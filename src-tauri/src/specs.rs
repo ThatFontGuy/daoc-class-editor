@@ -467,13 +467,33 @@ pub fn apply_class_specs(
         // changed) - deleting it first, then trying to clone from it, deletes its only copy of
         // the data before clone_spec can ever read it, leaving an empty, orphaned spec that then
         // crashes any character's login (SkillBase.GetSpecialization null-derefs on a key with no
-        // matching row). There is nothing to safely redo in this case anyway - it already has
-        // everything a previous deploy gave it - so skip both steps entirely and leave it alone.
+        // matching row). There is nothing to safely redo via the normal delete-then-reclone path
+        // in this case - it already has everything a previous deploy gave it.
+        //
+        // A real, reported bug found live after *that* fix shipped: this unconditionally skipped
+        // everything, including a spell_line_selection customization the Edit flow's own picker
+        // produces - opening an already-deployed spec's "customize spell lines" picker and
+        // unchecking a line/spell does not change source_key, new_key, new_name, or
+        // level_acquired at all (only spell_line_selection does), so a self-source redeploy with
+        // real exclusions to apply was being silently discarded entirely - generating, deploying,
+        // even restarting the server did nothing, since this whole branch never even looked at
+        // spell_line_selection before returning. The destructive delete-then-reclone path is
+        // still never safe here (same reason as before - there's no separate source left to
+        // clone from), but a *targeted, in-place* prune of this exact key's own already-existing
+        // SpellLine/LineXSpell rows is - see prune_spell_lines_in_place's own doc comment.
         if a.source_key == final_key {
-            log.push_str(&format!(
-                "left '{}' untouched (already its own source - nothing to reclone)\n",
-                final_key
-            ));
+            if a.spell_line_selection.is_empty() {
+                log.push_str(&format!(
+                    "left '{}' untouched (already its own source - nothing to reclone)\n",
+                    final_key
+                ));
+            } else {
+                log.push_str(&prune_spell_lines_in_place(
+                    cfg,
+                    &final_key,
+                    &a.spell_line_selection,
+                )?);
+            }
             continue;
         }
         delete_existing_clone(cfg, &final_key)?;
@@ -1010,6 +1030,82 @@ fn grant_respec_to_characters(cfg: &SshConfig, class_id: i64) -> Result<String, 
         names.len(),
         names.join(", ")
     ))
+}
+
+/// Prunes an already-deployed spec's own existing SpellLine/LineXSpell rows in place, according
+/// to `spell_line_selection` - used specifically for the self-source case in `apply_class_specs`
+/// (`source_key == final_key`, i.e. redeploying an unchanged, already-assigned spec), where the
+/// normal delete-then-reclone path can never run safely (there is no separate source left to
+/// clone from - see that call site's own doc comment for the real data-loss bug that caused). A
+/// real, reported bug this fixes: opening an already-deployed spec's "customize spell lines"
+/// picker and unchecking a line/spell doesn't change `source_key`, `new_key`, `new_name`, or
+/// `level_acquired` at all - only `spell_line_selection` does - so the self-source skip was
+/// silently discarding every such exclusion entirely; generating, deploying, even restarting the
+/// server did nothing, since `spell_line_selection` was never even looked at in that branch.
+///
+/// Because this operates on the spec's own *current* `KeyName` (not a fresh clone target), a
+/// `SpellLineSelection.source_line_key` here is naturally the exact `SpellLine.KeyName` this key
+/// already owns (the Edit flow's own picker calls `list_spec_spell_lines` with this exact key as
+/// `spec_key`, confirmed in `ClonePanel.tsx` - never the *original* source's own, differently
+/// -prefixed line key, so no remapping is needed at all). A line absent from the selection
+/// entirely is excluded, matching `clone_spec`'s own "non-empty selection is authoritative"
+/// convention.
+fn prune_spell_lines_in_place(
+    cfg: &SshConfig,
+    final_key: &str,
+    spell_line_selection: &[SpellLineSelection],
+) -> Result<String, String> {
+    let final_key_q = sql_quote(final_key);
+    let lines = run_remote_sql_json(
+        cfg,
+        &format!("SELECT KeyName FROM SpellLine WHERE Spec = '{final_key_q}';"),
+    )?;
+    let mut log = String::new();
+    for line in &lines {
+        let line_key = str_field(line, "KeyName");
+        let line_key_q = sql_quote(&line_key);
+        let selection = spell_line_selection
+            .iter()
+            .find(|s| s.source_line_key == line_key);
+
+        if selection.is_none_or(|s| !s.included) {
+            run_remote_sql(
+                cfg,
+                &format!("DELETE FROM LineXSpell WHERE LineName = '{line_key_q}';"),
+            )?;
+            run_remote_sql(
+                cfg,
+                &format!("DELETE FROM SpellLine WHERE KeyName = '{line_key_q}';"),
+            )?;
+            log.push_str(&format!(
+                "removed the whole '{}' spell line (excluded from the customization)\n",
+                line_key
+            ));
+            continue;
+        }
+
+        let s = selection.unwrap();
+        if !s.excluded_spell_ids.is_empty() {
+            let ids = s
+                .excluded_spell_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            run_remote_sql(
+                cfg,
+                &format!(
+                    "DELETE FROM LineXSpell WHERE LineName = '{line_key_q}' AND SpellID IN ({ids});"
+                ),
+            )?;
+            log.push_str(&format!(
+                "removed {} excluded spell(s) from '{}'\n",
+                s.excluded_spell_ids.len(),
+                line_key
+            ));
+        }
+    }
+    Ok(log)
 }
 
 /// Deep-clones one specialization: the Specialization row itself, every SpellLine attached to it
@@ -1856,6 +1952,138 @@ mod tests {
             2,
             "its spells must not have been wiped out: {spells:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resubmitting_a_spec_with_itself_as_source_still_applies_a_spell_line_customization() {
+        // A real, reported bug found live: opening an already-deployed spec's "customize spell
+        // lines" picker and unchecking a specific spell did not change source_key, new_key,
+        // new_name, or level_acquired at all (only spell_line_selection does) - generating,
+        // deploying, even restarting the server did nothing at all, since the self-source skip
+        // above (correctly protecting against the real data-loss bug the previous test covers)
+        // unconditionally discarded spell_line_selection without ever looking at it. A self
+        // -source redeploy with a real customization must still apply it - via an in-place prune
+        // of this key's own existing data, never the destructive delete-then-reclone path (there
+        // is no separate source left to safely reclone from here).
+        let dir = setup_test_db("resubmit-self-source-prune");
+        let cfg = test_cfg(&dir);
+
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: Vec::new(),
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        // Resubmit it exactly as the Edit flow's picker would after excluding one spell from the
+        // line - source_key is its own already-cloned key (self-source), but this time with a
+        // real, non-empty spell_line_selection.
+        let resubmit = vec![SpecAssignment {
+            source_key: "frostbolt_tree_64".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: vec![SpellLineSelection {
+                source_line_key: "frostbolt_tree_64_smite_base".to_string(),
+                included: true,
+                excluded_spell_ids: vec![9002],
+            }],
+        }];
+        let log = apply_class_specs(&cfg, 64, &resubmit, &[]).unwrap();
+        assert!(
+            log.contains("removed 1 excluded spell(s) from 'frostbolt_tree_64_smite_base'"),
+            "log should mention the prune: {log}"
+        );
+
+        let spells = run_remote_sql_json(
+            &cfg,
+            "SELECT SpellID FROM LineXSpell WHERE LineName='frostbolt_tree_64_smite_base';",
+        )
+        .unwrap();
+        assert_eq!(spells.len(), 1, "{spells:?}");
+        assert_eq!(int_field(&spells[0], "SpellID"), 9001, "9002 must be excluded");
+
+        // The spec and its line must still exist - only the one excluded spell is gone.
+        let specs = list_specializations(&cfg).unwrap();
+        assert!(specs.iter().any(|s| s.key_name == "frostbolt_tree_64"));
+        let lines = run_remote_sql_json(
+            &cfg,
+            "SELECT 1 FROM SpellLine WHERE KeyName='frostbolt_tree_64_smite_base';",
+        )
+        .unwrap();
+        assert!(!lines.is_empty(), "the line itself must survive");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resubmitting_a_spec_with_itself_as_source_can_remove_a_whole_line_in_place() {
+        // The exact live incident this fix recovered from: removing a whole spell line (every
+        // spell in it, not just some) via the customizer on an already-deployed spec.
+        let dir = setup_test_db("resubmit-self-source-prune-whole-line");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('smite_advanced', 'Advanced Smiting', 'smite', 0, 1);\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_advanced', 9099, 5, 'seed-advanced-1');",
+        )
+        .unwrap();
+
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: Vec::new(),
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+        let lines_before = run_remote_sql_json(
+            &cfg,
+            "SELECT KeyName FROM SpellLine WHERE Spec='frostbolt_tree_64';",
+        )
+        .unwrap();
+        assert_eq!(lines_before.len(), 2, "{lines_before:?}");
+
+        // Resubmit self-sourced, keeping only "smite_base"'s own clone - the other line is simply
+        // absent from the selection, matching clone_spec's own "not mentioned = excluded"
+        // convention.
+        let resubmit = vec![SpecAssignment {
+            source_key: "frostbolt_tree_64".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: vec![SpellLineSelection {
+                source_line_key: "frostbolt_tree_64_smite_base".to_string(),
+                included: true,
+                excluded_spell_ids: Vec::new(),
+            }],
+        }];
+        let log = apply_class_specs(&cfg, 64, &resubmit, &[]).unwrap();
+        assert!(
+            log.contains("removed the whole 'frostbolt_tree_64_smite_advanced' spell line"),
+            "{log}"
+        );
+
+        let lines_after = run_remote_sql_json(
+            &cfg,
+            "SELECT KeyName FROM SpellLine WHERE Spec='frostbolt_tree_64';",
+        )
+        .unwrap();
+        assert_eq!(lines_after.len(), 1, "{lines_after:?}");
+        assert_eq!(
+            str_field(&lines_after[0], "KeyName"),
+            "frostbolt_tree_64_smite_base"
+        );
+        let orphaned_spells = run_remote_sql_json(
+            &cfg,
+            "SELECT 1 FROM LineXSpell WHERE LineName='frostbolt_tree_64_smite_advanced';",
+        )
+        .unwrap();
+        assert!(orphaned_spells.is_empty(), "its spells must be cleaned up too");
 
         std::fs::remove_dir_all(&dir).ok();
     }
