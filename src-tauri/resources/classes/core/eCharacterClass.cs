@@ -98,5 +98,17 @@ namespace DOL.GS
 		// Experimental Hibernian class; only enabled by the isolated Sluaghbinder
 		// test-copy bot catalog (never by the main Offline DAoC installation).
 		Sluaghbinder = 63,
+
+		// Native client slots 64-67, and 70: custom classes on the Divided Realms fork
+		// (github.com/ThatFontGuy/daoc-divided-linux), compiled into the server itself (not
+		// loose bin/scripts/ files, so this tool's live "deployed classes" scan can't see
+		// them) - vendored here so ID suggestions and the class list stay collision-free on
+		// that server. Nosferatu (68) is still a loose bin/scripts/ file there and needs no
+		// enum entry; the live scan already finds it.
+		Drengr = 64,
+		PendragonSovereign = 65,
+		DeathKnight = 66,
+		TuathaSovereign = 67,
+		Stormforged = 70,
 	}
 }

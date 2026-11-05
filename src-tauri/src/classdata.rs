@@ -410,11 +410,16 @@ pub fn load_all_classes_with_extra(resources_dir: &Path, extra: Vec<ClassInfo>) 
     out
 }
 
-/// The next ID at least one above the highest already in use, across any mix of vendored and
-/// deployed classes passed in - so a brand-new custom class (which may itself later be cloned
-/// again) never collides with one already deployed to the server.
+/// Custom classes start at 100, never lower - deliberately well clear of every live class ID a
+/// supported server fork is known to use (stock classes top out at 63/Sluaghbinder; Divided
+/// Realms' own native slots run 64-70), so a new class is never at risk of colliding with a
+/// custom class this tool's live "deployed classes" scan can't see (compiled-in classes, not
+/// loose bin/scripts/ files - see eCharacterClass.cs's own comment on this for Divided Realms'
+/// 64-67/70). Still takes the actual class list's highest ID into account above that floor, so
+/// IDs climbing past 100 (several custom classes deployed over time) still can't collide either.
 pub fn next_free_id_from(classes: &[ClassInfo]) -> i32 {
-    classes.iter().map(|c| c.id).max().unwrap_or(0) + 1
+    const CUSTOM_CLASS_ID_FLOOR: i32 = 100;
+    (classes.iter().map(|c| c.id).max().unwrap_or(0) + 1).max(CUSTOM_CLASS_ID_FLOOR)
 }
 
 /// Walks `parent_ident` up from `class_ident` until it reaches a true archetype (one whose own
@@ -822,9 +827,30 @@ namespace DOL.GS
     fn next_free_id_is_above_highest_known() {
         let id = next_free_id_from(&load_all_classes(&resources()));
         assert!(
-            id >= 64,
-            "expected next free id >= 64 (Sluaghbinder is 63), got {id}"
+            id >= 100,
+            "expected next free id >= 100 (the custom-class floor), got {id}"
         );
+    }
+
+    #[test]
+    fn next_free_id_floors_at_100_even_with_no_classes_above_it() {
+        // Divided Realms' native slots (64-67, 70) are the highest IDs this tool's vendored data
+        // knows about right now - still expect the 100 floor, not 71, so a brand-new class can
+        // never collide with one of those even before any class is actually deployed above 100.
+        assert_eq!(next_free_id_from(&load_all_classes(&resources())), 100);
+    }
+
+    #[test]
+    fn next_free_id_climbs_past_100_once_classes_are_deployed_there() {
+        let mut classes = load_all_classes(&resources());
+        classes.push(
+            parse_deployed_source(
+                r#"[CharacterClass(103, "Something", "Base")]
+                public class ClassSomething : ClassDruid { }"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(next_free_id_from(&classes), 104);
     }
 }
 

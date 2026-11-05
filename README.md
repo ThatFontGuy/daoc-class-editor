@@ -124,6 +124,26 @@ the server repo (`playerclasses/`, `trainer/`, and a handful of core enums/base 
 with the app so it doesn't need the server repo checked out locally. If the server repo's class
 system changes meaningfully, re-sync this folder from there.
 
+## Compatibility with Divided Realms (github.com/ThatFontGuy/daoc-divided-linux)
+
+This fork of the server (used by its own `daoc-server.sh`/`bin/scripts/` layout, confirmed directly
+against its source) renumbered several native-client-slot classes: `Drengr` (64, the slot Midgard's
+retired `Stormforged` used to hold), `PendragonSovereign` (65), `DeathKnight` (66),
+`TuathaSovereign` (67), and dormant `Stormforged` (70, kept for save/client compatibility). All five
+are vendored here (`eCharacterClass.cs` and their own `playerclasses/`/`trainer/` files) so they're
+correctly known as taken IDs and can be picked as clone sources - **but unlike Nosferatu (still a
+loose `bin/scripts/` file there), none of the five show up in the "Deployed classes" tab or the
+Edit flow**, because they're compiled into that server's own `GameServer.dll`, not loose files in
+`bin/scripts/` - this tool's live scan only reads that folder. A custom class promoted out of
+`bin/scripts/` into compiled source this way needs a real server rebuild to edit, same as any other
+server-side code change; this tool can still generate it as a starting point, just not manage it
+live afterward.
+
+New custom classes always get an ID of **at least 100** (`classdata::next_free_id_from`), regardless
+of what the highest actually-visible ID is - deliberately well clear of every native slot a
+supported fork is known to use (64-70 here), so a class this tool can't see on a particular server
+can never collide with a new one it suggests.
+
 ## Development
 
 Rust backend: `cargo test --manifest-path src-tauri/Cargo.toml` runs the parser/codegen test
