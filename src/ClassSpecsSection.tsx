@@ -675,11 +675,9 @@ function NewSpecForm({
 export default function ClassSpecsSection({
   sshConfig,
   classId,
-  isCustom,
 }: {
   sshConfig: SshConfig;
   classId: number;
-  isCustom: boolean;
 }) {
   const [summaries, setSummaries] = useState<ClassSpecSummary[] | null>(null);
   const [status, setStatus] = useState("");
@@ -759,18 +757,16 @@ export default function ClassSpecsSection({
       {busy && <p className="hint">⏳ Working - please wait...</p>}
       {status && <pre className="status">{status}</pre>}
 
-      {isCustom && (
-        <div className="new-spec-actions">
-          <h3>Create from scratch</h3>
-          <p className="hint">
-            Adds a brand-new spec to this class - not cloned from anything else - seeded with one
-            placeholder (a style or spell) ready to rename and tune below. Only offered for
-            cloned/custom classes, to keep every stock class's own data untouched.
-          </p>
-          <NewSpecForm label="New Combat Spec" busy={busy} onCreate={(name, lvl) => createSpec("create_new_combat_spec", name, lvl)} />{" "}
-          <NewSpecForm label="New Spell Line" busy={busy} onCreate={(name, lvl) => createSpec("create_new_spell_spec", name, lvl)} />
-        </div>
-      )}
+      <div className="new-spec-actions">
+        <h3>Create from scratch</h3>
+        <p className="hint">
+          Adds a brand-new spec to this class - not cloned from anything else - seeded with one
+          placeholder (a style or spell) ready to rename and tune below. Works for any class,
+          standard or cloned, the same as editing an existing spec below already does.
+        </p>
+        <NewSpecForm label="New Combat Spec" busy={busy} onCreate={(name, lvl) => createSpec("create_new_combat_spec", name, lvl)} />{" "}
+        <NewSpecForm label="New Spell Line" busy={busy} onCreate={(name, lvl) => createSpec("create_new_spell_spec", name, lvl)} />
+      </div>
 
       {combatSpecs.length > 0 && (
         <div>
