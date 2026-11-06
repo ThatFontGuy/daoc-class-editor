@@ -136,10 +136,10 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
             Every class in the game, organized by realm - the ~63 built-in classes this tool
             ships reference data for, plus anything you've already deployed with it. Pick one to
             see its details and its own spells, clone it as a starting point for a new class, or
-            (for a class you deployed yourself) edit its file in place or delete it. A class shown
-            struck through and marked <span className="badge-disabled">DISABLED</span> is
-            currently blocked at character creation for regular players (the server's own
-            "disabled_classes" setting) - a GM account can still create one anyway.
+            (for a class you deployed yourself) edit its file in place or delete it. A class
+            marked <span className="badge-disabled">DISABLED</span> is currently blocked at
+            character creation for regular players (the server's own "disabled_classes" setting)
+            - a GM account can still create one anyway.
           </p>
           <div className="actions">
             <button onClick={updateAllClassData} disabled={busy}>
@@ -173,7 +173,7 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
                       return (
                         <tr key={c.class_ident}>
                           <td>{c.id}</td>
-                          <td style={disabled ? { textDecoration: "line-through" } : undefined}>
+                          <td>
                             {c.name}
                             {disabled && <span className="badge-disabled"> DISABLED</span>}
                           </td>
