@@ -84,8 +84,12 @@ deployment path was confirmed against a real running server after an early mix-u
   Class**). No more needing to already know a class's raw numeric ID just to reach it (a real
   limitation this used to have for a class compiled straight into the server, like a
   native-client-slot class promoted out of `bin/scripts/` - see "Compatibility with Divided
-  Realms" below) - picking it by name here is enough. Selecting a class shows its details and its
-  own spells together, in one place:
+  Realms" below) - picking it by name here is enough. A class currently blocked at character
+  creation for regular players is shown struck through and marked **DISABLED**, read straight from
+  the server's own `disabled_classes` property (parsed the same way the real server itself does,
+  semicolon-separated IDs/ranges like `20;63;65-67` - the exact, real, reproduced bug this project
+  once found live, where an over-wide range accidentally also disabled Drengr). Selecting a class
+  shows its details and its own spells together, in one place:
   - **Clone this class** opens the clone wizard with it preselected as the source.
   - For a class *you* deployed (a **Cloned Class**), **Edit class file** opens it back up in the
     clone wizard with its name/ID/filename locked (so redeploying overwrites the same file, not a

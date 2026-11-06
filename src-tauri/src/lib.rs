@@ -341,6 +341,17 @@ fn delete_deployed_class(
     deployed::delete_deployed_class(&cfg, &filename, class_id, cleanup_cloned_specs)
 }
 
+/// Every class ID the server's own `DISABLED_CLASSES` property currently blocks at character
+/// creation for regular (non-GM) players - lets the Classes tab mark a disabled class instead of
+/// just letting a player (or the owner) discover it only by trying to create one. Returned
+/// sorted purely for a stable, readable order in the UI/logs - the set itself has no ordering.
+#[tauri::command]
+fn list_disabled_class_ids(cfg: SshConfig) -> Result<Vec<i32>, String> {
+    let mut ids: Vec<i32> = deployed::fetch_disabled_class_ids(&cfg)?.into_iter().collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -379,6 +390,7 @@ pub fn run() {
             save_project_file,
             load_project_file,
             delete_deployed_class,
+            list_disabled_class_ids,
             root_archetype,
             generate_trainer_code,
             find_trainer_npcs,

@@ -217,6 +217,13 @@ button.danger {
   color: #e05a5a;
 }
 
+.badge-disabled {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #e05a5a;
+  letter-spacing: 0.02em;
+}
+
 .picker-row {
   display: flex;
   gap: 0.5rem;

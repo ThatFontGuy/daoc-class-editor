@@ -92,6 +92,52 @@ fn int_field(row: &Value, key: &str) -> i64 {
     row.get(key).and_then(Value::as_i64).unwrap_or(0)
 }
 
+/// Parses the server's own `DISABLED_CLASSES` property (`ServerProperty.Key = 'disabled_classes'`)
+/// into the set of numeric class IDs it actually disables for regular (non-GM) players at
+/// character creation - confirmed directly in the real server source
+/// (`CharacterCreateRequestHandler.cs`/`Util.SplitCSV`): a semicolon-separated list where each
+/// entry is either a single class ID or an inclusive `from-to` range (e.g. `"20;63;65-67"` means
+/// 20, 63, 65, 66, and 67 - this is exactly the real, reproduced bug found live, where an
+/// over-wide range accidentally disabled Drengr too). Returns an empty set (nothing disabled) if
+/// the property is missing or blank - the same "no restriction" default the server itself falls
+/// back to.
+pub fn fetch_disabled_class_ids(cfg: &SshConfig) -> Result<std::collections::HashSet<i32>, String> {
+    let rows = run_remote_sql_json(
+        cfg,
+        "SELECT Value FROM ServerProperty WHERE \"Key\" = 'disabled_classes';",
+    )?;
+    let raw = rows.first().map(|r| str_field(r, "Value")).unwrap_or_default();
+    Ok(parse_disabled_class_ids(&raw))
+}
+
+/// Pure parsing logic, split out so it's testable without a real database - mirrors the real
+/// server's own `Util.SplitCSV(str, rangeCheck: true)` exactly: semicolon-separated, each entry a
+/// single integer or an inclusive `from-to` range (auto-swapped if given backwards); an entry
+/// that doesn't parse as an integer (or a range whose two halves don't) is silently skipped, the
+/// same as the real server's own `int.TryParse` guard.
+fn parse_disabled_class_ids(raw: &str) -> std::collections::HashSet<i32> {
+    let mut ids = std::collections::HashSet::new();
+    for part in raw.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((from_s, to_s)) = part.split_once('-') {
+            if let (Ok(mut from), Ok(mut to)) = (from_s.trim().parse::<i32>(), to_s.trim().parse::<i32>()) {
+                if from > to {
+                    std::mem::swap(&mut from, &mut to);
+                }
+                for id in from..=to {
+                    ids.insert(id);
+                }
+            }
+        } else if let Ok(id) = part.parse::<i32>() {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
 /// Removes a deployed class: the `.cs` file, its `ClassXSpecialization` rows, and - if
 /// `cleanup_cloned_specs` is set - every Specialization/SpellLine/LineXSpell/Style row whose
 /// KeyName/Spec carries this exact class's `_<id>` suffix (the convention `apply_class_specs`'s
@@ -379,6 +425,75 @@ mod tests {
             tracking.is_empty(),
             "the ownership tracking rows must be cleaned up too: {tracking:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_disabled_class_ids_expands_ranges_and_singles() {
+        // The exact value found live that accidentally disabled Drengr (64) for regular players:
+        // "63-67" (meant to cover 65-67) also swept in 63 and 64.
+        let ids = parse_disabled_class_ids("20;63;65-67");
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from([20, 63, 65, 66, 67]),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn parse_disabled_class_ids_handles_blank_reversed_and_malformed_entries() {
+        assert!(parse_disabled_class_ids("").is_empty());
+        assert!(parse_disabled_class_ids("   ").is_empty());
+        // A backwards range must still expand correctly.
+        assert_eq!(
+            parse_disabled_class_ids("7-5"),
+            std::collections::HashSet::from([5, 6, 7])
+        );
+        // A non-numeric entry (or a range with a non-numeric half) is silently skipped, not an
+        // error - matches the real server's own int.TryParse guard exactly.
+        assert_eq!(
+            parse_disabled_class_ids("abc;9;x-y"),
+            std::collections::HashSet::from([9])
+        );
+    }
+
+    #[test]
+    fn fetch_disabled_class_ids_reads_the_real_server_property() {
+        let dir = std::env::temp_dir().join("daoc-class-editor-disabled-classes-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let db = dir.join("data/opendaoc.sqlite3.db");
+        let sql = "
+            CREATE TABLE ServerProperty (Category TEXT, \"Key\" TEXT PRIMARY KEY, Description TEXT, DefaultValue TEXT, Value TEXT);
+            INSERT INTO ServerProperty VALUES ('classes', 'disabled_classes', '', '', '20;63;65-67');
+        ";
+        let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
+        assert!(status.success());
+
+        let cfg = test_cfg(&dir);
+        let ids = fetch_disabled_class_ids(&cfg).unwrap();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from([20, 63, 65, 66, 67]),
+            "{ids:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetch_disabled_class_ids_is_empty_when_the_property_is_missing() {
+        let dir = std::env::temp_dir().join("daoc-class-editor-disabled-classes-missing-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let db = dir.join("data/opendaoc.sqlite3.db");
+        let sql = "CREATE TABLE ServerProperty (Category TEXT, \"Key\" TEXT PRIMARY KEY, Description TEXT, DefaultValue TEXT, Value TEXT);";
+        let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
+        assert!(status.success());
+
+        let cfg = test_cfg(&dir);
+        assert!(fetch_disabled_class_ids(&cfg).unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

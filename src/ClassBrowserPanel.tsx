@@ -14,6 +14,7 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
   const [, setProject] = useProject();
   const [sshConfig, setSshConfig] = useState<SshConfig>(emptySshConfig);
   const [classes, setClasses] = useState<ClassInfo[]>([]);
+  const [disabledClassIds, setDisabledClassIds] = useState<Set<number>>(new Set());
   const [selectedIdent, setSelectedIdent] = useState<string | null>(null);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
@@ -41,6 +42,15 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
       setStatus(`Could not list classes: ${e}`);
     } finally {
       setBusy(false);
+    }
+    // Best-effort, separate from the class list itself - a server fork without this property (or
+    // an unreachable connection) shouldn't block browsing the class list at all, it just means
+    // nothing gets marked disabled.
+    try {
+      const ids = await invoke<number[]>("list_disabled_class_ids", { cfg });
+      setDisabledClassIds(new Set(ids));
+    } catch {
+      setDisabledClassIds(new Set());
     }
   }
 
@@ -126,7 +136,10 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
             Every class in the game, organized by realm - the ~63 built-in classes this tool
             ships reference data for, plus anything you've already deployed with it. Pick one to
             see its details and its own spells, clone it as a starting point for a new class, or
-            (for a class you deployed yourself) edit its file in place or delete it.
+            (for a class you deployed yourself) edit its file in place or delete it. A class shown
+            struck through and marked <span className="badge-disabled">DISABLED</span> is
+            currently blocked at character creation for regular players (the server's own
+            "disabled_classes" setting) - a GM account can still create one anyway.
           </p>
           <div className="actions">
             <button onClick={updateAllClassData} disabled={busy}>
@@ -155,20 +168,26 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
                     </tr>
                   </thead>
                   <tbody>
-                    {inRealm.map((c) => (
-                      <tr key={c.class_ident}>
-                        <td>{c.id}</td>
-                        <td>{c.name}</td>
-                        <td>{c.is_custom ? "Cloned Class" : "Standard Class"}</td>
-                        <td>{c.profession ?? "-"}</td>
-                        <td>{c.base_class_name}</td>
-                        <td>
-                          <button onClick={() => setSelectedIdent(c.class_ident)} disabled={busy}>
-                            View
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {inRealm.map((c) => {
+                      const disabled = disabledClassIds.has(c.id);
+                      return (
+                        <tr key={c.class_ident}>
+                          <td>{c.id}</td>
+                          <td style={disabled ? { textDecoration: "line-through" } : undefined}>
+                            {c.name}
+                            {disabled && <span className="badge-disabled"> DISABLED</span>}
+                          </td>
+                          <td>{c.is_custom ? "Cloned Class" : "Standard Class"}</td>
+                          <td>{c.profession ?? "-"}</td>
+                          <td>{c.base_class_name}</td>
+                          <td>
+                            <button onClick={() => setSelectedIdent(c.class_ident)} disabled={busy}>
+                              View
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -191,6 +210,7 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
             <strong>{selected.is_custom ? "Cloned Class" : "Standard Class"}</strong> - realm:{" "}
             {selected.realm}, profession: {selected.profession ?? "-"}, based on:{" "}
             {selected.base_class_name} ({selected.parent_ident})
+            {disabledClassIds.has(selected.id) && <span className="badge-disabled"> DISABLED</span>}
           </p>
           <div className="actions">
             <button onClick={cloneThisClass} disabled={busy}>
