@@ -6,9 +6,14 @@ import { ClassSpecSummary, OwnedSpellInLine, SpellLineGroup, SshConfig, StyleInf
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
 // listed here still exists and is still copied faithfully by the clone, it's just not offered in
 // this quick-edit form (the "Run SQL" box in Server connection can always reach it directly).
+// Order here is the actual display order (Name first, then the longer text fields), not just a
+// membership check - see PRIMARY_SPELL_FIELDS below for which of these get their own full-width
+// row above the compact grid of the rest.
 const EDITABLE_SPELL_FIELD_HINTS = [
   "Name",
   "Description",
+  "Message1",
+  "Message2",
   "Damage",
   "DamageType",
   "Value",
@@ -23,13 +28,17 @@ const EDITABLE_SPELL_FIELD_HINTS = [
   "ClientEffect",
   "Target",
   "SpellType",
-  "Message1",
-  "Message2",
 ];
+
+// These get their own full-width row, in this order, above the compact grid every other editable
+// field is packed into - the ones actually likely to hold a longer string, and (Name) the one
+// field worth always seeing first regardless.
+const PRIMARY_SPELL_FIELDS = ["Name", "Description", "Message1", "Message2"];
 
 // Same idea as EDITABLE_SPELL_FIELD_HINTS, but for a Style (combat skill) row - the fields
 // someone tuning a melee style is actually likely to want to change. SpecLevelRequirement is
-// deliberately left out here - it has its own quick-edit in the Level column instead.
+// deliberately left out here - it has its own quick-edit in the Level column instead. Order here
+// is the actual display order too.
 const EDITABLE_STYLE_FIELD_HINTS = [
   "Name",
   "Icon",
@@ -47,6 +56,19 @@ const EDITABLE_STYLE_FIELD_HINTS = [
   "RandomProc",
   "TwoHandAnimation",
 ];
+
+const PRIMARY_STYLE_FIELDS = ["Name"];
+
+/** Splits an already-ordered list of field keys into its own "primary" fields (Name, and for
+ * spells the longer text fields) - each shown on its own full-width row - and everything else,
+ * packed into a compact multi-column grid below them. Keeps the common rendering shape (one
+ * editable-fields object) from having to be duplicated between the spell and style editors. */
+function splitPrimaryFields(keys: string[], primary: string[]): { primaryKeys: string[]; restKeys: string[] } {
+  return {
+    primaryKeys: primary.filter((k) => keys.includes(k)),
+    restKeys: keys.filter((k) => !primary.includes(k)),
+  };
+}
 
 /** One spec's combat styles, fetched and edited only once its own row is actually expanded -
  * cloning/granting this class its own copy of a style on the spot the moment it's actually saved
@@ -194,9 +216,13 @@ function CombatSpecEditor({
               const currentLevel = String(s.fields.SpecLevelRequirement ?? 0);
               const levelDraft = levelDrafts[s.style_id] ?? currentLevel;
               const levelChanged = levelDraft !== currentLevel;
-              const editableKeys = Object.keys(s.fields).filter((k) => EDITABLE_STYLE_FIELD_HINTS.includes(k));
+              const editableKeys = EDITABLE_STYLE_FIELD_HINTS.filter((k) => k in s.fields);
               const fallbackKeys = Object.keys(s.fields).filter(
                 (k) => k !== "StyleID" && k !== "SpecLevelRequirement",
+              );
+              const { primaryKeys, restKeys } = splitPrimaryFields(
+                editableKeys.length > 0 ? editableKeys : fallbackKeys,
+                PRIMARY_STYLE_FIELDS,
               );
               return (
                 <Fragment key={s.style_id}>
@@ -239,8 +265,17 @@ function CombatSpecEditor({
                   {isEditingField && (
                     <tr>
                       <td colSpan={3}>
-                        <div className="override-grid">
-                          {(editableKeys.length > 0 ? editableKeys : fallbackKeys).map((key) => (
+                        {primaryKeys.map((key) => (
+                          <label className="field" key={key}>
+                            <span>{key}</span>
+                            <input
+                              value={draft[key] ?? ""}
+                              onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+                            />
+                          </label>
+                        ))}
+                        <div className="compact-field-grid">
+                          {restKeys.map((key) => (
                             <label className="field" key={key}>
                               <span>{key}</span>
                               <input
@@ -396,10 +431,12 @@ function SpellSpecEditor({
         groups
           .filter((group) => group.spells.length > 0)
           .map((group) => {
-            const editableKeys = Object.keys(group.spells[0]?.fields ?? {}).filter((k) =>
-              EDITABLE_SPELL_FIELD_HINTS.includes(k),
-            );
+            const editableKeys = EDITABLE_SPELL_FIELD_HINTS.filter((k) => k in (group.spells[0]?.fields ?? {}));
             const fallbackKeys = Object.keys(group.spells[0]?.fields ?? {}).filter((k) => k !== "SpellID");
+            const { primaryKeys, restKeys } = splitPrimaryFields(
+              editableKeys.length > 0 ? editableKeys : fallbackKeys,
+              PRIMARY_SPELL_FIELDS,
+            );
             return (
               <div key={group.line_key}>
                 {groups.length > 1 && <h4>{group.line_name}</h4>}
@@ -461,8 +498,17 @@ function SpellSpecEditor({
                           {isEditingField && (
                             <tr>
                               <td colSpan={4}>
-                                <div className="override-grid">
-                                  {(editableKeys.length > 0 ? editableKeys : fallbackKeys).map((key) => (
+                                {primaryKeys.map((key) => (
+                                  <label className="field" key={key}>
+                                    <span>{key}</span>
+                                    <input
+                                      value={draft[key] ?? ""}
+                                      onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+                                    />
+                                  </label>
+                                ))}
+                                <div className="compact-field-grid">
+                                  {restKeys.map((key) => (
                                     <label className="field" key={key}>
                                       <span>{key}</span>
                                       <input

@@ -158,6 +158,32 @@ select {
   gap: 0.6rem;
 }
 
+/* A denser alternative to .override-grid, used only by the spell/style field editors (Classes
+   tab) - those routinely have a dozen-plus small fields (damage, range, icon, ...) that waste a
+   lot of vertical space stacked one-per-row the way .override-grid's own use elsewhere (the
+   clone wizard's stat overrides, fewer and more varied fields) wants. Flows as many compact
+   fields per row as fit, instead of one full-width field per row. */
+.compact-field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+  gap: 0.4rem 0.6rem;
+  margin-top: 0.3rem;
+}
+
+.compact-field-grid .field {
+  margin-bottom: 0;
+  gap: 0.1rem;
+}
+
+.compact-field-grid .field span {
+  font-size: 0.7rem;
+}
+
+.compact-field-grid .field input {
+  padding: 0.25rem 0.35rem;
+  font-size: 0.8rem;
+}
+
 .override-row {
   display: grid;
   grid-template-columns: 220px 1fr;
