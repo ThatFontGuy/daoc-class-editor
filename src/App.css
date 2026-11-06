@@ -1,6 +1,31 @@
 :root {
-  color-scheme: light dark;
+  color-scheme: dark;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+  /* Palette matches the Divided Realms server page (https://whozon.ca/othlyn) - a dark
+     parchment/gold theme, kept consistent across both so the tool reads as part of the same
+     project. */
+  --bg: #14100c;
+  --panel: #1f1912;
+  --border: #4a3a24;
+  --gold: #c8a95c;
+  --text: #e8ddc8;
+  --muted: #a8977e;
+  --danger: #e0a0a0;
+  --danger-border: #7a3a3a;
+  --danger-bg: #3a1e1e;
+
+  /* Traditional DAoC realm colors, used to tint the Classes tab's own per-realm sections -
+     Albion red, Midgard a light "snow" blue, Hibernia a light "grass" green. */
+  --albion: #e0a0a0;
+  --albion-border: #8a4a4a;
+  --albion-bg: #2a1616;
+  --midgard: #a8d4e8;
+  --midgard-border: #4a7a8a;
+  --midgard-bg: #141f26;
+  --hibernia: #a8d8a0;
+  --hibernia-border: #4a7a4a;
+  --hibernia-bg: #16221a;
 }
 
 * {
@@ -9,6 +34,8 @@
 
 body {
   margin: 0;
+  background: var(--bg);
+  color: var(--text);
 }
 
 .app {
@@ -19,7 +46,8 @@ body {
 
 header {
   padding: 0.75rem 1.25rem;
-  border-bottom: 1px solid #8884;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
   display: flex;
   align-items: center;
   gap: 1.5rem;
@@ -28,6 +56,8 @@ header {
 header h1 {
   font-size: 1.1rem;
   margin: 0;
+  color: var(--gold);
+  letter-spacing: 0.02em;
 }
 
 nav {
@@ -37,16 +67,18 @@ nav {
 
 nav button {
   background: none;
-  border: 1px solid #8884;
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.35rem 0.8rem;
   cursor: pointer;
+  color: var(--text);
 }
 
 nav button.active {
-  background: #6b8afd;
-  color: white;
-  border-color: #6b8afd;
+  background: var(--gold);
+  color: #1a1308;
+  border-color: var(--gold);
+  font-weight: 600;
 }
 
 main {
@@ -64,18 +96,20 @@ main {
   font-size: 1rem;
   margin-top: 2rem;
   margin-bottom: 0.5rem;
-  border-bottom: 1px solid #8884;
+  border-bottom: 1px solid var(--border);
   padding-bottom: 0.25rem;
+  color: var(--gold);
 }
 
 .panel h3 {
   font-size: 0.9rem;
   margin-top: 1.5rem;
+  color: var(--gold);
 }
 
 .hint {
   font-size: 0.85rem;
-  opacity: 0.75;
+  color: var(--muted);
   margin: 0.25rem 0 0.75rem;
 }
 
@@ -88,24 +122,29 @@ main {
 
 .field span {
   font-size: 0.8rem;
-  opacity: 0.8;
+  color: var(--muted);
 }
 
 .field input,
 .field select {
   padding: 0.4rem;
   border-radius: 6px;
-  border: 1px solid #8886;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
 }
 
 select {
   padding: 0.4rem;
   border-radius: 6px;
-  border: 1px solid #8886;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
 }
 
 .source-summary {
-  background: #8882;
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.75rem;
   font-size: 0.85rem;
@@ -125,7 +164,7 @@ select {
   align-items: center;
   gap: 0.75rem;
   padding: 0.4rem 0;
-  border-bottom: 1px solid #8882;
+  border-bottom: 1px solid var(--border);
 }
 
 .override-toggle {
@@ -145,7 +184,9 @@ select {
   width: 100%;
   padding: 0.35rem;
   border-radius: 6px;
-  border: 1px solid #8886;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
 }
 
 .override-value.disabled {
@@ -177,8 +218,9 @@ select {
   font-size: 0.78rem;
   padding: 0.75rem;
   border-radius: 8px;
-  border: 1px solid #8886;
-  background: #8881;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
 }
 
 .sql-box {
@@ -187,7 +229,9 @@ select {
   font-size: 0.8rem;
   padding: 0.5rem;
   border-radius: 6px;
-  border: 1px solid #8886;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
 }
 
 .actions {
@@ -200,10 +244,15 @@ select {
 button {
   padding: 0.45rem 0.9rem;
   border-radius: 6px;
-  border: 1px solid #8886;
-  background: #8882;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
   cursor: pointer;
   font-size: 0.85rem;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--gold);
 }
 
 button:disabled {
@@ -212,15 +261,15 @@ button:disabled {
 }
 
 button.danger {
-  border-color: #e05a5a88;
-  background: #e05a5a22;
-  color: #e05a5a;
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger);
 }
 
 .badge-disabled {
   font-size: 0.75rem;
   font-weight: 600;
-  color: #e05a5a;
+  color: var(--danger);
   letter-spacing: 0.02em;
 }
 
@@ -233,17 +282,18 @@ button.danger {
 
 .picker-btn {
   background: none;
-  border: 1px solid #8884;
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.4rem 0.85rem;
   cursor: pointer;
   font-size: 0.85rem;
+  color: var(--text);
 }
 
 .picker-btn.active {
-  background: #6b8afd;
-  color: white;
-  border-color: #6b8afd;
+  background: var(--gold);
+  color: #1a1308;
+  border-color: var(--gold);
 }
 
 .picker-btn .count {
@@ -254,7 +304,7 @@ button.danger {
 
 .picker-step-label {
   font-size: 0.78rem;
-  opacity: 0.7;
+  color: var(--muted);
   margin: 0.4rem 0 0.3rem;
 }
 
@@ -267,20 +317,22 @@ button.danger {
   background: none;
   border: none;
   padding: 0;
-  color: #6b8afd;
+  color: var(--gold);
   cursor: pointer;
   font-size: inherit;
   text-decoration: underline;
 }
 
 .status {
-  background: #0003;
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.75rem;
   font-size: 0.78rem;
   white-space: pre-wrap;
   max-height: 220px;
   overflow-y: auto;
+  color: var(--text);
 }
 
 .progress-indicator {
@@ -302,8 +354,8 @@ button.danger {
   font-weight: 600;
   padding: 0.25rem 0.6rem;
   border-radius: 999px;
-  background: #6b8afd2a;
-  color: #6b8afd;
+  background: #c8a95c2a;
+  color: var(--gold);
   margin-bottom: 1rem;
 }
 
@@ -316,7 +368,7 @@ button.danger {
 
 .project-status {
   font-size: 0.78rem;
-  opacity: 0.7;
+  color: var(--muted);
   max-width: 320px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -334,12 +386,13 @@ button.danger {
   text-align: left;
   font-weight: 600;
   padding: 0.3rem 0.5rem;
-  border-bottom: 1px solid #8886;
+  border-bottom: 1px solid var(--border);
+  color: var(--gold);
 }
 
 .spec-table td {
   padding: 0.3rem 0.5rem;
-  border-bottom: 1px solid #8882;
+  border-bottom: 1px solid var(--border);
 }
 
 .spec-table select,
@@ -347,7 +400,9 @@ button.danger {
   width: 100%;
   padding: 0.3rem;
   border-radius: 6px;
-  border: 1px solid #8886;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
 }
 
 .spec-table input[type="checkbox"] {
@@ -355,10 +410,45 @@ button.danger {
   flex: none;
 }
 
+/* Realm tinting for the Classes tab - Albion red, Midgard "snow" blue, Hibernia "grass" green,
+   the traditional DAoC realm colors. Applied to the realm section's own wrapping element, so its
+   heading and table header row both pick up the tint without needing a class on every element. */
+.realm-albion h2,
+.realm-albion h3 {
+  color: var(--albion);
+  border-left: 3px solid var(--albion-border);
+  padding-left: 0.5rem;
+}
+.realm-albion .spec-table th {
+  color: var(--albion);
+  background: var(--albion-bg);
+}
+
+.realm-midgard h2,
+.realm-midgard h3 {
+  color: var(--midgard);
+  border-left: 3px solid var(--midgard-border);
+  padding-left: 0.5rem;
+}
+.realm-midgard .spec-table th {
+  color: var(--midgard);
+  background: var(--midgard-bg);
+}
+
+.realm-hibernia h2,
+.realm-hibernia h3 {
+  color: var(--hibernia);
+  border-left: 3px solid var(--hibernia-border);
+  padding-left: 0.5rem;
+}
+.realm-hibernia .spec-table th {
+  color: var(--hibernia);
+  background: var(--hibernia-bg);
+}
 
 .spell-line-customizer {
   padding: 0.5rem;
-  background: #8881;
+  background: var(--panel);
   border-radius: 6px;
 }
 
@@ -394,7 +484,7 @@ button.danger {
 }
 
 .spell-progression-row:nth-child(odd) {
-  background: #8881;
+  background: var(--panel);
 }
 
 .spell-checkbox {
@@ -404,3 +494,4 @@ button.danger {
   font-size: 0.8rem;
   white-space: nowrap;
 }
+

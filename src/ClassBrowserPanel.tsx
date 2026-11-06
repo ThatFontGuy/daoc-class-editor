@@ -157,7 +157,7 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
               .sort((a, b) => a.name.localeCompare(b.name));
             if (inRealm.length === 0) return null;
             return (
-              <div key={realm}>
+              <div key={realm} className={`realm-${realm.toLowerCase()}`}>
                 <h3>{realm}</h3>
                 <table className="spec-table">
                   <thead>
@@ -209,7 +209,7 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
       )}
 
       {selected && (
-        <div className="panel">
+        <div className={`panel realm-${selected.realm.toLowerCase()}`}>
           <div className="actions" style={{ justifyContent: "space-between" }}>
             <h2 style={{ margin: 0 }}>
               {selected.superseded_by ? (
