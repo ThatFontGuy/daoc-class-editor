@@ -119,65 +119,74 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
 
   return (
     <div className="panel">
-      <h2>Classes</h2>
-      <p className="hint">
-        Every class in the game, organized by realm - the ~63 built-in classes this tool ships
-        reference data for, plus anything you've already deployed with it. Pick one to see its
-        details and its own spells below, clone it as a starting point for a new class, or (for a
-        class you deployed yourself) edit its file in place or delete it.
-      </p>
-      <div className="actions">
-        <button onClick={updateAllClassData} disabled={busy}>
-          Update All Class Data
-        </button>
-      </div>
-      {status && <pre className="status">{status}</pre>}
-
-      {realms.map((realm) => {
-        const inRealm = leafClasses
-          .filter((c) => c.realm === realm)
-          .sort((a, b) => a.name.localeCompare(b.name));
-        if (inRealm.length === 0) return null;
-        return (
-          <div key={realm}>
-            <h3>{realm}</h3>
-            <table className="spec-table">
-              <thead>
-                <tr>
-                  <th>ID</th>
-                  <th>Name</th>
-                  <th>Status</th>
-                  <th>Profession</th>
-                  <th>Based on</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {inRealm.map((c) => (
-                  <tr key={c.class_ident} className={c.class_ident === selectedIdent ? "active-row" : ""}>
-                    <td>{c.id}</td>
-                    <td>{c.name}</td>
-                    <td>{c.is_custom ? "Cloned Class" : "Standard Class"}</td>
-                    <td>{c.profession ?? "-"}</td>
-                    <td>{c.base_class_name}</td>
-                    <td>
-                      <button onClick={() => setSelectedIdent(c.class_ident)} disabled={busy}>
-                        {c.class_ident === selectedIdent ? "Selected" : "View"}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {!selected && (
+        <>
+          <h2>Classes</h2>
+          <p className="hint">
+            Every class in the game, organized by realm - the ~63 built-in classes this tool
+            ships reference data for, plus anything you've already deployed with it. Pick one to
+            see its details and its own spells, clone it as a starting point for a new class, or
+            (for a class you deployed yourself) edit its file in place or delete it.
+          </p>
+          <div className="actions">
+            <button onClick={updateAllClassData} disabled={busy}>
+              Update All Class Data
+            </button>
           </div>
-        );
-      })}
+          {status && <pre className="status">{status}</pre>}
+
+          {realms.map((realm) => {
+            const inRealm = leafClasses
+              .filter((c) => c.realm === realm)
+              .sort((a, b) => a.name.localeCompare(b.name));
+            if (inRealm.length === 0) return null;
+            return (
+              <div key={realm}>
+                <h3>{realm}</h3>
+                <table className="spec-table">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Name</th>
+                      <th>Status</th>
+                      <th>Profession</th>
+                      <th>Based on</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {inRealm.map((c) => (
+                      <tr key={c.class_ident}>
+                        <td>{c.id}</td>
+                        <td>{c.name}</td>
+                        <td>{c.is_custom ? "Cloned Class" : "Standard Class"}</td>
+                        <td>{c.profession ?? "-"}</td>
+                        <td>{c.base_class_name}</td>
+                        <td>
+                          <button onClick={() => setSelectedIdent(c.class_ident)} disabled={busy}>
+                            View
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            );
+          })}
+        </>
+      )}
 
       {selected && (
         <div className="panel">
-          <h2>
-            {selected.name} <span className="hint">(ID {selected.id})</span>
-          </h2>
+          <div className="actions" style={{ justifyContent: "space-between" }}>
+            <h2 style={{ margin: 0 }}>
+              {selected.name} <span className="hint">(ID {selected.id})</span>
+            </h2>
+            <button onClick={() => setSelectedIdent(null)} disabled={busy}>
+              Return to Class List
+            </button>
+          </div>
           <p>
             <strong>{selected.is_custom ? "Cloned Class" : "Standard Class"}</strong> - realm:{" "}
             {selected.realm}, profession: {selected.profession ?? "-"}, based on:{" "}
@@ -208,6 +217,9 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
                 </button>
               </>
             )}
+            <button onClick={updateAllClassData} disabled={busy}>
+              Update All Class Data
+            </button>
           </div>
           <p className="hint">
             <strong>Stop the server before editing or deleting</strong> - the same database-lock
@@ -215,6 +227,7 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
             existing character will leave that character broken; only touch classes nothing is
             using yet.
           </p>
+          {status && <pre className="status">{status}</pre>}
           <ClassSpellsSection
             key={`${selected.id}-${spellsRefreshKey}`}
             sshConfig={sshConfig}
