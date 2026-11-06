@@ -820,6 +820,169 @@ pub fn migrate_class_to_owned_spells(
     ))
 }
 
+/// One spell's own row on a particular spell line, for the "Edit spells" UI's own grouped view -
+/// the level it becomes available at (editable, see `update_line_spell_level`) plus its full
+/// `Spell` row (dynamic fields - see `spell_ownership`'s own doc comment for why this is a raw
+/// JSON object rather than a fixed struct). `is_owned` tells the UI whether this spell is
+/// actually safe to field-edit yet (an independent clone) or still needs `migrate_class_to_owned_
+/// spells` run first - a class's own LineXSpell rows can legitimately still point at shared,
+/// un-owned spells if migration hasn't happened yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnedSpellInLine {
+    pub line_xspell_id: String,
+    pub level: i64,
+    pub spell_id: i64,
+    pub is_owned: bool,
+    pub fields: Value,
+}
+
+/// One `SpellLine` belonging to one of a class's own cloned specs, with every spell on it (in
+/// level order) - the real "how does this class's own spec actually progress" shape the flat,
+/// line-blind spell list this UI used to show couldn't express at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpellLineGroup {
+    pub spec_key: String,
+    pub line_key: String,
+    pub line_name: String,
+    pub spells: Vec<OwnedSpellInLine>,
+}
+
+/// Every spell line belonging to a spec `class_id` itself owns (the same `_<class_id>` suffix
+/// convention used throughout this module), each with its own spells in level order - lets the
+/// editing UI show a class's real spec progression (e.g. Drengr's three real lines) instead of
+/// one flat, unordered list with no indication of which line a spell belongs to or what level it
+/// unlocks at.
+pub fn list_owned_spell_lines(cfg: &SshConfig, class_id: i64) -> Result<Vec<SpellLineGroup>, String> {
+    ensure_tracking_table(cfg)?;
+
+    let suffix = format!("_{class_id}");
+    let assigned = run_remote_sql_json(
+        cfg,
+        &format!("SELECT SpecKeyName FROM ClassXSpecialization WHERE ClassID = {class_id};"),
+    )?;
+    let owned_keys: Vec<String> = assigned
+        .iter()
+        .map(|r| str_field(r, "SpecKeyName"))
+        .filter(|k| k.ends_with(&suffix))
+        .collect();
+    if owned_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys_csv = owned_keys
+        .iter()
+        .map(|k| format!("'{}'", sql_quote(k)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lines = run_remote_sql_json(
+        cfg,
+        &format!("SELECT KeyName, Name, Spec FROM SpellLine WHERE Spec IN ({keys_csv});"),
+    )?;
+    let mut groups: Vec<SpellLineGroup> = lines
+        .iter()
+        .map(|l| SpellLineGroup {
+            spec_key: str_field(l, "Spec"),
+            line_key: str_field(l, "KeyName"),
+            line_name: str_field(l, "Name"),
+            spells: Vec::new(),
+        })
+        .collect();
+    if groups.is_empty() {
+        return Ok(groups);
+    }
+
+    let line_keys_csv = groups
+        .iter()
+        .map(|g| format!("'{}'", sql_quote(&g.line_key)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `Spell.*` is deliberately the generic, dynamic field set (see `OwnedSpellInLine`'s own doc
+    // comment); `LineXSpell`'s own `LineName`/`LineXSpell_ID`/`Level` are aliased so they don't
+    // collide with `Spell`'s own identically-named `SpellID` column in the combined JSON row.
+    let rows = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT LineXSpell.LineName AS OwnerLineKey, LineXSpell.LineXSpell_ID AS OwnerLineXSpellId, \
+             LineXSpell.Level AS OwnerLevel, Spell.* \
+             FROM LineXSpell JOIN Spell ON Spell.SpellID = LineXSpell.SpellID \
+             WHERE LineXSpell.LineName IN ({line_keys_csv}) ORDER BY LineXSpell.Level;"
+        ),
+    )?;
+
+    let spell_ids: Vec<i64> = rows.iter().map(|r| int_field(r, "SpellID")).collect();
+    let owned_ids: std::collections::HashSet<i64> = if spell_ids.is_empty() {
+        Default::default()
+    } else {
+        let ids_csv = spell_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        run_remote_sql_json(
+            cfg,
+            &format!("SELECT NewSpellID FROM ClassEditorSpellClone WHERE NewSpellID IN ({ids_csv});"),
+        )?
+        .iter()
+        .map(|r| int_field(r, "NewSpellID"))
+        .collect()
+    };
+
+    for row in &rows {
+        let line_key = str_field(row, "OwnerLineKey");
+        if let Some(group) = groups.iter_mut().find(|g| g.line_key == line_key) {
+            let spell_id = int_field(row, "SpellID");
+            group.spells.push(OwnedSpellInLine {
+                line_xspell_id: str_field(row, "OwnerLineXSpellId"),
+                level: int_field(row, "OwnerLevel"),
+                spell_id,
+                is_owned: owned_ids.contains(&spell_id),
+                fields: row.clone(),
+            });
+        }
+    }
+    Ok(groups)
+}
+
+/// Changes the level a spell line's own spell becomes available at (`LineXSpell.Level`) - safe
+/// regardless of whether the spell itself has been migrated to an independent clone yet, since
+/// unlike `Spell` rows, a `LineXSpell` row is never shared across classes to begin with (each
+/// class's own clone already gets its own uniquely-keyed `SpellLine`/`LineXSpell` rows, even
+/// before this tool started independently cloning the underlying `Spell` data too). Still refuses
+/// outright if the line in question doesn't actually belong to one of `class_id`'s own cloned
+/// specs (the same `_<class_id>` suffix check used throughout this module) - a plain/shared
+/// spec's own line (e.g. "Sword") is never touched, since that one genuinely is shared with other
+/// classes.
+pub fn update_line_spell_level(
+    cfg: &SshConfig,
+    class_id: i64,
+    line_xspell_id: &str,
+    new_level: i64,
+) -> Result<String, String> {
+    let line_id_q = sql_quote(line_xspell_id);
+    let owning_spec = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT SpellLine.Spec FROM LineXSpell JOIN SpellLine ON SpellLine.KeyName = LineXSpell.LineName \
+             WHERE LineXSpell.LineXSpell_ID = '{line_id_q}';"
+        ),
+    )?;
+    let spec_key = owning_spec
+        .first()
+        .map(|r| str_field(r, "Spec"))
+        .unwrap_or_default();
+    let suffix = format!("_{class_id}");
+    if !spec_key.ends_with(&suffix) {
+        return Err(format!(
+            "'{spec_key}' is not a spec owned specifically by class {class_id} - refusing to \
+             change its level (it may still be shared with other classes)"
+        ));
+    }
+    run_remote_sql(
+        cfg,
+        &format!("UPDATE LineXSpell SET Level = {new_level} WHERE LineXSpell_ID = '{line_id_q}';"),
+    )?;
+    Ok(format!("updated level to {new_level}"))
+}
+
 /// Fully removes whatever an exact spec KeyName already owns (Specialization, its SpellLine(s)
 /// and their LineXSpell entries, Style, SpecXAbility, and its ClassXSpecialization assignment) -
 /// everything clone_spec creates - if it exists at all. A clean no-op otherwise. Lets
@@ -1957,6 +2120,94 @@ mod tests {
             second_log.contains("migrated 0 spell(s) and 0 proc(s)"),
             "second run should find nothing left to migrate: {second_log}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_owned_spell_lines_groups_spells_by_line_in_level_order() {
+        let dir = setup_test_db("list-owned-lines");
+        let cfg = test_cfg(&dir);
+
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: Vec::new(),
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        let groups = list_owned_spell_lines(&cfg, 64).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let group = &groups[0];
+        assert_eq!(group.spec_key, "frostbolt_tree_64");
+        assert_eq!(group.line_name, "Frostbolt Tree");
+        assert_eq!(group.spells.len(), 2, "{:?}", group.spells);
+        assert_eq!(group.spells[0].level, 1, "spells must come back in level order");
+        assert_eq!(group.spells[1].level, 10);
+        assert!(
+            group.spells.iter().all(|s| s.is_owned),
+            "every spell cloned by apply_class_specs is already independent: {:?}",
+            group.spells
+        );
+        assert_ne!(
+            group.spells[0].spell_id, 9001,
+            "must reference the independent clone, not the shared source spell"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_line_spell_level_changes_the_level_on_this_classs_own_line() {
+        let dir = setup_test_db("update-level-owned");
+        let cfg = test_cfg(&dir);
+
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: Vec::new(),
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        let groups = list_owned_spell_lines(&cfg, 64).unwrap();
+        let first_spell = &groups[0].spells[0];
+        assert_eq!(first_spell.level, 1);
+
+        update_line_spell_level(&cfg, 64, &first_spell.line_xspell_id, 5).unwrap();
+
+        let groups_after = list_owned_spell_lines(&cfg, 64).unwrap();
+        assert_eq!(groups_after[0].spells[0].level, 5);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_line_spell_level_refuses_a_plain_shared_specs_line() {
+        // "Slash" is a plain/shared spec (no class suffix) - its own spell line, if it had one,
+        // would still be in active use by any other class assigned it directly, so changing its
+        // level here must be refused the same way editing/deleting a shared Spell row is.
+        let dir = setup_test_db("update-level-refuses-shared");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 1);\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('slash_base', 9001, 1, 'shared-line-1');",
+        )
+        .unwrap();
+
+        let result = update_line_spell_level(&cfg, 64, "shared-line-1", 99);
+        assert!(result.is_err(), "editing a shared spec's own line must be refused");
+
+        let unchanged = run_remote_sql_json(
+            &cfg,
+            "SELECT Level FROM LineXSpell WHERE LineXSpell_ID = 'shared-line-1';",
+        )
+        .unwrap();
+        assert_eq!(int_field(&unchanged[0], "Level"), 1, "the level must be untouched");
 
         std::fs::remove_dir_all(&dir).ok();
     }

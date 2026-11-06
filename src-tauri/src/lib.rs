@@ -226,6 +226,21 @@ fn list_owned_spells(cfg: SshConfig, class_id: i64) -> Result<Vec<serde_json::Va
 }
 
 #[tauri::command]
+fn list_owned_spell_lines(cfg: SshConfig, class_id: i64) -> Result<Vec<specs::SpellLineGroup>, String> {
+    specs::list_owned_spell_lines(&cfg, class_id)
+}
+
+#[tauri::command]
+fn update_line_spell_level(
+    cfg: SshConfig,
+    class_id: i64,
+    line_xspell_id: String,
+    new_level: i64,
+) -> Result<String, String> {
+    specs::update_line_spell_level(&cfg, class_id, &line_xspell_id, new_level)
+}
+
+#[tauri::command]
 fn update_owned_spell_fields(
     cfg: SshConfig,
     spell_id: i64,
@@ -281,6 +296,8 @@ pub fn run() {
             clone_realm_abilities,
             migrate_class_to_owned_spells,
             list_owned_spells,
+            list_owned_spell_lines,
+            update_line_spell_level,
             update_owned_spell_fields,
             save_project_file,
             load_project_file,

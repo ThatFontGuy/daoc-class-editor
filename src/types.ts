@@ -119,6 +119,22 @@ export interface SpecAssignmentPayload {
 // deliberately untyped - the editor renders whatever columns actually come back.
 export type OwnedSpellRow = Record<string, string | number | boolean | null>;
 
+// Mirrors specs.rs's OwnedSpellInLine/SpellLineGroup.
+export interface OwnedSpellInLine {
+  line_xspell_id: string;
+  level: number;
+  spell_id: number;
+  is_owned: boolean;
+  fields: OwnedSpellRow;
+}
+
+export interface SpellLineGroup {
+  spec_key: string;
+  line_key: string;
+  line_name: string;
+  spells: OwnedSpellInLine[];
+}
+
 // Mirrors src-tauri/src/trainer.rs.
 
 export interface TrainerRequest {

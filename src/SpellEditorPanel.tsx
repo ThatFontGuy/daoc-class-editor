@@ -1,7 +1,14 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ClassInfo, ClassListResult, OwnedSpellRow, SshConfig, emptySshConfig } from "./types";
+import {
+  ClassInfo,
+  ClassListResult,
+  OwnedSpellInLine,
+  SpellLineGroup,
+  SshConfig,
+  emptySshConfig,
+} from "./types";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
@@ -37,9 +44,12 @@ export default function SpellEditorPanel() {
   const [sshConfig, setSshConfig] = useState<SshConfig>(emptySshConfig);
   const [deployedClasses, setDeployedClasses] = useState<ClassInfo[]>([]);
   const [selectedClassId, setSelectedClassId] = useState<number | null>(null);
-  const [spells, setSpells] = useState<OwnedSpellRow[] | null>(null);
+  const [spellLines, setSpellLines] = useState<SpellLineGroup[] | null>(null);
   const [editingSpellId, setEditingSpellId] = useState<number | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
+  // Keyed by line_xspell_id - only populated once a level's own input is actually touched, so an
+  // untouched row always reflects the real current level straight from `spellLines`.
+  const [levelDrafts, setLevelDrafts] = useState<Record<string, string>>({});
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
   const [migrateProgress, setMigrateProgress] = useState<MigrateProgress | null>(null);
@@ -83,31 +93,43 @@ export default function SpellEditorPanel() {
     }
   }
 
-  async function loadSpells(classId: number) {
+  async function loadSpellLines(classId: number) {
     if (busyRef.current) return;
     busyRef.current = true;
+    setBusy(true);
+    setStatus("Loading this class's own spell lines...");
+    try {
+      await loadSpellLinesInner(classId);
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  // Shared body for both the class picker and the post-migrate/post-save refresh - callers that
+  // already hold the busy guard for their own whole operation (migrate, save) call this directly
+  // instead of `loadSpellLines`, which would otherwise treat itself as a re-entrant call and
+  // no-op.
+  async function loadSpellLinesInner(classId: number) {
     setSelectedClassId(classId);
     setEditingSpellId(null);
-    setBusy(true);
-    setStatus("Loading this class's own spells...");
+    setLevelDrafts({});
     try {
-      const rows = await invoke<OwnedSpellRow[]>("list_owned_spells", {
+      const groups = await invoke<SpellLineGroup[]>("list_owned_spell_lines", {
         cfg: sshConfig,
         classId,
       });
-      setSpells(rows);
+      setSpellLines(groups);
+      const totalSpells = groups.reduce((sum, g) => sum + g.spells.length, 0);
       setStatus(
-        rows.length === 0
-          ? "This class has no independently-owned spells yet - use Migrate below if it was " +
+        totalSpells === 0
+          ? "No spell lines found yet for this class's own specs - use Migrate below if it was " +
               "cloned before spell editing existed, or redeploy/edit its specs to create some."
           : "",
       );
     } catch (e) {
-      setStatus(`Could not load spells: ${e}`);
-      setSpells(null);
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
+      setStatus(`Could not load spell lines: ${e}`);
+      setSpellLines(null);
     }
   }
 
@@ -123,7 +145,7 @@ export default function SpellEditorPanel() {
         classId: selectedClassId,
       });
       setStatus(result);
-      await loadSpellsInner(selectedClassId);
+      await loadSpellLinesInner(selectedClassId);
     } catch (e) {
       setStatus(`Migration failed: ${e}`);
     } finally {
@@ -133,39 +155,23 @@ export default function SpellEditorPanel() {
     }
   }
 
-  // `migrate` already holds the busy guard for its own whole operation (including the refresh
-  // that follows) - this is the same body as `loadSpells` minus its own (would-be re-entrant)
-  // guard/busy toggling.
-  async function loadSpellsInner(classId: number) {
-    setSelectedClassId(classId);
-    setEditingSpellId(null);
-    try {
-      const rows = await invoke<OwnedSpellRow[]>("list_owned_spells", { cfg: sshConfig, classId });
-      setSpells(rows);
-    } catch (e) {
-      setStatus(`Could not load spells: ${e}`);
-      setSpells(null);
-    }
-  }
-
-  function startEditing(spell: OwnedSpellRow) {
-    const spellId = Number(spell.SpellID);
-    setEditingSpellId(spellId);
+  function startEditing(item: OwnedSpellInLine) {
+    setEditingSpellId(item.spell_id);
     const initial: Record<string, string> = {};
-    for (const [key, value] of Object.entries(spell)) {
+    for (const [key, value] of Object.entries(item.fields)) {
       initial[key] = value === null || value === undefined ? "" : String(value);
     }
     setDraft(initial);
   }
 
-  async function save(original: OwnedSpellRow) {
+  async function save(item: OwnedSpellInLine) {
     if (editingSpellId == null || busyRef.current) return;
     // Only send fields that actually changed, and coerce back to a number when the original
     // value was one - the backend stores whatever JSON type is sent verbatim.
     const fields: Record<string, string | number> = {};
     for (const [key, value] of Object.entries(draft)) {
       if (key === "SpellID") continue;
-      const originalValue = original[key];
+      const originalValue = item.fields[key];
       const originalAsString = originalValue === null || originalValue === undefined ? "" : String(originalValue);
       if (value === originalAsString) continue;
       const wasNumber = typeof originalValue === "number";
@@ -182,12 +188,12 @@ export default function SpellEditorPanel() {
     try {
       const result = await invoke<string>("update_owned_spell_fields", {
         cfg: sshConfig,
-        spellId: editingSpellId,
+        spellId: item.spell_id,
         fields,
       });
       setStatus(result);
       setEditingSpellId(null);
-      if (selectedClassId != null) await loadSpellsInner(selectedClassId);
+      if (selectedClassId != null) await loadSpellLinesInner(selectedClassId);
     } catch (e) {
       setStatus(`Save failed: ${e}`);
     } finally {
@@ -196,19 +202,47 @@ export default function SpellEditorPanel() {
     }
   }
 
-  const editableKeys = spells
-    ? Object.keys(spells[0] ?? {}).filter((k) => EDITABLE_FIELD_HINTS.includes(k))
-    : [];
-  const fallbackKeys = spells ? Object.keys(spells[0] ?? {}).filter((k) => k !== "SpellID") : [];
+  async function saveLevel(item: OwnedSpellInLine) {
+    if (selectedClassId == null || busyRef.current) return;
+    const draftValue = levelDrafts[item.line_xspell_id];
+    const newLevel = Number(draftValue);
+    if (draftValue === undefined || draftValue.trim() === "" || Number.isNaN(newLevel)) {
+      setStatus("Level must be a number.");
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    setStatus("Saving level...");
+    try {
+      const result = await invoke<string>("update_line_spell_level", {
+        cfg: sshConfig,
+        classId: selectedClassId,
+        lineXspellId: item.line_xspell_id,
+        newLevel,
+      });
+      setStatus(result);
+      await loadSpellLinesInner(selectedClassId);
+    } catch (e) {
+      setStatus(`Save failed: ${e}`);
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  const totalSpells = spellLines?.reduce((sum, g) => sum + g.spells.length, 0) ?? 0;
 
   return (
     <div className="panel">
       <h2>Edit spells</h2>
       <p className="hint">
-        Only spells this tool has <strong>independently cloned</strong> for a class are editable
-        here - never a spell still shared with the class it was cloned from (or any other class).
-        A class cloned before this feature existed needs a one-time <strong>Migrate</strong> first
-        to convert its spells to independent copies.
+        Grouped by this class's own spell lines (e.g. Drengr's three real lines), in level order,
+        so a spec's actual progression is visible - the level shown is editable too. Field-editing
+        a spell's own values (damage, range, duration, ...) only ever touches a spell this tool
+        has <strong>independently cloned</strong> for this class - never one still shared with the
+        class it was cloned from (or any other class). A class cloned before this feature existed
+        needs a one-time <strong>Migrate</strong> first to convert its spells to independent
+        copies.
       </p>
       <p className="hint">
         <strong>Stop the server before editing</strong> - same database-lock caution as deploying
@@ -220,7 +254,7 @@ export default function SpellEditorPanel() {
         </button>
         <select
           value={selectedClassId ?? ""}
-          onChange={(e) => e.target.value && loadSpells(Number(e.target.value))}
+          onChange={(e) => e.target.value && loadSpellLines(Number(e.target.value))}
           disabled={busy || deployedClasses.length === 0}
         >
           <option value="">Pick a deployed class...</option>
@@ -249,65 +283,118 @@ export default function SpellEditorPanel() {
       {busy && !migrateProgress && <p className="hint">⏳ Working - please wait...</p>}
       {status && <pre className="status">{status}</pre>}
 
-      {spells && spells.length > 0 && (
-        <table className="spec-table">
-          <thead>
-            <tr>
-              <th>SpellID</th>
-              <th>Name</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {spells.map((spell) => {
-              const spellId = Number(spell.SpellID);
-              const isEditing = editingSpellId === spellId;
+      {spellLines && totalSpells > 0 && (
+        <>
+          {spellLines
+            .filter((group) => group.spells.length > 0)
+            .map((group) => {
+              const editableKeys = Object.keys(group.spells[0]?.fields ?? {}).filter((k) =>
+                EDITABLE_FIELD_HINTS.includes(k),
+              );
+              const fallbackKeys = Object.keys(group.spells[0]?.fields ?? {}).filter(
+                (k) => k !== "SpellID",
+              );
               return (
-                <Fragment key={spellId}>
-                  <tr>
-                    <td>{spellId}</td>
-                    <td>{String(spell.Name ?? "")}</td>
-                    <td>
-                      {isEditing ? (
-                        <>
-                          <button onClick={() => save(spell)} disabled={busy}>
-                            Save
-                          </button>{" "}
-                          <button onClick={() => setEditingSpellId(null)} disabled={busy}>
-                            Cancel
-                          </button>
-                        </>
-                      ) : (
-                        <button onClick={() => startEditing(spell)} disabled={busy}>
-                          Edit
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                  {isEditing && (
-                    <tr>
-                      <td colSpan={3}>
-                        <div className="override-grid">
-                          {(editableKeys.length > 0 ? editableKeys : fallbackKeys).map((key) => (
-                            <label className="field" key={key}>
-                              <span>{key}</span>
-                              <input
-                                value={draft[key] ?? ""}
-                                onChange={(e) =>
-                                  setDraft((prev) => ({ ...prev, [key]: e.target.value }))
-                                }
-                              />
-                            </label>
-                          ))}
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                </Fragment>
+                <div key={group.line_key}>
+                  <h3>
+                    {group.line_name} <span className="hint">({group.spec_key})</span>
+                  </h3>
+                  <table className="spec-table">
+                    <thead>
+                      <tr>
+                        <th>Level</th>
+                        <th>SpellID</th>
+                        <th>Name</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {group.spells.map((item) => {
+                        const isEditingField = editingSpellId === item.spell_id;
+                        const levelDraft = levelDrafts[item.line_xspell_id] ?? String(item.level);
+                        const levelChanged = levelDraft !== String(item.level);
+                        return (
+                          <Fragment key={item.line_xspell_id}>
+                            <tr>
+                              <td>
+                                <input
+                                  type="number"
+                                  value={levelDraft}
+                                  onChange={(e) =>
+                                    setLevelDrafts((prev) => ({
+                                      ...prev,
+                                      [item.line_xspell_id]: e.target.value,
+                                    }))
+                                  }
+                                  style={{ width: "4em" }}
+                                  disabled={busy}
+                                />{" "}
+                                {levelChanged && (
+                                  <button onClick={() => saveLevel(item)} disabled={busy}>
+                                    Save
+                                  </button>
+                                )}
+                              </td>
+                              <td>{item.spell_id}</td>
+                              <td>
+                                {String(item.fields.Name ?? "")}
+                                {!item.is_owned && (
+                                  <span className="hint"> (not yet migrated - read-only)</span>
+                                )}
+                              </td>
+                              <td>
+                                {isEditingField ? (
+                                  <>
+                                    <button onClick={() => save(item)} disabled={busy}>
+                                      Save
+                                    </button>{" "}
+                                    <button onClick={() => setEditingSpellId(null)} disabled={busy}>
+                                      Cancel
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    onClick={() => startEditing(item)}
+                                    disabled={busy || !item.is_owned}
+                                  >
+                                    Edit
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                            {isEditingField && (
+                              <tr>
+                                <td colSpan={4}>
+                                  <div className="override-grid">
+                                    {(editableKeys.length > 0 ? editableKeys : fallbackKeys).map(
+                                      (key) => (
+                                        <label className="field" key={key}>
+                                          <span>{key}</span>
+                                          <input
+                                            value={draft[key] ?? ""}
+                                            onChange={(e) =>
+                                              setDraft((prev) => ({
+                                                ...prev,
+                                                [key]: e.target.value,
+                                              }))
+                                            }
+                                          />
+                                        </label>
+                                      ),
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </Fragment>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               );
             })}
-          </tbody>
-        </table>
+        </>
       )}
     </div>
   );
