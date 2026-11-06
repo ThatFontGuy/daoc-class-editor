@@ -1898,25 +1898,49 @@ fn clone_spec(
     let new_key_q = sql_quote(new_key);
     let new_name_q = sql_quote(new_name);
 
-    // The source spec's own ClientStyleGroup (if it's itself a previous clone) decides whether
-    // this new clone inherits an explicit override or needs one computed fresh - see
-    // client_style_group_for's doc comment.
-    let source_rows = run_remote_sql_json(
-        cfg,
-        &format!("SELECT ClientStyleGroup FROM Specialization WHERE KeyName = '{source_key_q}';"),
-    )?;
-    let source_override = source_rows
-        .first()
-        .and_then(|r| r.get("ClientStyleGroup"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0) as u8;
-    let client_style_group = client_style_group_for(source_key, source_override);
+    // ClientStyleGroup isn't on every fork's own Specialization table at all - a real,
+    // reproduced case: Divided Realms' actual live production server (unlike the stale "Othlyn"
+    // deployment this project's own earlier testing happened against, before that mixup was
+    // caught) simply doesn't have this column, so unconditionally assuming it existed made every
+    // single spec clone against the real server fail outright ("table Specialization has no
+    // column named ClientStyleGroup") - this had gone undetected because nothing had actually
+    // exercised a fresh clone_spec call against that specific database until now. Checked fresh
+    // via the real schema (the same "never assume, introspect" approach this project's GUID-PK
+    // handling already uses), not assumed present.
+    let has_client_style_group = columns_excluding_pk(cfg, "Specialization")?
+        .iter()
+        .any(|c| c == "ClientStyleGroup");
 
-    let mut batch = format!(
-        "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
-         SELECT '{new_key_q}', '{new_name_q}', Description, Icon, Implementation, {client_style_group} \
-         FROM Specialization WHERE KeyName = '{source_key_q}';\n"
-    );
+    let client_style_group = if has_client_style_group {
+        // The source spec's own ClientStyleGroup (if it's itself a previous clone) decides
+        // whether this new clone inherits an explicit override or needs one computed fresh - see
+        // client_style_group_for's doc comment.
+        let source_rows = run_remote_sql_json(
+            cfg,
+            &format!("SELECT ClientStyleGroup FROM Specialization WHERE KeyName = '{source_key_q}';"),
+        )?;
+        let source_override = source_rows
+            .first()
+            .and_then(|r| r.get("ClientStyleGroup"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as u8;
+        Some(client_style_group_for(source_key, source_override))
+    } else {
+        None
+    };
+
+    let mut batch = match client_style_group {
+        Some(group) => format!(
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+             SELECT '{new_key_q}', '{new_name_q}', Description, Icon, Implementation, {group} \
+             FROM Specialization WHERE KeyName = '{source_key_q}';\n"
+        ),
+        None => format!(
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation) \
+             SELECT '{new_key_q}', '{new_name_q}', Description, Icon, Implementation \
+             FROM Specialization WHERE KeyName = '{source_key_q}';\n"
+        ),
+    };
 
     // Every spell (cast or proc) this clone needs gets its own fully independent `Spell` row -
     // see spell_ownership.rs's own module doc comment for the real bug this closes. One cloner
@@ -2764,6 +2788,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(int_field(&rows[0], "ClientStyleGroup"), 0x69);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clone_spec_works_on_a_fork_whose_specialization_table_has_no_client_style_group_at_all() {
+        // A real, reproduced bug found live: the actual production server this project targets
+        // (unlike the stale "Othlyn" deployment this project's own earlier testing mistakenly
+        // happened against) simply has no ClientStyleGroup column on Specialization at all -
+        // confirmed directly against its real schema. Unconditionally assuming the column existed
+        // made every single spec clone fail outright ("table Specialization has no column named
+        // ClientStyleGroup") the moment it was actually tried against that real database - this
+        // had gone undetected because nothing had exercised a fresh clone_spec call against that
+        // specific schema shape until then. Mirrors that exact schema (no ClientStyleGroup at
+        // all), rather than reusing setup_test_db, which always has the column.
+        let dir = std::env::temp_dir().join("daoc-class-editor-specs-test-no-client-style-group");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let db = dir.join("data/opendaoc.sqlite3.db");
+        let sql = "
+            CREATE TABLE Specialization (KeyName TEXT, Name TEXT, Description TEXT, Icon INTEGER, Implementation TEXT);
+            CREATE TABLE ClassXSpecialization (ClassID INTEGER, SpecKeyName TEXT, LevelAcquired INTEGER);
+            CREATE TABLE SpellLine (KeyName TEXT, Name TEXT, Spec TEXT, IsBaseLine INTEGER, ClassIDHint INTEGER);
+            CREATE TABLE LineXSpell (LineName TEXT, SpellID INTEGER, Level INTEGER, LineXSpell_ID TEXT PRIMARY KEY DEFAULT '');
+            CREATE TABLE Style (StyleID INTEGER PRIMARY KEY AUTOINCREMENT, ClassId INTEGER, Name TEXT, SpecKeyName TEXT,
+                SpecLevelRequirement INTEGER, Icon INTEGER, EnduranceCost INTEGER, StealthRequirement INTEGER,
+                OpeningRequirementType INTEGER, OpeningRequirementValue INTEGER, AttackResultRequirement INTEGER,
+                WeaponTypeRequirement INTEGER, GrowthOffset REAL, GrowthRate REAL, BonusToHit INTEGER,
+                BonusToDefense INTEGER, TwoHandAnimation INTEGER, RandomProc INTEGER, ArmorHitLocation INTEGER,
+                ID INTEGER DEFAULT 0);
+            CREATE TABLE SpecXAbility (SpecXabilityID INTEGER PRIMARY KEY AUTOINCREMENT, Spec TEXT, SpecLevel INTEGER,
+                AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
+            CREATE TABLE DOLCharacters (Name TEXT, Class INTEGER, RespecAmountAllSkill INTEGER DEFAULT 0, SerializedSpecs TEXT DEFAULT '');
+            CREATE TABLE Spell (SpellID INTEGER NOT NULL DEFAULT 0, Name TEXT, SpellGroup INTEGER DEFAULT 0, Spell_ID TEXT NOT NULL DEFAULT '', PRIMARY KEY (Spell_ID));
+            CREATE UNIQUE INDEX U_Spell_SpellID ON Spell (SpellID);
+            CREATE TABLE StyleXSpell (StyleXSpell_ID TEXT PRIMARY KEY DEFAULT '', SpellID INTEGER, ClassID INTEGER, StyleID INTEGER, Chance INTEGER);
+
+            INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL);
+            INSERT INTO ClassXSpecialization VALUES (1, 'slash', 0);
+            INSERT INTO Style VALUES (NULL, 1, 'Pulverize', 'slash', 5, 300, 5, 0, 1, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);
+        ";
+        let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
+        assert!(status.success());
+        let cfg = test_cfg(&dir);
+
+        let assignments = vec![SpecAssignment {
+            source_key: "slash".to_string(),
+            new_key: "earthshatter".to_string(),
+            new_name: "Earthshatter".to_string(),
+            level_acquired: 0,
+            spell_line_selection: Vec::new(),
+        }];
+        let result = apply_class_specs(&cfg, 64, &assignments, &[]);
+        assert!(result.is_ok(), "{result:?}");
+
+        let rows = run_remote_sql_json(
+            &cfg,
+            "SELECT Name FROM Specialization WHERE KeyName='earthshatter_64';",
+        )
+        .unwrap();
+        assert_eq!(str_field(&rows[0], "Name"), "Earthshatter");
 
         std::fs::remove_dir_all(&dir).ok();
     }
