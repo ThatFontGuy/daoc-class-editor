@@ -233,3 +233,6 @@ Rust backend: `cargo test --manifest-path src-tauri/Cargo.toml` runs the parser/
 suite, including tests that assert the parser extracts exact known values (e.g. Sluaghbinder's
 real stats) and that generated code has balanced braces and only emits the overrides you actually
 changed.
+
+See `docs/future-improvements.md` for ideas explicitly deferred for later, detailed enough to
+pick back up without re-researching from scratch.
