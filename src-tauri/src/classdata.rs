@@ -506,14 +506,39 @@ pub struct KnownOptions {
     pub stats: Vec<String>,
     pub races: Vec<String>,
     pub class_types: Vec<String>,
+    /// Every real `eSpellType` value, straight from the vendored enum - what actually decides
+    /// which `[SpellHandler(eSpellType.X)]`-tagged class implements a spell's effect (see
+    /// `eSpellType.cs`'s own vendored copy). Lets the spell field editor offer this as a picker
+    /// instead of a free-text field a typo could silently break.
+    pub spell_types: Vec<String>,
     /// Race name -> realm ("Albion"/"Midgard"/"Hibernia"), so the frontend can filter the full
     /// race list down to just the realm of whatever class is being cloned.
     pub race_realms: HashMap<String, String>,
 }
 
-/// Extracts the canonical stat/race/class-type names straight from the vendored source files
-/// (eStat.cs, PlayerRace.cs, ICharacterClass.cs) rather than hardcoding lists in the frontend,
-/// so this stays correct if the server's own enums ever change.
+/// Extracts every member name from a plain `enum X { A, B, C, ... }` block (neither `eClassType`
+/// nor `eSpellType` assign explicit numeric values) - scoped to just that one enum's own `{ ... }`
+/// block within the file, so an unrelated trailing-comma line elsewhere in the same file can't
+/// sneak in as a false match.
+fn extract_enum_members(text: &str, enum_name: &str) -> Vec<String> {
+    (|| {
+        let start = text.find(&format!("enum {enum_name}"))?;
+        let open = text[start..].find('{')? + start;
+        let close = text[open..].find('}')? + open;
+        let block = &text[open..close];
+        let re = Regex::new(r"(?m)^\s*(\w+)\s*,?\s*$").ok()?;
+        Some(
+            re.captures_iter(block)
+                .map(|c| c[1].to_string())
+                .collect::<Vec<_>>(),
+        )
+    })()
+    .unwrap_or_default()
+}
+
+/// Extracts the canonical stat/race/class-type/spell-type names straight from the vendored source
+/// files (eStat.cs, PlayerRace.cs, ICharacterClass.cs, eSpellType.cs) rather than hardcoding lists
+/// in the frontend, so this stays correct if the server's own enums ever change.
 pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
     // `_First`/`_Last` are sentinel bounds, not real trainable stats - skip anything starting `_`.
     let stats = extract_idents(
@@ -528,28 +553,17 @@ pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
         r"public static PlayerRace (\w+) =>",
     );
     let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
-    // Scoped to just the `enum eClassType { ... }` block, not the whole interface file, so an
-    // unrelated trailing-comma line elsewhere can't sneak in as a false match.
-    let class_types =
-        std::fs::read_to_string(resources_dir.join("core").join("ICharacterClass.cs"))
-            .ok()
-            .and_then(|text| {
-                let start = text.find("enum eClassType")?;
-                let open = text[start..].find('{')? + start;
-                let close = text[open..].find('}')? + open;
-                let block = &text[open..close];
-                let re = Regex::new(r"(?m)^\s*(\w+)\s*,?\s*$").ok()?;
-                Some(
-                    re.captures_iter(block)
-                        .map(|c| c[1].to_string())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or_default();
+    let class_types = std::fs::read_to_string(resources_dir.join("core").join("ICharacterClass.cs"))
+        .map(|text| extract_enum_members(&text, "eClassType"))
+        .unwrap_or_default();
+    let spell_types = std::fs::read_to_string(resources_dir.join("core").join("eSpellType.cs"))
+        .map(|text| extract_enum_members(&text, "eSpellType"))
+        .unwrap_or_default();
     KnownOptions {
         stats,
         races,
         class_types,
+        spell_types,
         race_realms,
     }
 }
@@ -941,5 +955,14 @@ mod known_options_tests {
             Some("Albion")
         );
         assert_eq!(opts.race_realms.len(), 21, "{:?}", opts.race_realms);
+
+        assert!(opts.spell_types.contains(&"SpeedDecrease".to_string()));
+        assert!(opts.spell_types.contains(&"ArmorAbsorptionBuff".to_string()));
+        assert!(opts.spell_types.contains(&"DirectDamage".to_string()));
+        assert!(
+            opts.spell_types.len() > 400,
+            "expected the full eSpellType enum (500+ entries), got {}",
+            opts.spell_types.len()
+        );
     }
 }

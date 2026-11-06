@@ -117,7 +117,13 @@ deployment path was confirmed against a real running server after an early mix-u
     spell's values clones (or, for a mechanic-locked spec like "Staff"/"Sword" that can never be
     renamed, grants this class its own locked copy of) just that one spec the moment you hit
     **Save**, if it isn't independent for this class already - no separate "Migrate" step to run
-    first, and no risk of also changing it for any other class that shares the same spec.
+    first, and no risk of also changing it for any other class that shares the same spec. A
+    spell's own **Type** field (the real thing that decides what it mechanically does - the
+    server dispatches to a specific handler class by this value, e.g. "SpeedDecrease" ->
+    `SpeedDecreaseSpellHandler.cs` - everything else, Value/Duration/Range/..., is just a
+    parameter fed into whatever handler Type selects) is a dropdown of every real value the
+    server actually recognizes (`eSpellType`, vendored the same way the class list is), not a
+    free-text field a typo could silently turn into a spell the server can't dispatch at all.
   - **Update All Class Data** re-reads the class list and the selected class's own specs fresh
     from the server - handy after deploying or editing something outside this tool (e.g. directly
     via the "run SQL" box, or a server restart that changed `bin/scripts/`).
@@ -195,9 +201,10 @@ deployment path was confirmed against a real running server after an early mix-u
 ## Where the reference data comes from
 
 `src-tauri/resources/classes/` is a vendored, periodically-updated copy of the relevant files from
-the server repo (`playerclasses/`, `trainer/`, and a handful of core enums/base classes) - bundled
-with the app so it doesn't need the server repo checked out locally. If the server repo's class
-system changes meaningfully, re-sync this folder from there.
+the server repo (`playerclasses/`, `trainer/`, and a handful of core enums/base classes - including
+`eSpellType.cs`, the full list a spell's own `Type` field can be, used for its dropdown in the
+spell field editor) - bundled with the app so it doesn't need the server repo checked out locally.
+If the server repo's class system changes meaningfully, re-sync this folder from there.
 
 ## Compatibility with Divided Realms (github.com/ThatFontGuy/daoc-divided-linux)
 

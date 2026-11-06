@@ -47,6 +47,7 @@ export interface KnownOptions {
   stats: string[];
   races: string[];
   class_types: string[];
+  spell_types: string[];
   race_realms: Record<string, string>;
 }
 

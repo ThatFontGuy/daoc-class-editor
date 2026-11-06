@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ClassSpecSummary, OwnedSpellInLine, SpellLineGroup, SshConfig, StyleInfo } from "./types";
+import { ClassSpecSummary, KnownOptions, OwnedSpellInLine, SpellLineGroup, SshConfig, StyleInfo } from "./types";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
@@ -324,7 +324,14 @@ function SpellSpecEditor({
   const [levelDrafts, setLevelDrafts] = useState<Record<string, string>>({});
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  const [spellTypes, setSpellTypes] = useState<string[]>([]);
   const busyRef = useRef(false);
+
+  useEffect(() => {
+    invoke<KnownOptions>("known_options").then((opts) =>
+      setSpellTypes([...opts.spell_types].sort((a, b) => a.localeCompare(b))),
+    );
+  }, []);
 
   useEffect(() => {
     load();
@@ -430,6 +437,35 @@ function SpellSpecEditor({
 
   const totalSpells = groups?.reduce((sum, g) => sum + g.spells.length, 0) ?? 0;
 
+  /** "Type" gets a dropdown of every real eSpellType value instead of a free-text field - it's
+   * the single field that actually decides which handler (and therefore which real gameplay
+   * effect) a spell uses, so picking it from a known-good list instead of typing it by hand
+   * means there's no risk of a typo silently producing a spell the server can't even dispatch. */
+  function renderDraftField(key: string) {
+    if (key === "Type") {
+      const current = draft[key] ?? "";
+      return (
+        <select
+          value={current}
+          onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+        >
+          {current !== "" && !spellTypes.includes(current) && <option value={current}>{current} (unrecognized)</option>}
+          {spellTypes.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+      );
+    }
+    return (
+      <input
+        value={draft[key] ?? ""}
+        onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+      />
+    );
+  }
+
   return (
     <div>
       {busy && <p className="hint">⏳ Working - please wait...</p>}
@@ -509,20 +545,14 @@ function SpellSpecEditor({
                                 {primaryKeys.map((key) => (
                                   <label className="field" key={key}>
                                     <span>{key}</span>
-                                    <input
-                                      value={draft[key] ?? ""}
-                                      onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-                                    />
+                                    {renderDraftField(key)}
                                   </label>
                                 ))}
                                 <div className="compact-field-grid">
                                   {restKeys.map((key) => (
                                     <label className="field" key={key}>
                                       <span>{key}</span>
-                                      <input
-                                        value={draft[key] ?? ""}
-                                        onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-                                      />
+                                      {renderDraftField(key)}
                                     </label>
                                   ))}
                                 </div>
