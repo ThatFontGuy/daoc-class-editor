@@ -682,6 +682,11 @@ pub fn migrate_class_to_owned_spells(
         .map(|r| str_field(r, "SpecKeyName"))
         .filter(|k| k.ends_with(&suffix))
         .collect();
+    if owned_keys.is_empty() {
+        return Ok("migrated 0 spell(s) and 0 proc(s), across 0 owned spec(s), to independent, \
+                    editable copies\n"
+            .to_string());
+    }
 
     // Whatever StyleXSpell's own real GUID-style primary key column is called (see
     // `style_x_spell_guid_column`'s own doc comment), resolved once up front - falls back to
@@ -693,6 +698,17 @@ pub fn migrate_class_to_owned_spells(
     // First pass: gather every row that actually still needs migrating (already-independent
     // ones are skipped here, not just silently no-op'd later), so the real total is known before
     // any work starts - what a progress indicator actually needs to be meaningful.
+    //
+    // A real, reproduced performance problem this used to have: every single spell's own
+    // "already independently owned?" check (plus every spec's own SpellLine lookup, and every
+    // line's own LineXSpell lookup) was its own individual round-trip - for a class with ~100
+    // spells across a few lines, that's ~100+ separate SSH connections just to confirm there was
+    // nothing left to do, each paying real connection-setup overhead on top of the query itself.
+    // Re-running Migrate on an already-fully-migrated class (a safe, idempotent no-op by design)
+    // could feel like a hang for a minute or more, with zero visible progress the whole time
+    // (the progress bar only has something to report once this whole gathering pass finishes).
+    // Every one of these lookups is now a single batched `IN (...)` query instead - one round
+    // trip per *kind* of lookup, not one per row.
     struct LineWork {
         line_xspell_id: String,
         old_spell_id: i64,
@@ -701,79 +717,99 @@ pub fn migrate_class_to_owned_spells(
         row_key: String,
         old_spell_id: i64,
     }
-    let mut line_work: Vec<LineWork> = Vec::new();
-    let mut proc_work: Vec<ProcWork> = Vec::new();
 
-    for spec_key in &owned_keys {
-        let spec_key_q = sql_quote(spec_key);
+    let keys_csv = owned_keys
+        .iter()
+        .map(|k| format!("'{}'", sql_quote(k)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let spell_lines = run_remote_sql_json(
+        cfg,
+        &format!("SELECT KeyName FROM SpellLine WHERE Spec IN ({keys_csv});"),
+    )?;
+    let line_keys: Vec<String> = spell_lines.iter().map(|l| str_field(l, "KeyName")).collect();
 
-        let lines = run_remote_sql_json(
-            cfg,
-            &format!("SELECT KeyName FROM SpellLine WHERE Spec = '{spec_key_q}';"),
-        )?;
-        for line in &lines {
-            let line_key_q = sql_quote(&str_field(line, "KeyName"));
-            let rows = run_remote_sql_json(
-                cfg,
-                &format!(
-                    "SELECT LineXSpell_ID, SpellID FROM LineXSpell WHERE LineName = '{line_key_q}';"
-                ),
-            )?;
-            for row in &rows {
-                let old_spell_id = int_field(row, "SpellID");
-                let already_owned = run_remote_sql_json(
-                    cfg,
-                    &format!(
-                        "SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {old_spell_id};"
-                    ),
-                )?;
-                if already_owned.is_empty() {
-                    line_work.push(LineWork {
-                        line_xspell_id: str_field(row, "LineXSpell_ID"),
-                        old_spell_id,
-                    });
-                }
-            }
-        }
-
-        let styles = run_remote_sql_json(
-            cfg,
-            &format!("SELECT StyleID FROM Style WHERE SpecKeyName = '{spec_key_q}';"),
-        )?;
-        let style_ids_csv = styles
+    let mut line_rows: Vec<Value> = Vec::new();
+    if !line_keys.is_empty() {
+        let line_keys_csv = line_keys
             .iter()
-            .map(|r| int_field(r, "StyleID").to_string())
+            .map(|k| format!("'{}'", sql_quote(k)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        line_rows = run_remote_sql_json(
+            cfg,
+            &format!(
+                "SELECT LineXSpell_ID, SpellID FROM LineXSpell WHERE LineName IN ({line_keys_csv});"
+            ),
+        )?;
+    }
+
+    let style_rows = run_remote_sql_json(
+        cfg,
+        &format!("SELECT StyleID FROM Style WHERE SpecKeyName IN ({keys_csv});"),
+    )?;
+    let style_ids: Vec<i64> = style_rows.iter().map(|r| int_field(r, "StyleID")).collect();
+
+    let mut proc_rows: Vec<Value> = Vec::new();
+    if !style_ids.is_empty() {
+        let style_ids_csv = style_ids
+            .iter()
+            .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        if style_ids_csv.is_empty() {
-            continue;
-        }
         let select_cols = match &style_x_spell_pk {
             Some(col) => format!("{col} AS RowKey, SpellID"),
             None => "StyleID AS RowKey, SpellID".to_string(),
         };
-        let procs = run_remote_sql_json(
+        proc_rows = run_remote_sql_json(
             cfg,
             &format!("SELECT {select_cols} FROM StyleXSpell WHERE StyleID IN ({style_ids_csv});"),
         )?;
-        for proc in &procs {
-            let old_spell_id = int_field(proc, "SpellID");
-            let already_owned = run_remote_sql_json(
-                cfg,
-                &format!("SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {old_spell_id};"),
-            )?;
-            if already_owned.is_empty() {
-                proc_work.push(ProcWork {
-                    row_key: if style_x_spell_pk.is_some() {
-                        str_field(proc, "RowKey")
-                    } else {
-                        int_field(proc, "RowKey").to_string()
-                    },
-                    old_spell_id,
-                });
-            }
-        }
     }
+
+    // One batched ownership check covering every distinct spell either kind of row references,
+    // instead of one check per row.
+    let mut candidate_ids: Vec<i64> = line_rows.iter().map(|r| int_field(r, "SpellID")).collect();
+    candidate_ids.extend(proc_rows.iter().map(|r| int_field(r, "SpellID")));
+    candidate_ids.sort_unstable();
+    candidate_ids.dedup();
+    let already_owned: std::collections::HashSet<i64> = if candidate_ids.is_empty() {
+        Default::default()
+    } else {
+        let ids_csv = candidate_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        run_remote_sql_json(
+            cfg,
+            &format!("SELECT NewSpellID FROM ClassEditorSpellClone WHERE NewSpellID IN ({ids_csv});"),
+        )?
+        .iter()
+        .map(|r| int_field(r, "NewSpellID"))
+        .collect()
+    };
+
+    let line_work: Vec<LineWork> = line_rows
+        .iter()
+        .filter(|r| !already_owned.contains(&int_field(r, "SpellID")))
+        .map(|r| LineWork {
+            line_xspell_id: str_field(r, "LineXSpell_ID"),
+            old_spell_id: int_field(r, "SpellID"),
+        })
+        .collect();
+    let proc_work: Vec<ProcWork> = proc_rows
+        .iter()
+        .filter(|r| !already_owned.contains(&int_field(r, "SpellID")))
+        .map(|r| ProcWork {
+            row_key: if style_x_spell_pk.is_some() {
+                str_field(r, "RowKey")
+            } else {
+                int_field(r, "RowKey").to_string()
+            },
+            old_spell_id: int_field(r, "SpellID"),
+        })
+        .collect();
 
     let total = line_work.len() + proc_work.len();
     let mut processed = 0usize;
