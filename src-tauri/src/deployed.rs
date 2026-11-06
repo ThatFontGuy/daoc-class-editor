@@ -92,22 +92,62 @@ fn int_field(row: &Value, key: &str) -> i64 {
     row.get(key).and_then(Value::as_i64).unwrap_or(0)
 }
 
+/// Native-client-slot classes whose own creation gate is a dedicated boolean `ServerProperty`,
+/// confirmed directly in `CharacterCreateRequestHandler.cs` - e.g.
+/// `StormforgedRules.IsStormforged(ch.Class) && !Properties.ENABLE_STORMFORGED` blocks Stormforged
+/// outright, completely independent of `DISABLED_CLASSES`. A class here is effectively disabled
+/// whenever its own flag is anything other than `"True"`, *regardless* of what `DISABLED_CLASSES`
+/// separately says - relying on `DISABLED_CLASSES` alone would silently go stale the moment
+/// either list is edited without the other in mind. A real, reproduced case this exists for:
+/// Stormforged (70) isn't in `DISABLED_CLASSES` at all on Divided Realms, and is only actually
+/// blocked via its own `enable_stormforged` flag (currently `False`) - `PendragonSovereign`/
+/// `TuathaSovereign` happen to *also* be listed in `DISABLED_CLASSES` today, but checking their
+/// own flags here keeps that from being a coincidence this tool quietly depends on.
+const NATIVE_SLOT_ENABLE_FLAGS: &[(i32, &str)] = &[
+    (65, "enable_pendragon"),
+    (67, "enable_tuatha"),
+    (70, "enable_stormforged"),
+];
+
 /// Parses the server's own `DISABLED_CLASSES` property (`ServerProperty.Key = 'disabled_classes'`)
 /// into the set of numeric class IDs it actually disables for regular (non-GM) players at
 /// character creation - confirmed directly in the real server source
 /// (`CharacterCreateRequestHandler.cs`/`Util.SplitCSV`): a semicolon-separated list where each
 /// entry is either a single class ID or an inclusive `from-to` range (e.g. `"20;63;65-67"` means
 /// 20, 63, 65, 66, and 67 - this is exactly the real, reproduced bug found live, where an
-/// over-wide range accidentally disabled Drengr too). Returns an empty set (nothing disabled) if
-/// the property is missing or blank - the same "no restriction" default the server itself falls
-/// back to.
+/// over-wide range accidentally disabled Drengr too) - unioned with every `NATIVE_SLOT_ENABLE_
+/// FLAGS` class whose own dedicated flag is currently off. Returns an empty set (nothing
+/// disabled) if `DISABLED_CLASSES` is missing/blank and every native-slot flag reads enabled -
+/// the same "no restriction" default the server itself falls back to.
 pub fn fetch_disabled_class_ids(cfg: &SshConfig) -> Result<std::collections::HashSet<i32>, String> {
     let rows = run_remote_sql_json(
         cfg,
         "SELECT Value FROM ServerProperty WHERE \"Key\" = 'disabled_classes';",
     )?;
     let raw = rows.first().map(|r| str_field(r, "Value")).unwrap_or_default();
-    Ok(parse_disabled_class_ids(&raw))
+    let mut ids = parse_disabled_class_ids(&raw);
+
+    let flag_keys_csv = NATIVE_SLOT_ENABLE_FLAGS
+        .iter()
+        .map(|(_, key)| format!("'{key}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let flag_rows = run_remote_sql_json(
+        cfg,
+        &format!("SELECT \"Key\", Value FROM ServerProperty WHERE \"Key\" IN ({flag_keys_csv});"),
+    )?;
+    for (class_id, key) in NATIVE_SLOT_ENABLE_FLAGS {
+        // A missing property row is treated the same as the server's own documented default for
+        // every one of these flags (`false`) - never silently assume a flag not found is enabled.
+        let enabled = flag_rows
+            .iter()
+            .find(|r| str_field(r, "Key") == *key)
+            .is_some_and(|r| str_field(r, "Value").eq_ignore_ascii_case("true"));
+        if !enabled {
+            ids.insert(*class_id);
+        }
+    }
+    Ok(ids)
 }
 
 /// Pure parsing logic, split out so it's testable without a real database - mirrors the real
@@ -467,6 +507,9 @@ mod tests {
         let sql = "
             CREATE TABLE ServerProperty (Category TEXT, \"Key\" TEXT PRIMARY KEY, Description TEXT, DefaultValue TEXT, Value TEXT);
             INSERT INTO ServerProperty VALUES ('classes', 'disabled_classes', '', '', '20;63;65-67');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_pendragon', '', '', 'True');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_tuatha', '', '', 'True');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_stormforged', '', '', 'True');
         ";
         let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
         assert!(status.success());
@@ -483,12 +526,64 @@ mod tests {
     }
 
     #[test]
-    fn fetch_disabled_class_ids_is_empty_when_the_property_is_missing() {
+    fn fetch_disabled_class_ids_is_empty_when_every_property_is_missing() {
         let dir = std::env::temp_dir().join("daoc-class-editor-disabled-classes-missing-test");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("data")).unwrap();
         let db = dir.join("data/opendaoc.sqlite3.db");
-        let sql = "CREATE TABLE ServerProperty (Category TEXT, \"Key\" TEXT PRIMARY KEY, Description TEXT, DefaultValue TEXT, Value TEXT);";
+        let sql = "
+            CREATE TABLE ServerProperty (Category TEXT, \"Key\" TEXT PRIMARY KEY, Description TEXT, DefaultValue TEXT, Value TEXT);
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_pendragon', '', '', 'True');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_tuatha', '', '', 'True');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_stormforged', '', '', 'True');
+        ";
+        let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
+        assert!(status.success());
+
+        let cfg = test_cfg(&dir);
+        assert!(fetch_disabled_class_ids(&cfg).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetch_disabled_class_ids_disables_a_native_slot_class_whose_own_flag_is_off() {
+        // The real, reproduced case this exists for: Stormforged (70) isn't in DISABLED_CLASSES
+        // at all on Divided Realms - it's only actually blocked via its own enable_stormforged
+        // flag, confirmed directly in CharacterCreateRequestHandler.cs.
+        let dir = std::env::temp_dir().join("daoc-class-editor-disabled-classes-native-slot-off-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let db = dir.join("data/opendaoc.sqlite3.db");
+        let sql = "
+            CREATE TABLE ServerProperty (Category TEXT, \"Key\" TEXT PRIMARY KEY, Description TEXT, DefaultValue TEXT, Value TEXT);
+            INSERT INTO ServerProperty VALUES ('classes', 'disabled_classes', '', '', '20');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_pendragon', '', '', 'True');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_tuatha', '', '', 'True');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_stormforged', '', '', 'False');
+        ";
+        let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
+        assert!(status.success());
+
+        let cfg = test_cfg(&dir);
+        let ids = fetch_disabled_class_ids(&cfg).unwrap();
+        assert_eq!(ids, std::collections::HashSet::from([20, 70]), "{ids:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetch_disabled_class_ids_leaves_a_native_slot_class_enabled_when_its_flag_is_on() {
+        let dir = std::env::temp_dir().join("daoc-class-editor-disabled-classes-native-slot-on-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let db = dir.join("data/opendaoc.sqlite3.db");
+        let sql = "
+            CREATE TABLE ServerProperty (Category TEXT, \"Key\" TEXT PRIMARY KEY, Description TEXT, DefaultValue TEXT, Value TEXT);
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_pendragon', '', '', 'True');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_tuatha', '', '', 'True');
+            INSERT INTO ServerProperty VALUES ('classes', 'enable_stormforged', '', '', 'True');
+        ";
         let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
         assert!(status.success());
 
@@ -498,3 +593,4 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+

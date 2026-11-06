@@ -51,9 +51,28 @@ pub struct ClassInfo {
     /// deployed-classes list know which file to overwrite on redeploy.
     #[serde(default)]
     pub filename: Option<String>,
+    /// Set for a class whose native client slot has, in practice, been effectively replaced by a
+    /// different, actively-used class on this fork - e.g. "Drengr" for the retired Stormforged
+    /// ("Storm Sovereign," still vendored/kept around purely so its ID is never mistaken as
+    /// free). Not derivable from any server property - see `SLOT_SUCCESSORS`'s own doc comment.
+    /// Lets the UI show which class actually occupies this one's conceptual role instead of just
+    /// marking it unavailable with no further context.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
     /// Full original source, kept so the UI can show "what you're cloning" for reference.
     pub raw_source: String,
 }
+
+/// Classes whose native client slot has effectively been reused by a different, actively-
+/// implemented class, even though the two live at completely different numeric IDs entirely -
+/// e.g. the retired "Storm Sovereign" (`Stormforged`, id 70, kept vendored purely so the ID is
+/// never mistaken as free - see `ClassStormforged.cs`'s own file) was replaced in practice by
+/// `Drengr` (id 64) once that slot was retired off of 64 - see `ClassDrengr.cs`'s own comment on
+/// its history. This can't be derived from any server property (a dormant class being disabled
+/// doesn't say *what*, if anything, replaced it) - purely curated knowledge about this project's
+/// own history. Extend this as more native-slot classes get superseded by a real implementation
+/// in the future.
+const SLOT_SUCCESSORS: &[(i32, &str)] = &[(70, "Drengr")];
 
 fn capture1(re: &Regex, text: &str) -> Option<String> {
     re.captures(text).map(|c| c[1].to_string())
@@ -148,6 +167,7 @@ fn parse_fields(
         eligible_races,
         is_custom,
         filename: None,
+        superseded_by: None,
         raw_source,
     })
 }
@@ -387,6 +407,9 @@ fn finalize_classes(classes: &mut Vec<ClassInfo>, race_realms: &HashMap<String, 
                 class.realm = realm.clone();
             }
         }
+        if let Some((_, successor)) = SLOT_SUCCESSORS.iter().find(|(id, _)| *id == class.id) {
+            class.superseded_by = Some((*successor).to_string());
+        }
     }
     classes.sort_by(|a, b| a.realm.cmp(&b.realm).then(a.name.cmp(&b.name)));
 }
@@ -566,6 +589,27 @@ mod tests {
         assert!(names.contains(&"Sluaghbinder"), "Sluaghbinder missing");
         assert!(names.contains(&"Cleric"), "Cleric missing");
         assert!(names.contains(&"Warrior"), "Warrior missing");
+    }
+
+    #[test]
+    fn storm_sovereign_is_flagged_as_superseded_by_drengr_but_drengr_is_not_superseded() {
+        let classes = load_all_classes(&resources());
+        let storm_sovereign = classes
+            .iter()
+            .find(|c| c.id == 70)
+            .expect("the retired Stormforged (id 70) should still be vendored");
+        assert_eq!(storm_sovereign.name, "Storm Sovereign");
+        assert_eq!(storm_sovereign.superseded_by.as_deref(), Some("Drengr"));
+
+        let drengr = classes
+            .iter()
+            .find(|c| c.id == 64)
+            .expect("Drengr (id 64) should be vendored");
+        assert_eq!(drengr.name, "Drengr");
+        assert_eq!(
+            drengr.superseded_by, None,
+            "Drengr itself is the successor, not a superseded class"
+        );
     }
 
     #[test]

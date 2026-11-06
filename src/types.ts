@@ -21,6 +21,7 @@ export interface ClassInfo {
   effective_eligible_races: string[];
   is_custom: boolean;
   filename: string | null;
+  superseded_by: string | null;
   raw_source: string;
 }
 

@@ -88,8 +88,15 @@ deployment path was confirmed against a real running server after an early mix-u
   creation for regular players is marked **DISABLED**, read straight from the server's own
   `disabled_classes` property (parsed the same way the real server itself does, semicolon-
   separated IDs/ranges like `20;63;65-67` - the exact, real, reproduced bug this project once
-  found live, where an over-wide range accidentally also disabled Drengr). Selecting a class
-  shows its details and its own spells together, in one place:
+  found live, where an over-wide range accidentally also disabled Drengr) *and* any native-slot
+  class's own dedicated enable flag (e.g. `enable_stormforged`/`enable_pendragon`/`enable_tuatha`
+  - confirmed in the server's own source, some of these classes are gated by their own property
+  instead of `disabled_classes` at all). A class shown struck through with an arrow to another
+  class's name (e.g. ~~Storm Sovereign~~ → Drengr) is a retired native client slot that's been
+  superseded by that other, actively-used class entirely - never actually creatable regardless of
+  any setting (curated knowledge about this project's own class-vendoring history, not derived
+  from a property - see `classdata.rs`'s `SLOT_SUCCESSORS`). Selecting a class shows its details
+  and its own spells together, in one place:
   - **Clone this class** opens the clone wizard with it preselected as the source.
   - For a class *you* deployed (a **Cloned Class**), **Edit class file** opens it back up in the
     clone wizard with its name/ID/filename locked (so redeploying overwrites the same file, not a

@@ -138,8 +138,11 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
             see its details and its own spells, clone it as a starting point for a new class, or
             (for a class you deployed yourself) edit its file in place or delete it. A class
             marked <span className="badge-disabled">DISABLED</span> is currently blocked at
-            character creation for regular players (the server's own "disabled_classes" setting)
-            - a GM account can still create one anyway.
+            character creation for regular players (the server's own "disabled_classes"/feature-
+            flag settings) - a GM account can still create one anyway. A class shown struck
+            through with <span className="badge-disabled">→ [name]</span> is a retired native
+            client slot that's been superseded by that other, actively-used class entirely -
+            never actually creatable regardless of any setting.
           </p>
           <div className="actions">
             <button onClick={updateAllClassData} disabled={busy}>
@@ -174,8 +177,17 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
                         <tr key={c.class_ident}>
                           <td>{c.id}</td>
                           <td>
-                            {c.name}
-                            {disabled && <span className="badge-disabled"> DISABLED</span>}
+                            {c.superseded_by ? (
+                              <>
+                                <span style={{ textDecoration: "line-through" }}>{c.name}</span>{" "}
+                                <span className="badge-disabled">→ {c.superseded_by}</span>
+                              </>
+                            ) : (
+                              <>
+                                {c.name}
+                                {disabled && <span className="badge-disabled"> DISABLED</span>}
+                              </>
+                            )}
                           </td>
                           <td>{c.is_custom ? "Cloned Class" : "Standard Class"}</td>
                           <td>{c.profession ?? "-"}</td>
@@ -200,7 +212,12 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
         <div className="panel">
           <div className="actions" style={{ justifyContent: "space-between" }}>
             <h2 style={{ margin: 0 }}>
-              {selected.name} <span className="hint">(ID {selected.id})</span>
+              {selected.superseded_by ? (
+                <span style={{ textDecoration: "line-through" }}>{selected.name}</span>
+              ) : (
+                selected.name
+              )}{" "}
+              <span className="hint">(ID {selected.id})</span>
             </h2>
             <button onClick={() => setSelectedIdent(null)} disabled={busy}>
               Return to Class List
@@ -210,7 +227,11 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
             <strong>{selected.is_custom ? "Cloned Class" : "Standard Class"}</strong> - realm:{" "}
             {selected.realm}, profession: {selected.profession ?? "-"}, based on:{" "}
             {selected.base_class_name} ({selected.parent_ident})
-            {disabledClassIds.has(selected.id) && <span className="badge-disabled"> DISABLED</span>}
+            {selected.superseded_by ? (
+              <span className="badge-disabled"> → {selected.superseded_by}</span>
+            ) : (
+              disabledClassIds.has(selected.id) && <span className="badge-disabled"> DISABLED</span>
+            )}
           </p>
           <div className="actions">
             <button onClick={cloneThisClass} disabled={busy}>
