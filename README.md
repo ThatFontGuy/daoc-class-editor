@@ -135,6 +135,23 @@ deployment path was confirmed against a real running server after an early mix-u
   choose. Generates and deploys the trainer script, then spawns the actual NPC by deep-cloning an
   existing trainer's full stats/model/position (search by name, e.g. "Shadowblade Trainer", pick
   a location, done) - no hand-written C# or manual `Mob` row needed.
+- **Write safety, enforced, not just documented** - every single command that can change your live
+  server (deploying a class, editing specs/spells/styles, running SQL, spawning a trainer NPC, ...)
+  refuses outright unless **both** of these are true: the server is actually stopped (read straight
+  from `daoc-server.sh status`, not just a caution in this README), and a backup was taken within
+  the last 30 minutes. **Server connection**'s own "Write safety" section shows both at a glance
+  and has the two buttons that make this practical:
+  - **Backup Database** replaces this tool's own single managed snapshot of the live database
+    (via sqlite3's own `.backup`, safe even mid-WAL) - it isn't a history, every click overwrites
+    the one before it; keep your own longer-term backups separately if you want those.
+  - **Revert Database** restores that snapshot back over the live database (via `.restore`),
+    throwing away everything since - for when a change turns out to have broken something. Always
+    confirmed first; always refuses while the server is running, same as every other write.
+
+  The intended workflow: stop the server, **Backup Database**, make your changes, start the
+  server back up and test them, **Revert Database** if something broke. Since the backup's own
+  age is read fresh from the file every time (no separate tracking state to go stale on its own),
+  this stays accurate even across restarting this tool itself.
 
 **Not automated yet** (planned next, see the phased plan in project history/issues, or ask):
 - Starter equipment and a starting location aren't generated yet for a smooth first-level
@@ -146,7 +163,8 @@ deployment path was confirmed against a real running server after an early mix-u
   "Damage" party role unless you also touch the bot-side files in the server repo directly.
 - **Not safety-checked:** deleting a class currently in use by an existing character isn't
   blocked by this tool - it would leave that character in a broken state. Only delete classes
-  nothing has played yet, and stop the server first (same database-lock caution as deploying).
+  nothing has played yet (the server-stopped + recent-backup gate above still applies, but it
+  can't know whether a character is actually using the class).
 
 ## Setup
 

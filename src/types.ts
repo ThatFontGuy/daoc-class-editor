@@ -195,3 +195,16 @@ export interface TrainerNpcCandidate {
   model: number;
   level: number;
 }
+
+// Mirrors src-tauri/src/deploy.rs's BackupStatus, and lib.rs's WriteSafetyStatus.
+
+export interface BackupStatus {
+  exists: boolean;
+  age_seconds: number | null;
+  is_fresh: boolean;
+}
+
+export interface WriteSafetyStatus {
+  server_running: boolean;
+  backup: BackupStatus;
+}

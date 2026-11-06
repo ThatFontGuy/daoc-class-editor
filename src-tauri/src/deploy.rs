@@ -313,6 +313,184 @@ pub fn remote_server_control(cfg: &SshConfig, action: &str) -> Result<String, St
     run_command(cmd)
 }
 
+/// True if the server's own management script reports it's currently running - confirmed
+/// directly against `daoc-server.sh`'s own `status` case (`echo "running (pid $pid)"` or
+/// `echo "stopped"`, with no distinct exit code either way - this command always exits 0
+/// regardless, so the leading word of its own output is the only thing that actually
+/// distinguishes the two).
+pub fn is_server_running(cfg: &SshConfig) -> Result<bool, String> {
+    let output = remote_server_control(cfg, "status")?;
+    Ok(output.trim_start().starts_with("running"))
+}
+
+/// This tool's own single, disposable "last known good" checkpoint of the live database -
+/// always this exact filename, right next to the real one, replaced every time `backup_database`
+/// runs (never kept as a history of its own) - deliberately distinct from the various one-off,
+/// hand-made `.bak-<reason>-<date>` snapshots this project's own session history already has.
+fn backup_path(remote_server_dir: &str) -> PathBuf {
+    let db = Path::new(remote_server_dir).join("data/opendaoc.sqlite3.db");
+    let mut path = db.into_os_string();
+    path.push(".class-editor-backup");
+    PathBuf::from(path)
+}
+
+/// A write is only ever considered safe within this long after the last backup - half an hour,
+/// per the owner's own stated rule for this whole scheme: long enough to make one round of
+/// changes and test them in-game, short enough that an old backup is never mistaken for a
+/// current "known good" checkpoint.
+const FRESH_BACKUP_MAX_AGE_SECS: i64 = 30 * 60;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackupStatus {
+    pub exists: bool,
+    /// Seconds since the backup file was last written - `None` iff `exists` is false. Read
+    /// straight from the file's own mtime, so there's no separate tracking state that could ever
+    /// drift out of sync with what's actually on disk.
+    pub age_seconds: Option<i64>,
+    pub is_fresh: bool,
+}
+
+/// How long ago (if ever) `backup_database` last actually ran, read straight from the backup
+/// file's own mtime - the single source of truth both the write-safety gate and the UI's own
+/// "last backup: Xm ago" indicator rely on.
+pub fn backup_status(cfg: &SshConfig) -> Result<BackupStatus, String> {
+    let path = backup_path(&cfg.remote_server_dir);
+    let age_seconds = if is_local(cfg) {
+        match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(modified) => Some(
+                std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            ),
+            Err(_) => None,
+        }
+    } else {
+        // The age itself is computed entirely on the remote host (both "now" and the file's own
+        // mtime, in the same `date`/`stat` call) rather than comparing a remote mtime against
+        // this machine's own clock - a real, confirmed case this matters for: the actual server
+        // this project runs against has a clock about an hour off from the machine running this
+        // app, which would otherwise make a backup taken seconds ago look nearly an hour stale
+        // (or the reverse) purely from clock skew, nothing to do with how old it actually is.
+        // Linux `stat -c %Y` first, falling back to BSD/macOS `stat -f %m`.
+        let remote_cmd = format!(
+            "mtime=$(stat -c %Y '{path}' 2>/dev/null || stat -f %m '{path}' 2>/dev/null) && echo $(($(date +%s) - mtime))",
+            path = shell_escape(&path.to_string_lossy())
+        );
+        let mut cmd = Command::new("ssh");
+        cmd.args(ssh_base_args(cfg))
+            .arg(format!("{}@{}", cfg.user, cfg.host))
+            .arg(remote_cmd);
+        match run_command(cmd) {
+            Ok(out) => {
+                let trimmed = out.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    let age: i64 = trimmed
+                        .parse()
+                        .map_err(|_| format!("could not parse backup age: {trimmed}"))?;
+                    Some(age.max(0))
+                }
+            }
+            Err(_) => None,
+        }
+    };
+    Ok(backup_status_from_age(age_seconds))
+}
+
+/// Pure threshold logic, split out from `backup_status` so the exists/fresh boundary can be unit
+/// tested directly rather than by actually back-dating a real file's mtime.
+fn backup_status_from_age(age_seconds: Option<i64>) -> BackupStatus {
+    BackupStatus {
+        exists: age_seconds.is_some(),
+        age_seconds,
+        is_fresh: age_seconds.is_some_and(|age| age <= FRESH_BACKUP_MAX_AGE_SECS),
+    }
+}
+
+fn format_age(seconds: i64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    }
+}
+
+/// The single choke point every command that can actually change the live database or deploy a
+/// file must call first - refuses outright if the server is still running (writing underneath
+/// its own in-memory state risks corruption or a silent overwrite the moment it next saves), or
+/// if there's no sufficiently recent backup to fall back to if this particular edit turns out to
+/// be a mistake. Never bypassed by a different code path - this is the owner's own stated
+/// intent for this whole scheme: stop the server, back up, make changes, test, revert if
+/// something broke.
+pub fn ensure_safe_to_write(cfg: &SshConfig) -> Result<(), String> {
+    if is_server_running(cfg)? {
+        return Err(
+            "the server is still running - stop it first (Server connection tab), then make \
+             changes, so nothing is written underneath its own in-memory state"
+                .to_string(),
+        );
+    }
+    let status = backup_status(cfg)?;
+    match status.age_seconds {
+        None => Err(
+            "no backup found - click Backup Database first (Server connection tab) before \
+             making any changes"
+                .to_string(),
+        ),
+        Some(age) if !status.is_fresh => Err(format!(
+            "the last backup is {} old - click Backup Database again (Server connection tab) \
+             before making any changes (a backup older than {} minutes is no longer considered \
+             safe to rely on)",
+            format_age(age),
+            FRESH_BACKUP_MAX_AGE_SECS / 60
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Replaces this tool's own single managed backup with a fresh snapshot of the live database -
+/// always via sqlite3's own `.backup` command (safe even against a WAL-mode database with writes
+/// not yet checkpointed), never a plain file copy. Refuses outright if the server is still
+/// running - the same invariant every other write goes through, extended to backups too, so "I
+/// have a fresh backup" always genuinely means a clean snapshot of a database nothing was
+/// actively writing to, not just "a file that happens to be recent."
+pub fn backup_database(cfg: &SshConfig) -> Result<String, String> {
+    if is_server_running(cfg)? {
+        return Err(
+            "the server is still running - stop it first (Server connection tab), then back up"
+                .to_string(),
+        );
+    }
+    let backup = backup_path(&cfg.remote_server_dir);
+    run_remote_sql(cfg, &format!(".backup {}", backup.to_string_lossy()))?;
+    Ok(format!("backed up to {}", backup.display()))
+}
+
+/// Restores this tool's own single managed backup over the live database - via sqlite3's own
+/// `.restore` command, the exact inverse of `.backup` above. Refuses outright if the server is
+/// still running (restoring underneath its own open file would be at least as unsafe as writing
+/// to it directly), or if there's no backup to restore from at all. Deliberately does *not*
+/// require the backup to still be "fresh" the way a write does - reverting to whatever backup
+/// exists, however old, is exactly the point of this button, even if testing ran long past the
+/// usual half-hour window.
+pub fn revert_database(cfg: &SshConfig) -> Result<String, String> {
+    if is_server_running(cfg)? {
+        return Err(
+            "the server is still running - stop it first (Server connection tab), then revert"
+                .to_string(),
+        );
+    }
+    let status = backup_status(cfg)?;
+    if !status.exists {
+        return Err("no backup found to revert to - nothing to do".to_string());
+    }
+    let backup = backup_path(&cfg.remote_server_dir);
+    run_remote_sql(cfg, &format!(".restore {}", backup.to_string_lossy()))?;
+    Ok("reverted the live database to the last backup".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +613,157 @@ mod tests {
         let written = std::fs::read_to_string(tmp.join("bin/scripts/ClassTest.cs")).unwrap();
         assert_eq!(written, "// hi");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A fresh temp "server folder" whose `daoc-server.sh status` reports either
+    /// `"running (pid 1)"` or `"stopped"` depending on `running`, plus a real, seeded
+    /// `data/opendaoc.sqlite3.db` - everything `is_server_running`/`backup_database`/
+    /// `revert_database`/`ensure_safe_to_write` need to be exercised for real, locally.
+    fn setup_backup_test_server(name: &str, running: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("daoc-class-editor-backup-test-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let script = dir.join("daoc-server.sh");
+        let body = if running {
+            "#!/bin/sh\necho \"running (pid 1)\"\n"
+        } else {
+            "#!/bin/sh\necho stopped\n"
+        };
+        std::fs::write(&script, body).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let db = dir.join("data/opendaoc.sqlite3.db");
+        let status = Command::new("sqlite3")
+            .arg(&db)
+            .arg("CREATE TABLE T (V TEXT); INSERT INTO T VALUES ('original');")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        dir
+    }
+
+    #[test]
+    fn is_server_running_reads_the_scripts_own_status_output() {
+        let running_dir = setup_backup_test_server("is-running-true", true);
+        assert!(is_server_running(&cfg("", running_dir.to_str().unwrap())).unwrap());
+        std::fs::remove_dir_all(&running_dir).ok();
+
+        let stopped_dir = setup_backup_test_server("is-running-false", false);
+        assert!(!is_server_running(&cfg("", stopped_dir.to_str().unwrap())).unwrap());
+        std::fs::remove_dir_all(&stopped_dir).ok();
+    }
+
+    #[test]
+    fn backup_status_is_absent_until_a_backup_is_taken_then_fresh_afterward() {
+        let dir = setup_backup_test_server("status-lifecycle", false);
+        let c = cfg("", dir.to_str().unwrap());
+
+        let before = backup_status(&c).unwrap();
+        assert!(!before.exists);
+        assert_eq!(before.age_seconds, None);
+        assert!(!before.is_fresh);
+
+        backup_database(&c).unwrap();
+
+        let after = backup_status(&c).unwrap();
+        assert!(after.exists);
+        assert!(after.age_seconds.unwrap() < 5, "{after:?}");
+        assert!(after.is_fresh);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backup_database_refuses_while_the_server_is_running() {
+        let dir = setup_backup_test_server("backup-refuses-running", true);
+        let result = backup_database(&cfg("", dir.to_str().unwrap()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("still running"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_safe_to_write_refuses_when_the_server_is_running() {
+        let dir = setup_backup_test_server("gate-refuses-running", true);
+        let result = ensure_safe_to_write(&cfg("", dir.to_str().unwrap()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("still running"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_safe_to_write_refuses_with_no_backup_then_allows_one_right_after() {
+        let dir = setup_backup_test_server("gate-no-backup", false);
+        let c = cfg("", dir.to_str().unwrap());
+
+        let no_backup = ensure_safe_to_write(&c);
+        assert!(no_backup.is_err());
+        assert!(no_backup.unwrap_err().contains("no backup found"));
+
+        backup_database(&c).unwrap();
+        assert!(ensure_safe_to_write(&c).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backup_status_from_age_is_fresh_right_at_the_boundary_and_stale_just_past_it() {
+        let missing = backup_status_from_age(None);
+        assert!(!missing.exists);
+        assert!(!missing.is_fresh);
+
+        let fresh = backup_status_from_age(Some(FRESH_BACKUP_MAX_AGE_SECS));
+        assert!(fresh.exists);
+        assert!(fresh.is_fresh, "exactly the max age must still count as fresh");
+
+        let stale = backup_status_from_age(Some(FRESH_BACKUP_MAX_AGE_SECS + 1));
+        assert!(stale.exists);
+        assert!(!stale.is_fresh, "one second past the max age must count as stale");
+    }
+
+    #[test]
+    fn revert_database_restores_the_backup_over_live_changes() {
+        let dir = setup_backup_test_server("revert-restores", false);
+        let c = cfg("", dir.to_str().unwrap());
+        let db = dir.join("data/opendaoc.sqlite3.db");
+
+        backup_database(&c).unwrap();
+        // A "live" change made after the backup, that revert should undo.
+        let change = Command::new("sqlite3")
+            .arg(&db)
+            .arg("UPDATE T SET V = 'changed';")
+            .status()
+            .unwrap();
+        assert!(change.success());
+
+        revert_database(&c).unwrap();
+
+        let rows = Command::new("sqlite3")
+            .arg(&db)
+            .arg("SELECT V FROM T;")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&rows.stdout).trim(), "original");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn revert_database_refuses_with_no_backup_and_while_the_server_is_running() {
+        let dir = setup_backup_test_server("revert-refuses", false);
+        let c = cfg("", dir.to_str().unwrap());
+        let no_backup = revert_database(&c);
+        assert!(no_backup.is_err());
+        assert!(no_backup.unwrap_err().contains("no backup found"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let running_dir = setup_backup_test_server("revert-refuses-running", true);
+        let running_cfg = cfg("", running_dir.to_str().unwrap());
+        let result = revert_database(&running_cfg);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("still running"));
+        std::fs::remove_dir_all(&running_dir).ok();
     }
 }

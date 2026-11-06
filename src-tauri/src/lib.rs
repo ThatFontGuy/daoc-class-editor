@@ -107,6 +107,7 @@ fn spawn_trainer_npc(
     offset_x: i64,
     offset_y: i64,
 ) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     trainer::spawn_trainer_npc(
         &cfg,
         &reference_mob_id,
@@ -145,11 +146,13 @@ fn test_ssh_connection(cfg: SshConfig) -> Result<String, String> {
 
 #[tauri::command]
 fn deploy_class(cfg: SshConfig, filename: String, content: String) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     deploy::deploy_class_file(&cfg, &filename, &content)
 }
 
 #[tauri::command]
 fn run_remote_sql(cfg: SshConfig, sql: String) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     deploy::run_remote_sql(&cfg, &sql)
 }
 
@@ -190,6 +193,7 @@ fn apply_class_specs(
     assignments: Vec<SpecAssignment>,
     previous_keys: Vec<String>,
 ) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     specs::apply_class_specs(&cfg, new_class_id, &assignments, &previous_keys)
 }
 
@@ -199,6 +203,7 @@ fn clone_realm_abilities(
     source_class_id: i64,
     new_class_id: i64,
 ) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     realm_abilities::clone_realm_abilities(&cfg, source_class_id, new_class_id)
 }
 
@@ -215,6 +220,7 @@ fn migrate_class_to_owned_spells(
     class_id: i64,
 ) -> Result<String, String> {
     use tauri::Emitter;
+    deploy::ensure_safe_to_write(&cfg)?;
     specs::migrate_class_to_owned_spells(&cfg, class_id, |processed, total| {
         let _ = app.emit("migrate-progress", MigrateProgress { processed, total });
     })
@@ -247,6 +253,7 @@ fn update_line_spell_level(
     line_xspell_id: String,
     new_level: i64,
 ) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     specs::update_line_spell_level(&cfg, class_id, &line_xspell_id, new_level)
 }
 
@@ -258,6 +265,7 @@ fn update_style_level(
     style_id: i64,
     new_level: i64,
 ) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     specs::update_style_level(&cfg, class_id, &spec_key, style_id, new_level)
 }
 
@@ -267,6 +275,7 @@ fn update_owned_spell_fields(
     spell_id: i64,
     fields: std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     spell_ownership::update_owned_spell_fields(&cfg, spell_id, &fields)
 }
 
@@ -286,6 +295,7 @@ fn save_line_spell_fields(
     line_xspell_id: String,
     fields: std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<SaveLineSpellResult, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     let spell_id = specs::ensure_line_spell_owned(&cfg, class_id, &line_xspell_id)?;
     let message = if fields.is_empty() {
         format!("cloned spell {spell_id} independently for this class")
@@ -312,6 +322,7 @@ fn save_style_fields(
     style_id: i64,
     fields: std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<SaveStyleResult, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     let owned_style_id = specs::ensure_style_owned(&cfg, class_id, &spec_key, style_id)?;
     let message = if fields.is_empty() {
         format!("cloned style {owned_style_id} independently for this class")
@@ -338,6 +349,7 @@ fn delete_deployed_class(
     class_id: i64,
     cleanup_cloned_specs: bool,
 ) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
     deployed::delete_deployed_class(&cfg, &filename, class_id, cleanup_cloned_specs)
 }
 
@@ -350,6 +362,35 @@ fn list_disabled_class_ids(cfg: SshConfig) -> Result<Vec<i32>, String> {
     let mut ids: Vec<i32> = deployed::fetch_disabled_class_ids(&cfg)?.into_iter().collect();
     ids.sort_unstable();
     Ok(ids)
+}
+
+/// Both halves of the write-safety gate at once (server-running + backup freshness), in a single
+/// round trip - the Server connection tab's own persistent status indicator polls this, and the
+/// exact same two checks (`is_server_running`/`backup_status`) are what `ensure_safe_to_write`
+/// itself relies on for every mutating command, so what the UI shows is always consistent with
+/// what will actually be allowed.
+#[derive(serde::Serialize)]
+struct WriteSafetyStatus {
+    server_running: bool,
+    backup: deploy::BackupStatus,
+}
+
+#[tauri::command]
+fn write_safety_status(cfg: SshConfig) -> Result<WriteSafetyStatus, String> {
+    Ok(WriteSafetyStatus {
+        server_running: deploy::is_server_running(&cfg)?,
+        backup: deploy::backup_status(&cfg)?,
+    })
+}
+
+#[tauri::command]
+fn backup_database(cfg: SshConfig) -> Result<String, String> {
+    deploy::backup_database(&cfg)
+}
+
+#[tauri::command]
+fn revert_database(cfg: SshConfig) -> Result<String, String> {
+    deploy::revert_database(&cfg)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -391,6 +432,9 @@ pub fn run() {
             load_project_file,
             delete_deployed_class,
             list_disabled_class_ids,
+            write_safety_status,
+            backup_database,
+            revert_database,
             root_archetype,
             generate_trainer_code,
             find_trainer_npcs,

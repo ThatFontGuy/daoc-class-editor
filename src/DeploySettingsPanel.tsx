@@ -1,23 +1,59 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { SshConfig, emptySshConfig } from "./types";
+import { SshConfig, WriteSafetyStatus, emptySshConfig } from "./types";
+
+function formatAge(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
 
 export default function DeploySettingsPanel() {
   const [config, setConfig] = useState<SshConfig>(emptySshConfig);
   const [status, setStatus] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  const [writeSafety, setWriteSafety] = useState<WriteSafetyStatus | null>(null);
+  const [safetyError, setSafetyError] = useState("");
 
   const isLocal = config.host.trim() === "";
 
   useEffect(() => {
-    invoke<SshConfig>("load_ssh_config").then(setConfig);
+    invoke<SshConfig>("load_ssh_config").then((cfg) => {
+      setConfig(cfg);
+      refreshWriteSafety(cfg);
+    });
+    // Keeps the "last backup: Xm ago" display current without the user having to manually
+    // refresh - this is the one status the whole write-safety scheme depends on being trusted,
+    // so it should never look stale itself.
+    const interval = setInterval(() => {
+      setConfig((current) => {
+        refreshWriteSafety(current);
+        return current;
+      });
+    }, 60_000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function refreshWriteSafety(cfg: SshConfig) {
+    try {
+      const result = await invoke<WriteSafetyStatus>("write_safety_status", { cfg });
+      setWriteSafety(result);
+      setSafetyError("");
+    } catch (e) {
+      setWriteSafety(null);
+      setSafetyError(`Could not check server/backup status: ${e}`);
+    }
+  }
 
   async function save() {
     setBusy(true);
     try {
       await invoke("save_ssh_config", { cfg: config });
       setStatus("Saved.");
+      await refreshWriteSafety(config);
     } catch (e) {
       setStatus(`Error saving: ${e}`);
     } finally {
@@ -33,6 +69,43 @@ export default function DeploySettingsPanel() {
       setStatus(`OK:\n${result}`);
     } catch (e) {
       setStatus(`Failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function backupDatabase() {
+    setBusy(true);
+    setStatus("Backing up...");
+    try {
+      const result = await invoke<string>("backup_database", { cfg: config });
+      setStatus(result);
+      await refreshWriteSafety(config);
+    } catch (e) {
+      setStatus(`Backup failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revertDatabase() {
+    if (
+      !confirm(
+        "Revert the live database to the last backup?\n\n" +
+          "This throws away every change made since that backup was taken - there is no undo " +
+          "for this. Make sure the server is stopped first.",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setStatus("Reverting...");
+    try {
+      const result = await invoke<string>("revert_database", { cfg: config });
+      setStatus(result);
+      await refreshWriteSafety(config);
+    } catch (e) {
+      setStatus(`Revert failed: ${e}`);
     } finally {
       setBusy(false);
     }
@@ -106,6 +179,50 @@ export default function DeploySettingsPanel() {
         </button>
       </div>
       {status && <pre className="status">{status}</pre>}
+
+      <h3>Write safety</h3>
+      <p className="hint">
+        Every change this tool can make to your live server (deploying a class, editing specs/
+        spells/styles, running SQL, ...) is refused unless the server is stopped <em>and</em> a
+        backup was taken within the last 30 minutes - stop the server, back up, make your
+        changes, test them, and use <strong>Revert Database</strong> if something broke.{" "}
+        <strong>Backup Database</strong> always replaces the one backup this tool keeps (it isn't
+        a history) - any longer-term backups are still up to you.
+      </p>
+      {safetyError && <pre className="status">{safetyError}</pre>}
+      {writeSafety && (
+        <p>
+          Server:{" "}
+          {writeSafety.server_running ? (
+            <span className="badge-disabled">RUNNING - stop it to make changes</span>
+          ) : (
+            <strong>stopped</strong>
+          )}
+          {" · "}
+          Backup:{" "}
+          {!writeSafety.backup.exists ? (
+            <span className="badge-disabled">none yet - back up before making changes</span>
+          ) : writeSafety.backup.is_fresh ? (
+            <strong>{formatAge(writeSafety.backup.age_seconds ?? 0)} ago</strong>
+          ) : (
+            <span className="badge-disabled">
+              {formatAge(writeSafety.backup.age_seconds ?? 0)} ago - too old, back up again
+            </span>
+          )}
+        </p>
+      )}
+      <div className="actions">
+        <button onClick={backupDatabase} disabled={busy}>
+          Backup Database
+        </button>
+        <button
+          onClick={revertDatabase}
+          disabled={busy || !writeSafety?.backup.exists}
+          className="danger"
+        >
+          Revert Database
+        </button>
+      </div>
     </div>
   );
 }
