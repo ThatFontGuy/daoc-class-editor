@@ -60,7 +60,8 @@ deployment path was confirmed against a real running server after an early mix-u
   combat styles, and no weapon/armor proficiency at all. Every spec you add is always cloned -
   its own independent copy of the `Specialization` row, `SpellLine`(s), `LineXSpell` entries,
   `Style` rows, and `Style` procs (`StyleXSpell`) - which you can rename and edit separately (see
-  **Edit spells**, below). This used to also offer "reuse" (sharing the exact same spec, unchanged,
+  the **Spells** section of the **Classes** tab, below). This used to also offer "reuse" (sharing
+  the exact same spec, unchanged,
   with the class you cloned from), but that was removed after a real, reproduced bug: the server
   looks up whether a class can use a style by an *exact* class-ID match, so a reused spec whose
   styles happened to be locked to some other class (not even necessarily the class you cloned from
@@ -76,26 +77,38 @@ deployment path was confirmed against a real running server after an early mix-u
   be safely edited or deleted without ever touching a row some other class still depends on.
 - Deploying the generated file to your server's `bin/scripts/` folder and restarting it, over
   SSH or locally.
-- **Listing, editing, and deleting already-deployed classes** - a "Deployed classes" tab lists
-  every custom class currently in `bin/scripts/` (parsed straight from each file's
-  `[CharacterClass(id, "Name", "Base")]` attribute). **Edit** opens it back up in the clone wizard
-  with its name/ID/filename locked (so redeploying overwrites the same file, not a new one) and
-  every stat/profession/race field pre-filled with its *current* values, diffed against whatever
-  it actually subclasses - change what you want and redeploy. **Delete** removes the `.cs` file,
-  its `ClassXSpecialization` rows, and - optionally - every `Specialization`/`SpellLine`/
-  `LineXSpell`/`Style`/`StyleXSpell` row this tool cloned specifically for it (identified
-  precisely, because cloned spec keys always embed the owning class's ID, e.g. `earthshatter_64`),
-  plus every independently-owned `Spell` row that cleanup leaves orphaned. Handy for fixing or
-  cleaning up a clone that didn't work out while debugging, or just as routine housekeeping.
-- **Edit spells** - a tab listing every spell a given deployed class independently owns (cast
-  spells and style procs alike), editable field-by-field (damage, range, duration, icon, ...) with
-  no risk of also changing it for the class it was cloned from, or any other class. A class
-  deployed *before* this existed still has its spells pointing at shared, un-owned rows - use
-  **Migrate to independent spells** there first (safe to run more than once; anything already
-  independent is left alone) to convert it.
+- **One unified "Classes" tab, organized by realm** - every class in the game shows up here by
+  name: the ~63 vendored reference classes this tool ships data for, *and* anything you've
+  already deployed with it, each tagged with its real status (**Standard Class** vs **Cloned
+  Class**). No more needing to already know a class's raw numeric ID just to reach it (a real
+  limitation this used to have for a class compiled straight into the server, like a
+  native-client-slot class promoted out of `bin/scripts/` - see "Compatibility with Divided
+  Realms" below) - picking it by name here is enough. Selecting a class shows its details and its
+  own spells together, in one place:
+  - **Clone this class** opens the clone wizard with it preselected as the source.
+  - For a class *you* deployed (a **Cloned Class**), **Edit class file** opens it back up in the
+    clone wizard with its name/ID/filename locked (so redeploying overwrites the same file, not a
+    new one) and every stat/profession/race field pre-filled with its *current* values, diffed
+    against whatever it actually subclasses - change what you want and redeploy. **Delete class**
+    removes the `.cs` file, its `ClassXSpecialization` rows, and - optionally - every
+    `Specialization`/`SpellLine`/`LineXSpell`/`Style`/`StyleXSpell` row this tool cloned
+    specifically for it (identified precisely, because cloned spec keys always embed the owning
+    class's ID, e.g. `earthshatter_64`), plus every independently-owned `Spell` row that cleanup
+    leaves orphaned. Handy for fixing or cleaning up a clone that didn't work out while debugging,
+    or just as routine housekeeping.
+  - The **Spells** section below the class's own details lists every spell line one of its own
+    cloned specs owns, in level order, with an editable level per spell. Field-editing a spell's
+    values (damage, range, duration, icon, ...) clones it independently for this class the moment
+    you hit **Save**, if it isn't an independent copy already - no separate "Migrate" step to run
+    first, and no risk of also changing it for the class it was cloned from, or any other class.
+  - **Update All Class Data** re-reads the class list and the selected class's own spells fresh
+    from the server - handy after deploying or editing something outside this tool (e.g. directly
+    via the "run SQL" box, or a server restart that changed `bin/scripts/`).
 - **Save/Load a project** (top-right of the window) - designing a class is something you iterate
   into existence over multiple sessions, not finish in one sitting; a project file captures the
-  source class, every override, and every spec assignment so far.
+  source class, every override, and every spec assignment so far. This is unrelated to the
+  **Classes** tab above - it's purely a local file on your own computer, not anything live on the
+  server.
 - **A trainer, so the class is actually playable** (step 7, after deploying) - nothing beyond the
   game client's built-in class list is directly selectable at character creation, so (exactly
   like every real post-launch class, Sluaghbinder included) a player creates a character as the
@@ -135,9 +148,10 @@ deployment path was confirmed against a real running server after an early mix-u
    clones as its own independent copy, optionally rename each), override only what stat/race
    fields you want to change, generate,
    preview, and deploy. Use **Save**/**Load** (top-right) any time to pick this back up later.
-5. In **Edit spells**: pick a deployed class to field-edit its own independently-cloned spells
-   (damage, range, duration, icon, ...). A class deployed before this feature existed needs
-   **Migrate to independent spells** run once first.
+5. In **Classes**: pick any class, by realm, to see its details and field-edit its own
+   independently-cloned spells (damage, range, duration, icon, ...) - Save clones a spell for this
+   class automatically the first time it's actually touched, so there's no separate step to run
+   first.
 
 ## Where the reference data comes from
 
@@ -152,14 +166,15 @@ This fork of the server (used by its own `daoc-server.sh`/`bin/scripts/` layout,
 against its source) renumbered several native-client-slot classes: `Drengr` (64, the slot Midgard's
 retired `Stormforged` used to hold), `PendragonSovereign` (65), `DeathKnight` (66),
 `TuathaSovereign` (67), and dormant `Stormforged` (70, kept for save/client compatibility). All five
-are vendored here (`eCharacterClass.cs` and their own `playerclasses/`/`trainer/` files) so they're
-correctly known as taken IDs and can be picked as clone sources - **but unlike Nosferatu (still a
-loose `bin/scripts/` file there), none of the five show up in the "Deployed classes" tab or the
-Edit flow**, because they're compiled into that server's own `GameServer.dll`, not loose files in
-`bin/scripts/` - this tool's live scan only reads that folder. A custom class promoted out of
-`bin/scripts/` into compiled source this way needs a real server rebuild to edit, same as any other
-server-side code change; this tool can still generate it as a starting point, just not manage it
-live afterward.
+are vendored here (`eCharacterClass.cs` and their own `playerclasses/`/`trainer/` files), so they
+show up by name in the **Classes** tab like any other class - tagged **Standard Class** (not
+**Cloned Class**) since they're compiled into that server's own `GameServer.dll`, not loose files
+in `bin/scripts/`. That also means **Edit class file**/**Delete class** aren't offered for them
+(there's no file in `bin/scripts/` for this tool to manage) - a custom class promoted out of
+`bin/scripts/` into compiled source this way needs a real server rebuild to edit, same as any
+other server-side code change. Their own spec/spell data, however, lives entirely in the database
+like any class's does, so the **Spells** section still works on them exactly the same as any
+other class's own cloned specs.
 
 New custom classes always get an ID of **at least 100** (`classdata::next_free_id_from`), regardless
 of what the highest actually-visible ID is - deliberately well clear of every native slot a

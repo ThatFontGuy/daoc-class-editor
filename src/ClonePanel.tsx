@@ -7,11 +7,13 @@ import {
   CloneRequest,
   KnownOptions,
   LineSpellRow,
+  REALM_ORDER,
   SpecAssignmentPayload,
   SpecSpellLineRow,
   SpecializationRow,
   SshConfig,
   emptySshConfig,
+  leafClassesOf,
 } from "./types";
 import {
   Overrides,
@@ -98,17 +100,10 @@ export default function ClonePanel() {
   // showing/editing the wrong class even though the values below it were correct.
   const activeClassIdent = isEditing ? project.newIdent : project.sourceClassIdent;
 
-  // The base archetype files (ClassFighter, ClassAcolyte, ClassViking, ...) parse into ClassInfo
-  // records too (classdata.rs needs them for the EligibleRaces inheritance fallback), but they
-  // aren't playable classes themselves - only concrete classes that subclass one of them are
-  // valid clone sources. "CharacterClassBase" is the literal C# parent every archetype file
-  // itself extends, so anything still pointing at it directly is an archetype, not a leaf class.
-  const leafClasses = useMemo(
-    () => classes.filter((c) => c.parent_ident !== "CharacterClassBase"),
-    [classes],
-  );
+  // Only concrete classes that subclass one of the base archetype files are valid clone sources
+  // - see `leafClassesOf`'s own doc comment in types.ts.
+  const leafClasses = useMemo(() => leafClassesOf(classes), [classes]);
 
-  const REALM_ORDER = ["Albion", "Midgard", "Hibernia"];
   const realms = useMemo(() => {
     const present = new Set(leafClasses.map((c) => c.realm));
     return REALM_ORDER.filter((r) => present.has(r)).concat(

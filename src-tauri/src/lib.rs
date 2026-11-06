@@ -249,6 +249,31 @@ fn update_owned_spell_fields(
     spell_ownership::update_owned_spell_fields(&cfg, spell_id, &fields)
 }
 
+#[derive(serde::Serialize)]
+struct SaveLineSpellResult {
+    spell_id: i64,
+    message: String,
+}
+
+/// Clones a spell on the spot (if it isn't an independent copy for this class already) and
+/// applies the field edits in one call - this is what lets the "Edit spells" section's own Save
+/// button work immediately on any spell, with no separate "Migrate" step needed first.
+#[tauri::command]
+fn save_line_spell_fields(
+    cfg: SshConfig,
+    class_id: i64,
+    line_xspell_id: String,
+    fields: std::collections::HashMap<String, serde_json::Value>,
+) -> Result<SaveLineSpellResult, String> {
+    let spell_id = specs::ensure_line_spell_owned(&cfg, class_id, &line_xspell_id)?;
+    let message = if fields.is_empty() {
+        format!("cloned spell {spell_id} independently for this class")
+    } else {
+        spell_ownership::update_owned_spell_fields(&cfg, spell_id, &fields)?
+    };
+    Ok(SaveLineSpellResult { spell_id, message })
+}
+
 #[tauri::command]
 fn save_project_file(path: String, json: String) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("could not write {path}: {e}"))
@@ -299,6 +324,7 @@ pub fn run() {
             list_owned_spell_lines,
             update_line_spell_level,
             update_owned_spell_fields,
+            save_line_spell_fields,
             save_project_file,
             load_project_file,
             delete_deployed_class,

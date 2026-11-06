@@ -348,6 +348,11 @@ button.danger {
   flex: none;
 }
 
+.spec-table tr.active-row {
+  background: #6b8afd22;
+}
+
+
 .spell-line-customizer {
   padding: 0.5rem;
   background: #8881;

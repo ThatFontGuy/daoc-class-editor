@@ -29,6 +29,19 @@ export interface ClassListResult {
   deployed_error: string | null;
 }
 
+/** Shared realm display order - Albion/Midgard/Hibernia first, anything else (shouldn't normally
+ * happen) appended alphabetically after. */
+export const REALM_ORDER = ["Albion", "Midgard", "Hibernia"];
+
+/** The base archetype files (ClassFighter, ClassAcolyte, ClassViking, ...) parse into ClassInfo
+ * records too (classdata.rs needs them for the EligibleRaces inheritance fallback), but they
+ * aren't playable classes themselves - only concrete classes that subclass one of them are real,
+ * pickable classes. "CharacterClassBase" is the literal C# parent every archetype file itself
+ * extends, so anything still pointing at it directly is an archetype, not a leaf class. */
+export function leafClassesOf(classes: ClassInfo[]): ClassInfo[] {
+  return classes.filter((c) => c.parent_ident !== "CharacterClassBase");
+}
+
 export interface KnownOptions {
   stats: string[];
   races: string[];

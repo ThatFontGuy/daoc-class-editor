@@ -1,14 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import {
-  ClassInfo,
-  ClassListResult,
-  OwnedSpellInLine,
-  SpellLineGroup,
-  SshConfig,
-  emptySshConfig,
-} from "./types";
+import { OwnedSpellInLine, SpellLineGroup, SshConfig } from "./types";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
@@ -35,16 +27,17 @@ const EDITABLE_FIELD_HINTS = [
   "Message2",
 ];
 
-interface MigrateProgress {
-  processed: number;
-  total: number;
-}
-
-export default function SpellEditorPanel() {
-  const [sshConfig, setSshConfig] = useState<SshConfig>(emptySshConfig);
-  const [deployedClasses, setDeployedClasses] = useState<ClassInfo[]>([]);
-  const [selectedClassId, setSelectedClassId] = useState<number | null>(null);
-  const [manualClassId, setManualClassId] = useState("");
+/** Embeddable "this class's own spells, grouped by spell line" section - used by
+ * ClassBrowserPanel's class-detail view. Field-editing a spell clones it independently for this
+ * class on the spot the moment it's actually saved (see `save_line_spell_fields` on the Rust
+ * side) - there's no separate "Migrate" step to run first; Save always just works. */
+export default function ClassSpellsSection({
+  sshConfig,
+  classId,
+}: {
+  sshConfig: SshConfig;
+  classId: number;
+}) {
   const [spellLines, setSpellLines] = useState<SpellLineGroup[] | null>(null);
   const [editingSpellId, setEditingSpellId] = useState<number | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
@@ -53,66 +46,24 @@ export default function SpellEditorPanel() {
   const [levelDrafts, setLevelDrafts] = useState<Record<string, string>>({});
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
-  const [migrateProgress, setMigrateProgress] = useState<MigrateProgress | null>(null);
-  // A real, reported problem this guards against: a slow operation (migrating dozens of spells,
-  // each its own round-trip) with no obvious visual feedback invited a double-click on the same
-  // button, racing two overlapping calls against each other. `busy` (React state) is what
-  // visually disables the button, but a very fast second click can still slip in before a
-  // re-render actually paints that - a plain ref, checked and set synchronously the instant a
-  // handler starts, closes that gap completely regardless of render timing.
+  // A real, reported problem this guards against: a slow operation with no obvious visual
+  // feedback invited a double-click on the same button, racing two overlapping calls against
+  // each other. `busy` (React state) is what visually disables the button, but a very fast
+  // second click can still slip in before a re-render actually paints that - a plain ref,
+  // checked and set synchronously the instant a handler starts, closes that gap completely
+  // regardless of render timing.
   const busyRef = useRef(false);
 
   useEffect(() => {
-    invoke<SshConfig>("load_ssh_config").then(setSshConfig);
-  }, []);
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [classId]);
 
-  useEffect(() => {
-    const unlisten = listen<MigrateProgress>("migrate-progress", (event) => {
-      setMigrateProgress(event.payload);
-    });
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, []);
-
-  async function refreshClasses() {
-    if (busyRef.current) return;
-    busyRef.current = true;
-    setBusy(true);
-    setStatus("Loading deployed classes...");
-    try {
-      const result = await invoke<ClassListResult>("list_classes_with_deployed", {
-        cfg: sshConfig,
-      });
-      setDeployedClasses(result.classes.filter((c) => c.is_custom));
-      setStatus(result.deployed_error ?? "");
-    } catch (e) {
-      setStatus(`Could not list deployed classes: ${e}`);
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
-    }
-  }
-
-  async function loadSpellLines(classId: number) {
+  async function load() {
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
     setStatus("Loading this class's own spell lines...");
-    try {
-      await loadSpellLinesInner(classId);
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
-    }
-  }
-
-  // Shared body for both the class picker and the post-migrate/post-save refresh - callers that
-  // already hold the busy guard for their own whole operation (migrate, save) call this directly
-  // instead of `loadSpellLines`, which would otherwise treat itself as a re-entrant call and
-  // no-op.
-  async function loadSpellLinesInner(classId: number) {
-    setSelectedClassId(classId);
     setEditingSpellId(null);
     setLevelDrafts({});
     try {
@@ -124,33 +75,15 @@ export default function SpellEditorPanel() {
       const totalSpells = groups.reduce((sum, g) => sum + g.spells.length, 0);
       setStatus(
         totalSpells === 0
-          ? "No spell lines found yet for this class's own specs - use Migrate below if it was " +
-              "cloned before spell editing existed, or redeploy/edit its specs to create some."
+          ? "This class has no independently-clonable spec lines of its own yet - only specs " +
+              "whose key ends in this class's own ID (created via Clone this class's spec-line " +
+              "step) show up here."
           : "",
       );
     } catch (e) {
       setStatus(`Could not load spell lines: ${e}`);
       setSpellLines(null);
-    }
-  }
-
-  async function migrate() {
-    if (selectedClassId == null || busyRef.current) return;
-    busyRef.current = true;
-    setBusy(true);
-    setMigrateProgress({ processed: 0, total: 0 });
-    setStatus("Migrating this class's spells to independent copies - please wait, this can take a while...");
-    try {
-      const result = await invoke<string>("migrate_class_to_owned_spells", {
-        cfg: sshConfig,
-        classId: selectedClassId,
-      });
-      setStatus(result);
-      await loadSpellLinesInner(selectedClassId);
-    } catch (e) {
-      setStatus(`Migration failed: ${e}`);
     } finally {
-      setMigrateProgress(null);
       busyRef.current = false;
       setBusy(false);
     }
@@ -185,16 +118,17 @@ export default function SpellEditorPanel() {
     }
     busyRef.current = true;
     setBusy(true);
-    setStatus("Saving...");
+    setStatus(item.is_owned ? "Saving..." : "Cloning this spell for this class, then saving...");
     try {
-      const result = await invoke<string>("update_owned_spell_fields", {
+      const result = await invoke<{ spell_id: number; message: string }>("save_line_spell_fields", {
         cfg: sshConfig,
-        spellId: item.spell_id,
+        classId,
+        lineXspellId: item.line_xspell_id,
         fields,
       });
-      setStatus(result);
+      setStatus(result.message);
       setEditingSpellId(null);
-      if (selectedClassId != null) await loadSpellLinesInner(selectedClassId);
+      await load();
     } catch (e) {
       setStatus(`Save failed: ${e}`);
     } finally {
@@ -204,7 +138,7 @@ export default function SpellEditorPanel() {
   }
 
   async function saveLevel(item: OwnedSpellInLine) {
-    if (selectedClassId == null || busyRef.current) return;
+    if (busyRef.current) return;
     const draftValue = levelDrafts[item.line_xspell_id];
     const newLevel = Number(draftValue);
     if (draftValue === undefined || draftValue.trim() === "" || Number.isNaN(newLevel)) {
@@ -217,12 +151,12 @@ export default function SpellEditorPanel() {
     try {
       const result = await invoke<string>("update_line_spell_level", {
         cfg: sshConfig,
-        classId: selectedClassId,
+        classId,
         lineXspellId: item.line_xspell_id,
         newLevel,
       });
       setStatus(result);
-      await loadSpellLinesInner(selectedClassId);
+      await load();
     } catch (e) {
       setStatus(`Save failed: ${e}`);
     } finally {
@@ -235,78 +169,15 @@ export default function SpellEditorPanel() {
 
   return (
     <div className="panel">
-      <h2>Edit spells</h2>
+      <h3>Spells</h3>
       <p className="hint">
-        Grouped by this class's own spell lines (e.g. Drengr's three real lines), in level order,
-        so a spec's actual progression is visible - the level shown is editable too. Field-editing
-        a spell's own values (damage, range, duration, ...) only ever touches a spell this tool
-        has <strong>independently cloned</strong> for this class - never one still shared with the
-        class it was cloned from (or any other class). A class cloned before this feature existed
-        needs a one-time <strong>Migrate</strong> first to convert its spells to independent
-        copies.
+        Grouped by this class's own spell lines, in level order, so a spec's actual progression is
+        visible - the level shown is editable too. Editing a spell's own field values (damage,
+        range, duration, ...) independently clones it for this class the moment you hit{" "}
+        <strong>Save</strong>, if it isn't an independent copy yet - it never touches a spell still
+        shared with the class it was cloned from (or any other class).
       </p>
-      <p className="hint">
-        <strong>Stop the server before editing</strong> - same database-lock caution as deploying
-        or editing a class.
-      </p>
-      <div className="actions">
-        <button onClick={refreshClasses} disabled={busy}>
-          Refresh deployed classes
-        </button>
-        <select
-          value={selectedClassId ?? ""}
-          onChange={(e) => e.target.value && loadSpellLines(Number(e.target.value))}
-          disabled={busy || deployedClasses.length === 0}
-        >
-          <option value="">Pick a deployed class...</option>
-          {deployedClasses.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name} (id {c.id})
-            </option>
-          ))}
-        </select>
-        {/* The dropdown above only lists classes found by scanning loose bin/scripts/ files - a
-            class compiled directly into the server (a native client-slot class like a promoted
-            Drengr) never shows up there at all, even though its spec/spell data (and this whole
-            feature) lives entirely in the database, not in a script file. This lets any class ID
-            be reached directly regardless of how it's deployed. */}
-        <label
-          className="field"
-          style={{ display: "inline-flex", flexDirection: "row", gap: "0.3rem", alignItems: "center" }}
-        >
-          <span>or class ID:</span>
-          <input
-            type="number"
-            value={manualClassId}
-            onChange={(e) => setManualClassId(e.target.value)}
-            style={{ width: "5em" }}
-            disabled={busy}
-          />
-        </label>
-        <button
-          onClick={() => manualClassId.trim() !== "" && loadSpellLines(Number(manualClassId))}
-          disabled={busy || manualClassId.trim() === ""}
-        >
-          Load
-        </button>
-        {selectedClassId != null && (
-          <button onClick={migrate} disabled={busy}>
-            {busy && migrateProgress ? "Migrating..." : "Migrate to independent spells"}
-          </button>
-        )}
-      </div>
-      {selectedClassId != null && <p className="hint">Currently editing class {selectedClassId}.</p>}
-      {migrateProgress && (
-        <div className="progress-indicator">
-          <progress value={migrateProgress.processed} max={Math.max(migrateProgress.total, 1)} />
-          <span>
-            {migrateProgress.total === 0
-              ? "Checking what needs migrating..."
-              : `${migrateProgress.processed} / ${migrateProgress.total} spell(s)/proc(s) migrated - please wait, do not click again`}
-          </span>
-        </div>
-      )}
-      {busy && !migrateProgress && <p className="hint">⏳ Working - please wait...</p>}
+      {busy && <p className="hint">⏳ Working - please wait...</p>}
       {status && <pre className="status">{status}</pre>}
 
       {spellLines && totalSpells > 0 && (
@@ -322,9 +193,9 @@ export default function SpellEditorPanel() {
               );
               return (
                 <div key={group.line_key}>
-                  <h3>
+                  <h4>
                     {group.line_name} <span className="hint">({group.spec_key})</span>
-                  </h3>
+                  </h4>
                   <table className="spec-table">
                     <thead>
                       <tr>
@@ -365,7 +236,7 @@ export default function SpellEditorPanel() {
                               <td>
                                 {String(item.fields.Name ?? "")}
                                 {!item.is_owned && (
-                                  <span className="hint"> (not yet migrated - read-only)</span>
+                                  <span className="hint"> (shared - saving clones it for this class)</span>
                                 )}
                               </td>
                               <td>
@@ -379,10 +250,7 @@ export default function SpellEditorPanel() {
                                     </button>
                                   </>
                                 ) : (
-                                  <button
-                                    onClick={() => startEditing(item)}
-                                    disabled={busy || !item.is_owned}
-                                  >
+                                  <button onClick={() => startEditing(item)} disabled={busy}>
                                     Edit
                                   </button>
                                 )}

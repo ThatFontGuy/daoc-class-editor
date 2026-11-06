@@ -1019,6 +1019,64 @@ pub fn update_line_spell_level(
     Ok(format!("updated level to {new_level}"))
 }
 
+/// Returns `class_id`'s own independent clone of whatever `Spell` row `line_xspell_id` currently
+/// points at, cloning it on the spot (and repointing that `LineXSpell` row at the clone) if it
+/// isn't an independent copy already - a no-op, returning the same ID unchanged, if it already is
+/// one. Refuses outright if the line doesn't actually belong to one of `class_id`'s own cloned
+/// specs (same `_<class_id>` suffix check as `update_line_spell_level`), so this can never be
+/// used to clone/edit a spell by way of a spec it doesn't actually own.
+///
+/// This is what lets field-editing a spell "just work" straight from the editing UI's own Save
+/// button, one spell at a time, the moment it's actually touched - instead of requiring a
+/// separate, explicit, whole-class `migrate_class_to_owned_spells` pass up front before any
+/// editing could happen at all.
+pub fn ensure_line_spell_owned(
+    cfg: &SshConfig,
+    class_id: i64,
+    line_xspell_id: &str,
+) -> Result<i64, String> {
+    let line_id_q = sql_quote(line_xspell_id);
+    let owning = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT SpellLine.Spec AS OwnerSpec, LineXSpell.SpellID AS CurrentSpellID \
+             FROM LineXSpell JOIN SpellLine ON SpellLine.KeyName = LineXSpell.LineName \
+             WHERE LineXSpell.LineXSpell_ID = '{line_id_q}';"
+        ),
+    )?;
+    let row = owning.first().ok_or_else(|| {
+        format!("no LineXSpell row found for '{line_xspell_id}' - it may have been removed")
+    })?;
+    let spec_key = str_field(row, "OwnerSpec");
+    let suffix = format!("_{class_id}");
+    if !spec_key.ends_with(&suffix) {
+        return Err(format!(
+            "'{spec_key}' is not a spec owned specifically by class {class_id} - refusing to \
+             clone/edit its spell (it may still be shared with other classes)"
+        ));
+    }
+    let current_spell_id = int_field(row, "CurrentSpellID");
+
+    ensure_tracking_table(cfg)?;
+    let already_owned = run_remote_sql_json(
+        cfg,
+        &format!("SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {current_spell_id};"),
+    )?;
+    if !already_owned.is_empty() {
+        return Ok(current_spell_id);
+    }
+
+    let mut cloner = SpellCloner::new(cfg, class_id)?;
+    let new_spell_id = cloner.clone_for_class(cfg, current_spell_id)?;
+    run_remote_sql(
+        cfg,
+        &format!(
+            "UPDATE LineXSpell SET SpellID = {new_spell_id} WHERE LineXSpell_ID = '{line_id_q}';"
+        ),
+    )?;
+    Ok(new_spell_id)
+}
+
 /// Fully removes whatever an exact spec KeyName already owns (Specialization, its SpellLine(s)
 /// and their LineXSpell entries, Style, SpecXAbility, and its ClassXSpecialization assignment) -
 /// everything clone_spec creates - if it exists at all. A clean no-op otherwise. Lets
@@ -2244,6 +2302,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(int_field(&unchanged[0], "Level"), 1, "the level must be untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_line_spell_owned_clones_on_first_call_and_is_idempotent_after() {
+        // This is the "Save just works" building block - no separate whole-class Migrate pass
+        // needed before a single spell can be field-edited. Simulates a class cloned *before*
+        // `clone_spec` started independently cloning spells itself (same legacy shape used by
+        // `migrate_converts_an_old_classs_spells_and_procs_to_independent_clones`), since
+        // `apply_class_specs` today always clones spells up front already - this needs a line
+        // still genuinely un-owned to exercise the on-demand clone path at all.
+        let dir = setup_test_db("ensure-owned-first-call");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+                VALUES ('frostbolt_tree_64', 'Frostbolt Tree', 'Cold damage spells', 100, NULL, 0);
+             INSERT INTO ClassXSpecialization VALUES (64, 'frostbolt_tree_64', 0);
+             INSERT INTO SpellLine VALUES ('frostbolt_tree_64_smite_base', 'Frostbolt Spells', 'frostbolt_tree_64', 0, 64);
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('frostbolt_tree_64_smite_base', 9001, 1, 'old-line-1');",
+        )
+        .unwrap();
+
+        let groups = list_owned_spell_lines(&cfg, 64).unwrap();
+        let line = &groups[0].spells[0];
+        assert!(!line.is_owned, "a legacy line's spell starts out un-owned");
+        let original_spell_id = line.spell_id;
+        assert_eq!(original_spell_id, 9001);
+
+        let first_call_id = ensure_line_spell_owned(&cfg, 64, &line.line_xspell_id).unwrap();
+        assert_ne!(
+            first_call_id, original_spell_id,
+            "cloning must produce a brand-new SpellID, not reuse the shared one"
+        );
+
+        let groups_after = list_owned_spell_lines(&cfg, 64).unwrap();
+        let line_after = &groups_after[0].spells[0];
+        assert!(line_after.is_owned);
+        assert_eq!(line_after.spell_id, first_call_id);
+
+        // The original, shared spell must be completely untouched.
+        let original = run_remote_sql_json(&cfg, "SELECT SpellID FROM Spell WHERE SpellID = 9001;").unwrap();
+        assert_eq!(original.len(), 1, "the original shared spell must survive untouched");
+
+        // Calling it again once already owned must be a pure no-op - same ID, no second clone.
+        let second_call_id = ensure_line_spell_owned(&cfg, 64, &line.line_xspell_id).unwrap();
+        assert_eq!(second_call_id, first_call_id);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_line_spell_owned_refuses_a_plain_shared_specs_line() {
+        let dir = setup_test_db("ensure-owned-refuses-shared");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 1);\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('slash_base', 9001, 1, 'shared-line-1');",
+        )
+        .unwrap();
+
+        let result = ensure_line_spell_owned(&cfg, 64, "shared-line-1");
+        assert!(result.is_err(), "cloning via a shared spec's own line must be refused");
+
+        let unchanged = run_remote_sql_json(
+            &cfg,
+            "SELECT SpellID FROM LineXSpell WHERE LineXSpell_ID = 'shared-line-1';",
+        )
+        .unwrap();
+        assert_eq!(int_field(&unchanged[0], "SpellID"), 9001, "must be untouched");
 
         std::fs::remove_dir_all(&dir).ok();
     }
