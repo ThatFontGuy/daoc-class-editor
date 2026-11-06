@@ -9,8 +9,17 @@ import { ClassSpecSummary, OwnedSpellInLine, SpellLineGroup, SshConfig, StyleInf
 // Order here is the actual display order (Name first, then the longer text fields), not just a
 // membership check - see PRIMARY_SPELL_FIELDS below for which of these get their own full-width
 // row above the compact grid of the rest.
+//
+// "Type" (not "SpellType" - a real, found bug this list used to have, silently hiding the single
+// most mechanically important field on every spell) is the actual dispatch key: the server parses
+// it straight into the `eSpellType` enum and looks up whichever `[SpellHandler(eSpellType.X)]`-
+// tagged class implements that category (e.g. "SpeedDecrease" -> SpeedDecreaseSpellHandler.cs) to
+// actually apply the spell's effect - everything else here (Value, Duration, Range, ...) is just
+// a parameter fed into whatever handler Type selects. ClientEffect/Icon, by contrast, are purely
+// cosmetic - they only pick what the client shows, never anything about what the spell does.
 const EDITABLE_SPELL_FIELD_HINTS = [
   "Name",
+  "Type",
   "Description",
   "Message1",
   "Message2",
@@ -27,13 +36,12 @@ const EDITABLE_SPELL_FIELD_HINTS = [
   "Icon",
   "ClientEffect",
   "Target",
-  "SpellType",
 ];
 
 // These get their own full-width row, in this order, above the compact grid every other editable
-// field is packed into - the ones actually likely to hold a longer string, and (Name) the one
-// field worth always seeing first regardless.
-const PRIMARY_SPELL_FIELDS = ["Name", "Description", "Message1", "Message2"];
+// field is packed into - the ones actually likely to hold a longer string, plus (Name, Type) the
+// two fields worth always seeing first regardless of their own length.
+const PRIMARY_SPELL_FIELDS = ["Name", "Type", "Description", "Message1", "Message2"];
 
 // Same idea as EDITABLE_SPELL_FIELD_HINTS, but for a Style (combat skill) row - the fields
 // someone tuning a melee style is actually likely to want to change. SpecLevelRequirement is
