@@ -51,9 +51,6 @@ function Header({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
     <header>
       <h1>DAoC Class Editor</h1>
       <nav>
-        <button className={tab === "clone" ? "active" : ""} onClick={() => setTab("clone")}>
-          Clone a class
-        </button>
         <button className={tab === "classes" ? "active" : ""} onClick={() => setTab("classes")}>
           Classes
         </button>

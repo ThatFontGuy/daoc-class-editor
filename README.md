@@ -144,13 +144,16 @@ deployment path was confirmed against a real running server after an early mix-u
      your existing SSH keys/agent, nothing is sent anywhere except directly to your own server.
    - Either way, also set the start/stop script's filename (`daoc-server.sh` by default, but may
      be renamed).
-4. In **Clone a class**: pick a source class, name your new one, assign its spec lines (each
-   clones as its own independent copy, optionally rename each), override only what stat/race
-   fields you want to change, generate,
-   preview, and deploy. Use **Save**/**Load** (top-right) any time to pick this back up later.
-5. In **Classes**: pick any class, by realm, to see its details and field-edit its own
-   independently-cloned spells (damage, range, duration, icon, ...) - Save clones a spell for this
-   class automatically the first time it's actually touched, so there's no separate step to run
+4. In **Classes**: pick any class, by realm, to see its details and its own spells. Click
+   **Clone this class** to open the clone wizard with it preselected as the source - name your
+   new class, assign its spec lines (each clones as its own independent copy, optionally rename
+   each), override only what stat/race fields you want to change, generate, preview, and deploy.
+   Use **Save**/**Load** (top-right) any time to pick this back up later. (For a class you
+   already deployed yourself, **Edit class file** opens the same wizard pre-filled with its
+   current values instead.)
+5. Back in **Classes**, field-edit a class's own independently-cloned spells (damage, range,
+   duration, icon, ...) - Save clones a spell for this class automatically the first time it's
+   actually touched, so there's no separate step to run
    first.
 
 ## Where the reference data comes from
