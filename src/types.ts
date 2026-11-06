@@ -148,6 +148,25 @@ export interface SpellLineGroup {
   spells: OwnedSpellInLine[];
 }
 
+// Mirrors specs.rs's ClassSpecSummary - the "Classes" tab's own two summary lists (combat specs
+// vs. spells), before the user picks which one to actually expand and edit.
+export interface ClassSpecSummary {
+  key_name: string;
+  name: string;
+  level_acquired: number;
+  is_owned: boolean;
+  has_styles: boolean;
+  has_spell_lines: boolean;
+}
+
+// Mirrors specs.rs's StyleInfo - a combat style (melee skill) row, the Style-table equivalent of
+// OwnedSpellInLine/OwnedSpellRow above.
+export interface StyleInfo {
+  style_id: number;
+  is_owned: boolean;
+  fields: OwnedSpellRow;
+}
+
 // Mirrors src-tauri/src/trainer.rs.
 
 export interface TrainerRequest {

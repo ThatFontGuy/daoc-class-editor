@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ClassInfo, ClassListResult, REALM_ORDER, SshConfig, emptySshConfig, leafClassesOf } from "./types";
 import { buildEditingProjectState, useProject } from "./ProjectContext";
-import ClassSpellsSection from "./ClassSpellsSection";
+import ClassSpecsSection from "./ClassSpecsSection";
 
 /** The single, unified "every class in the game" browser - replaces the old separate "Deployed
  * classes" and "Edit spells" tabs. Lists every class (the ~63 vendored reference classes this
@@ -228,7 +228,7 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
             using yet.
           </p>
           {status && <pre className="status">{status}</pre>}
-          <ClassSpellsSection
+          <ClassSpecsSection
             key={`${selected.id}-${spellsRefreshKey}`}
             sshConfig={sshConfig}
             classId={selected.id}

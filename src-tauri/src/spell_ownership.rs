@@ -70,7 +70,7 @@ pub fn ensure_tracking_table(cfg: &SshConfig) -> Result<(), String> {
 /// message text, etc. - and genuinely varies between forks), the same "rediscover the real
 /// schema, don't assume it" approach this project's sibling class-ID renumbering tool already
 /// uses for its own column auditing.
-fn columns_excluding_pk(cfg: &SshConfig, table: &str) -> Result<Vec<String>, String> {
+pub(crate) fn columns_excluding_pk(cfg: &SshConfig, table: &str) -> Result<Vec<String>, String> {
     let rows = run_remote_sql_json(cfg, &format!("PRAGMA table_info({table});"))?;
     let cols: Vec<String> = rows
         .iter()

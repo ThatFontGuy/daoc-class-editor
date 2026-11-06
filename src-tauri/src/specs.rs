@@ -51,8 +51,8 @@
 
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use crate::spell_ownership::{
-    SpellCloner, clone_style_with_fresh_id, delete_owned_spells, delete_style_procs_for_styles,
-    ensure_tracking_table, style_x_spell_guid_column,
+    SpellCloner, clone_style_with_fresh_id, columns_excluding_pk, delete_owned_spells,
+    delete_style_procs_for_styles, ensure_tracking_table, sql_literal, style_x_spell_guid_column,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -373,6 +373,85 @@ pub fn list_class_specs(cfg: &SshConfig, class_id: i64) -> Result<Vec<ClassSpecR
             spec_key_name: str_field(r, "SpecKeyName"),
             spec_name: str_field(r, "SpecName"),
             level_acquired: int_field(r, "LevelAcquired"),
+        })
+        .collect())
+}
+
+/// One spec a class currently has assigned, enriched for the "Classes" tab's own two summary
+/// lists (combat specs vs. spell specs) - just enough to decide which group(s) to show it in and
+/// what status badge to give it, with no spell/style row data of its own (that's fetched
+/// separately, only for whichever one the user actually expands - see `list_spell_lines_for_spec`/
+/// `list_styles_for_spec`). A spec with both styles and spell lines (rare, but possible) shows up
+/// in both groups.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassSpecSummary {
+    pub key_name: String,
+    pub name: String,
+    pub level_acquired: i64,
+    /// Already safe to field-edit without this class triggering a clone first - either this
+    /// class's own `_<class_id>`-suffixed spec, or (for a mechanic-locked spec like "Staff" - see
+    /// `NEVER_CLONE_SPECS` - whose `Specialization`/`SpellLine` can never be renamed) one whose
+    /// combat styles are already locked specifically to this class's own `ClassId`, the same way
+    /// the real base game's own data already is for most classes that have always trained it.
+    pub is_owned: bool,
+    pub has_styles: bool,
+    pub has_spell_lines: bool,
+}
+
+/// Every spec `class_id` has assigned, each flagged with whether it grants combat styles, spell
+/// lines, both, or (rare) neither, and whether it's already safe to edit without this class
+/// triggering a clone first - the source list for the "Classes" tab's own "Combat specs"/"Spells"
+/// summaries, so the user sees a plain list of names before choosing what to actually expand and
+/// edit, rather than every spec's full data dumped on screen at once regardless of what they came
+/// here to change.
+pub fn list_class_spec_summaries(cfg: &SshConfig, class_id: i64) -> Result<Vec<ClassSpecSummary>, String> {
+    let specs = list_class_specs(cfg, class_id)?;
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys_csv = specs
+        .iter()
+        .map(|s| format!("'{}'", sql_quote(&s.spec_key_name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let line_keys: std::collections::HashSet<String> =
+        run_remote_sql_json(cfg, &format!("SELECT DISTINCT Spec FROM SpellLine WHERE Spec IN ({keys_csv});"))?
+            .iter()
+            .map(|r| str_field(r, "Spec"))
+            .collect();
+
+    // One query covers both "does this spec have any styles at all" and "does this class already
+    // have its own locked copies" - no need for a second round trip just to re-check ClassId.
+    let style_rows = run_remote_sql_json(
+        cfg,
+        &format!("SELECT DISTINCT SpecKeyName, ClassId FROM Style WHERE SpecKeyName IN ({keys_csv});"),
+    )?;
+    let mut style_keys = std::collections::HashSet::new();
+    let mut own_style_keys = std::collections::HashSet::new();
+    for row in &style_rows {
+        let key = str_field(row, "SpecKeyName");
+        if int_field(row, "ClassId") == class_id {
+            own_style_keys.insert(key.clone());
+        }
+        style_keys.insert(key);
+    }
+
+    let suffix = format!("_{class_id}");
+    Ok(specs
+        .into_iter()
+        .map(|s| {
+            let has_styles = style_keys.contains(&s.spec_key_name);
+            let has_spell_lines = line_keys.contains(&s.spec_key_name);
+            let is_owned = s.spec_key_name.ends_with(&suffix) || own_style_keys.contains(&s.spec_key_name);
+            ClassSpecSummary {
+                key_name: s.spec_key_name,
+                name: s.spec_name,
+                level_acquired: s.level_acquired,
+                is_owned,
+                has_styles,
+                has_spell_lines,
+            }
         })
         .collect())
 }
@@ -856,13 +935,12 @@ pub fn migrate_class_to_owned_spells(
     ))
 }
 
-/// One spell's own row on a particular spell line, for the "Edit spells" UI's own grouped view -
-/// the level it becomes available at (editable, see `update_line_spell_level`) plus its full
-/// `Spell` row (dynamic fields - see `spell_ownership`'s own doc comment for why this is a raw
-/// JSON object rather than a fixed struct). `is_owned` tells the UI whether this spell is
-/// actually safe to field-edit yet (an independent clone) or still needs `migrate_class_to_owned_
-/// spells` run first - a class's own LineXSpell rows can legitimately still point at shared,
-/// un-owned spells if migration hasn't happened yet.
+/// One spell's own row on a particular spell line, for the "Classes" tab's own spell-editing
+/// section - the level it becomes available at (editable, see `update_line_spell_level`) plus its
+/// full `Spell` row (dynamic fields - see `spell_ownership`'s own doc comment for why this is a
+/// raw JSON object rather than a fixed struct). `is_owned` tells the UI whether this spell is
+/// already an independent clone, or still shared with whatever class/spec it came from - editing
+/// it (Save) clones it for this class on the spot either way, so this is purely informational.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnedSpellInLine {
     pub line_xspell_id: String,
@@ -872,9 +950,8 @@ pub struct OwnedSpellInLine {
     pub fields: Value,
 }
 
-/// One `SpellLine` belonging to one of a class's own cloned specs, with every spell on it (in
-/// level order) - the real "how does this class's own spec actually progress" shape the flat,
-/// line-blind spell list this UI used to show couldn't express at all.
+/// One `SpellLine` belonging to a spec, with every spell on it (in level order) - the real "how
+/// does this spec actually progress" shape a flat, line-blind spell list couldn't express at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpellLineGroup {
     pub spec_key: String,
@@ -883,35 +960,19 @@ pub struct SpellLineGroup {
     pub spells: Vec<OwnedSpellInLine>,
 }
 
-/// Every spell line belonging to a spec `class_id` itself owns (the same `_<class_id>` suffix
-/// convention used throughout this module), each with its own spells in level order - lets the
-/// editing UI show a class's real spec progression (e.g. Drengr's three real lines) instead of
-/// one flat, unordered list with no indication of which line a spell belongs to or what level it
-/// unlocks at.
-pub fn list_owned_spell_lines(cfg: &SshConfig, class_id: i64) -> Result<Vec<SpellLineGroup>, String> {
+/// Every spell line belonging to `spec_key` - a class's own cloned spec, or a stock/shared one
+/// it's merely been assigned (any class with this spec in its spec list can call this, not just
+/// one that's already cloned it) - each with its own spells in level order. Scoped to one spec at
+/// a time (rather than a whole class's worth up front) so expanding just the one spec a user
+/// actually wants to look at in the "Classes" tab doesn't also have to fetch every other spec's
+/// own data nobody asked to see yet.
+pub fn list_spell_lines_for_spec(cfg: &SshConfig, spec_key: &str) -> Result<Vec<SpellLineGroup>, String> {
     ensure_tracking_table(cfg)?;
 
-    let suffix = format!("_{class_id}");
-    let assigned = run_remote_sql_json(
-        cfg,
-        &format!("SELECT SpecKeyName FROM ClassXSpecialization WHERE ClassID = {class_id};"),
-    )?;
-    let owned_keys: Vec<String> = assigned
-        .iter()
-        .map(|r| str_field(r, "SpecKeyName"))
-        .filter(|k| k.ends_with(&suffix))
-        .collect();
-    if owned_keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let keys_csv = owned_keys
-        .iter()
-        .map(|k| format!("'{}'", sql_quote(k)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let spec_key_q = sql_quote(spec_key);
     let lines = run_remote_sql_json(
         cfg,
-        &format!("SELECT KeyName, Name, Spec FROM SpellLine WHERE Spec IN ({keys_csv});"),
+        &format!("SELECT KeyName, Name, Spec FROM SpellLine WHERE Spec = '{spec_key_q}';"),
     )?;
     let mut groups: Vec<SpellLineGroup> = lines
         .iter()
@@ -978,68 +1039,81 @@ pub fn list_owned_spell_lines(cfg: &SshConfig, class_id: i64) -> Result<Vec<Spel
     Ok(groups)
 }
 
-/// Changes the level a spell line's own spell becomes available at (`LineXSpell.Level`) - safe
-/// regardless of whether the spell itself has been migrated to an independent clone yet, since
-/// unlike `Spell` rows, a `LineXSpell` row is never shared across classes to begin with (each
-/// class's own clone already gets its own uniquely-keyed `SpellLine`/`LineXSpell` rows, even
-/// before this tool started independently cloning the underlying `Spell` data too). Still refuses
-/// outright if the line in question doesn't actually belong to one of `class_id`'s own cloned
-/// specs (the same `_<class_id>` suffix check used throughout this module) - a plain/shared
-/// spec's own line (e.g. "Sword") is never touched, since that one genuinely is shared with other
-/// classes.
-pub fn update_line_spell_level(
-    cfg: &SshConfig,
-    class_id: i64,
-    line_xspell_id: &str,
-    new_level: i64,
-) -> Result<String, String> {
-    let line_id_q = sql_quote(line_xspell_id);
-    let owning_spec = run_remote_sql_json(
-        cfg,
-        &format!(
-            "SELECT SpellLine.Spec FROM LineXSpell JOIN SpellLine ON SpellLine.KeyName = LineXSpell.LineName \
-             WHERE LineXSpell.LineXSpell_ID = '{line_id_q}';"
-        ),
-    )?;
-    let spec_key = owning_spec
-        .first()
-        .map(|r| str_field(r, "Spec"))
-        .unwrap_or_default();
-    let suffix = format!("_{class_id}");
-    if !spec_key.ends_with(&suffix) {
+/// Promotes a spec `class_id` currently has assigned under a plain/shared key (e.g. a stock
+/// class's own real "Rejuvenation") into its own independent `_<class_id>`-suffixed clone -
+/// `clone_spec` under the hood, so everything it owns (SpellLine(s)/LineXSpell, Style,
+/// SpecXAbility, and every spell/proc) comes along fully independent in one step, exactly like a
+/// spec assigned through the clone wizard already does. Only this one spec's own
+/// `ClassXSpecialization` row is touched - unlike `apply_class_specs` (which always resubmits a
+/// class's *entire* spec list), this never risks cloning or touching any of the class's other,
+/// unrelated specs just because one of them was edited.
+///
+/// A no-op, returning `spec_key` unchanged, if it's already this class's own clone. Refuses
+/// outright for a mechanic-locked spec (`NEVER_CLONE_SPECS`, e.g. "Staff") - its `Specialization`/
+/// `SpellLine` can never safely be renamed at all (see that list's own doc comment); only its
+/// combat styles can ever be made class-specific, via `ensure_style_owned` instead.
+fn ensure_class_owns_spec(cfg: &SshConfig, class_id: i64, spec_key: &str) -> Result<String, String> {
+    if resolve_uncloneable_spec(spec_key, class_id).is_some() {
         return Err(format!(
-            "'{spec_key}' is not a spec owned specifically by class {class_id} - refusing to \
-             change its level (it may still be shared with other classes)"
+            "'{spec_key}' is one of this server's mechanic-locked specs - its own Specialization/\
+             SpellLine can't be independently cloned or renamed (see NEVER_CLONE_SPECS); only its \
+             combat styles can ever be made class-specific"
         ));
     }
+    let suffix = format!("_{class_id}");
+    if spec_key.ends_with(&suffix) {
+        return Ok(spec_key.to_string());
+    }
+
+    let spec_key_q = sql_quote(spec_key);
+    let rows = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT s.Name AS Name, cxs.LevelAcquired AS LevelAcquired FROM ClassXSpecialization cxs \
+             JOIN Specialization s ON s.KeyName = cxs.SpecKeyName \
+             WHERE cxs.ClassID = {class_id} AND cxs.SpecKeyName = '{spec_key_q}';"
+        ),
+    )?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("class {class_id} does not have '{spec_key}' assigned"))?;
+    let name = str_field(row, "Name");
+
+    let new_key = format!("{spec_key}_{class_id}");
+    delete_existing_clone(cfg, &new_key)?;
+    clone_spec(cfg, spec_key, &new_key, &name, class_id, &[])?;
+
+    let new_key_q = sql_quote(&new_key);
     run_remote_sql(
         cfg,
-        &format!("UPDATE LineXSpell SET Level = {new_level} WHERE LineXSpell_ID = '{line_id_q}';"),
+        &format!(
+            "UPDATE ClassXSpecialization SET SpecKeyName = '{new_key_q}' \
+             WHERE ClassID = {class_id} AND SpecKeyName = '{spec_key_q}';"
+        ),
     )?;
-    Ok(format!("updated level to {new_level}"))
+    Ok(new_key)
 }
 
-/// Returns `class_id`'s own independent clone of whatever `Spell` row `line_xspell_id` currently
-/// points at, cloning it on the spot (and repointing that `LineXSpell` row at the clone) if it
-/// isn't an independent copy already - a no-op, returning the same ID unchanged, if it already is
-/// one. Refuses outright if the line doesn't actually belong to one of `class_id`'s own cloned
-/// specs (same `_<class_id>` suffix check as `update_line_spell_level`), so this can never be
-/// used to clone/edit a spell by way of a spec it doesn't actually own.
+/// Returns (new `LineXSpell_ID`, new `SpellID`) for whatever `line_xspell_id` now maps to, after
+/// ensuring both the spec it belongs to and this one spell within it are independently owned by
+/// `class_id` - a no-op (echoes the same IDs straight back) if everything already was. This is
+/// the shared "clone on first touch" building block both field-editing (Save) and level-editing
+/// use, so neither needs a separate step run first, for a custom class's own spec *or* a stock
+/// class's real, previously-shared one alike (e.g. a class never cloned through this tool at all,
+/// like Friar's own real "Rejuvenation").
 ///
-/// This is what lets field-editing a spell "just work" straight from the editing UI's own Save
-/// button, one spell at a time, the moment it's actually touched - instead of requiring a
-/// separate, explicit, whole-class `migrate_class_to_owned_spells` pass up front before any
-/// editing could happen at all.
-pub fn ensure_line_spell_owned(
-    cfg: &SshConfig,
-    class_id: i64,
-    line_xspell_id: &str,
-) -> Result<i64, String> {
+/// When the owning spec isn't owned yet, promoting it (`ensure_class_owns_spec`) deep-clones its
+/// whole SpellLine/LineXSpell set under a deterministic new line key
+/// (`"{new_spec_key}_{old_line_key}"` - exactly what `clone_spec` itself always names a cloned
+/// line), so the spell's own new identity can be found again by its unchanged `Level` within that
+/// new line, with no fuzzy matching needed.
+fn ensure_line_owned(cfg: &SshConfig, class_id: i64, line_xspell_id: &str) -> Result<(String, i64), String> {
     let line_id_q = sql_quote(line_xspell_id);
     let owning = run_remote_sql_json(
         cfg,
         &format!(
-            "SELECT SpellLine.Spec AS OwnerSpec, LineXSpell.SpellID AS CurrentSpellID \
+            "SELECT SpellLine.Spec AS OwnerSpec, SpellLine.KeyName AS OwnerLineKey, \
+             LineXSpell.Level AS OwnerLevel, LineXSpell.SpellID AS CurrentSpellID \
              FROM LineXSpell JOIN SpellLine ON SpellLine.KeyName = LineXSpell.LineName \
              WHERE LineXSpell.LineXSpell_ID = '{line_id_q}';"
         ),
@@ -1048,33 +1122,250 @@ pub fn ensure_line_spell_owned(
         format!("no LineXSpell row found for '{line_xspell_id}' - it may have been removed")
     })?;
     let spec_key = str_field(row, "OwnerSpec");
-    let suffix = format!("_{class_id}");
-    if !spec_key.ends_with(&suffix) {
-        return Err(format!(
-            "'{spec_key}' is not a spec owned specifically by class {class_id} - refusing to \
-             clone/edit its spell (it may still be shared with other classes)"
-        ));
-    }
+    let old_line_key = str_field(row, "OwnerLineKey");
+    let level = int_field(row, "OwnerLevel");
     let current_spell_id = int_field(row, "CurrentSpellID");
 
-    ensure_tracking_table(cfg)?;
-    let already_owned = run_remote_sql_json(
-        cfg,
-        &format!("SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {current_spell_id};"),
-    )?;
-    if !already_owned.is_empty() {
-        return Ok(current_spell_id);
+    let suffix = format!("_{class_id}");
+    if spec_key.ends_with(&suffix) {
+        // The spec itself is already owned - only the individual spell might still need its own
+        // clone (e.g. a class cloned before independent spell cloning existed).
+        ensure_tracking_table(cfg)?;
+        let already_owned = run_remote_sql_json(
+            cfg,
+            &format!("SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {current_spell_id};"),
+        )?;
+        if !already_owned.is_empty() {
+            return Ok((line_xspell_id.to_string(), current_spell_id));
+        }
+        let mut cloner = SpellCloner::new(cfg, class_id)?;
+        let new_spell_id = cloner.clone_for_class(cfg, current_spell_id)?;
+        run_remote_sql(
+            cfg,
+            &format!(
+                "UPDATE LineXSpell SET SpellID = {new_spell_id} WHERE LineXSpell_ID = '{line_id_q}';"
+            ),
+        )?;
+        return Ok((line_xspell_id.to_string(), new_spell_id));
     }
 
-    let mut cloner = SpellCloner::new(cfg, class_id)?;
-    let new_spell_id = cloner.clone_for_class(cfg, current_spell_id)?;
-    run_remote_sql(
+    let new_key = ensure_class_owns_spec(cfg, class_id, &spec_key)?;
+    let new_line_key = format!("{new_key}_{old_line_key}");
+    let new_line_key_q = sql_quote(&new_line_key);
+    let new_rows = run_remote_sql_json(
         cfg,
         &format!(
-            "UPDATE LineXSpell SET SpellID = {new_spell_id} WHERE LineXSpell_ID = '{line_id_q}';"
+            "SELECT LineXSpell_ID, SpellID FROM LineXSpell WHERE LineName = '{new_line_key_q}' AND Level = {level};"
         ),
     )?;
-    Ok(new_spell_id)
+    let new_row = new_rows.first().ok_or_else(|| {
+        "could not find this class's own copy of this spell line after cloning its spec".to_string()
+    })?;
+    Ok((str_field(new_row, "LineXSpell_ID"), int_field(new_row, "SpellID")))
+}
+
+/// Changes the level a spell line's own spell becomes available at (`LineXSpell.Level`), cloning
+/// the owning spec (and this spell) for this class first if either isn't independently owned yet
+/// - see `ensure_line_owned`'s own doc comment.
+pub fn update_line_spell_level(
+    cfg: &SshConfig,
+    class_id: i64,
+    line_xspell_id: &str,
+    new_level: i64,
+) -> Result<String, String> {
+    let (owned_line_id, _) = ensure_line_owned(cfg, class_id, line_xspell_id)?;
+    let owned_line_id_q = sql_quote(&owned_line_id);
+    run_remote_sql(
+        cfg,
+        &format!("UPDATE LineXSpell SET Level = {new_level} WHERE LineXSpell_ID = '{owned_line_id_q}';"),
+    )?;
+    Ok(format!("updated level to {new_level}"))
+}
+
+/// Returns `class_id`'s own independent clone of whatever `Spell` row `line_xspell_id` currently
+/// points at, cloning it (and, if needed, its whole owning spec too) on the spot if it isn't an
+/// independent copy already - a no-op, returning the same ID unchanged, if it already is one. See
+/// `ensure_line_owned`'s own doc comment for exactly how.
+///
+/// This is what lets field-editing a spell "just work" straight from the editing UI's own Save
+/// button, one spell at a time, the moment it's actually touched - instead of requiring a
+/// separate, explicit, whole-class `migrate_class_to_owned_spells` pass (or, for a stock class
+/// that was never cloned through this tool at all, no path to independent editing whatsoever) run
+/// first.
+pub fn ensure_line_spell_owned(cfg: &SshConfig, class_id: i64, line_xspell_id: &str) -> Result<i64, String> {
+    let (_, spell_id) = ensure_line_owned(cfg, class_id, line_xspell_id)?;
+    Ok(spell_id)
+}
+
+/// One `Style` (combat skill) row for the "Classes" tab's own combat-spec editing section -
+/// mirrors `OwnedSpellInLine`'s shape/reasoning (dynamic fields, an informational `is_owned`
+/// flag - editing always clones/grants on Save regardless).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StyleInfo {
+    pub style_id: i64,
+    pub is_owned: bool,
+    pub fields: Value,
+}
+
+/// Every combat style `spec_key` currently grants that's actually visible to `class_id`, mirroring
+/// the real server's own `Specialization.GetStylesForLiving` lookup priority (see
+/// `grant_styles_for_uncloneable_spec`'s own doc comment for the citation): this class's own
+/// `ClassId`-locked copies if it has any, else the spec's `ClassId = 0` universal bucket if one
+/// exists, else - purely for display, so there's still something to look at and a basis to clone
+/// from - whatever styles exist under this spec at all (collapsed to one row per logical style,
+/// same `GROUP BY Name, SpecLevelRequirement` `grant_styles_for_uncloneable_spec` already uses,
+/// since an uncloneable spec's styles otherwise show up once per other real class that already
+/// has its own locked copy).
+pub fn list_styles_for_spec(cfg: &SshConfig, class_id: i64, spec_key: &str) -> Result<Vec<StyleInfo>, String> {
+    let spec_key_q = sql_quote(spec_key);
+    let to_infos = |rows: Vec<Value>, is_owned: bool| -> Vec<StyleInfo> {
+        rows.into_iter()
+            .map(|r| StyleInfo {
+                style_id: int_field(&r, "StyleID"),
+                is_owned,
+                fields: r,
+            })
+            .collect()
+    };
+
+    let own = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT * FROM Style WHERE SpecKeyName = '{spec_key_q}' AND ClassId = {class_id} \
+             ORDER BY SpecLevelRequirement;"
+        ),
+    )?;
+    if !own.is_empty() {
+        return Ok(to_infos(own, true));
+    }
+
+    let universal = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT * FROM Style WHERE SpecKeyName = '{spec_key_q}' AND ClassId = 0 \
+             ORDER BY SpecLevelRequirement;"
+        ),
+    )?;
+    if !universal.is_empty() {
+        return Ok(to_infos(universal, false));
+    }
+
+    let any = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT * FROM Style WHERE SpecKeyName = '{spec_key_q}' GROUP BY Name, SpecLevelRequirement \
+             ORDER BY SpecLevelRequirement;"
+        ),
+    )?;
+    Ok(to_infos(any, false))
+}
+
+/// Returns `class_id`'s own, exclusively-locked copy of `style_id` - granting/cloning it on the
+/// spot if it isn't one already, by whichever mechanism actually applies:
+/// - a mechanic-locked spec (`NEVER_CLONE_SPECS`, e.g. "Staff") grants this class its own
+///   `ClassId`-locked copies of the spec's styles (`grant_styles_for_uncloneable_spec`) without
+///   ever touching the spec/spell-line itself;
+/// - any other spec instead promotes the *whole* spec to an independent clone
+///   (`ensure_class_owns_spec`), which brings its own already-independent styles along with it.
+///
+/// Either way, `style_id` itself usually isn't reusable afterward (both paths can create a whole
+/// new set of rows under a new identity) - the newly-owned row is re-found by matching this
+/// class's own copy of the same `Name`/`SpecLevelRequirement`, the same matching `clone_spec`'s
+/// own style-grouping already relies on.
+pub fn ensure_style_owned(
+    cfg: &SshConfig,
+    class_id: i64,
+    spec_key: &str,
+    style_id: i64,
+) -> Result<i64, String> {
+    let rows = run_remote_sql_json(
+        cfg,
+        &format!("SELECT Name, SpecLevelRequirement, ClassId FROM Style WHERE StyleID = {style_id};"),
+    )?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("style {style_id} not found"))?;
+    if int_field(row, "ClassId") == class_id {
+        return Ok(style_id);
+    }
+    let name = str_field(row, "Name");
+    let level = int_field(row, "SpecLevelRequirement");
+
+    let owning_key = if let Some(real_name) = resolve_uncloneable_spec(spec_key, class_id) {
+        grant_styles_for_uncloneable_spec(cfg, real_name, class_id)?;
+        real_name.to_string()
+    } else {
+        ensure_class_owns_spec(cfg, class_id, spec_key)?
+    };
+
+    let owning_key_q = sql_quote(&owning_key);
+    let name_q = sql_quote(&name);
+    let new_rows = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT StyleID FROM Style WHERE SpecKeyName = '{owning_key_q}' AND ClassId = {class_id} \
+             AND Name = '{name_q}' AND SpecLevelRequirement = {level};"
+        ),
+    )?;
+    new_rows
+        .first()
+        .map(|r| int_field(r, "StyleID"))
+        .ok_or_else(|| format!("could not find this class's own copy of '{name}' after cloning/granting its spec"))
+}
+
+/// Updates one or more fields on a `Style` row this class already exclusively owns (`ClassId =
+/// class_id`) - refuses outright otherwise, the same safety stance `spell_ownership::
+/// update_owned_spell_fields` takes for `Spell`: never let the editing UI reach a row still
+/// shared with another class, even by mistake. Call `ensure_style_owned` first to get an owned
+/// `style_id` to pass in here.
+pub fn update_style_fields(
+    cfg: &SshConfig,
+    class_id: i64,
+    style_id: i64,
+    fields: &std::collections::HashMap<String, Value>,
+) -> Result<String, String> {
+    if fields.is_empty() {
+        return Ok("nothing to update".to_string());
+    }
+    let owned = run_remote_sql_json(
+        cfg,
+        &format!("SELECT 1 FROM Style WHERE StyleID = {style_id} AND ClassId = {class_id};"),
+    )?;
+    if owned.is_empty() {
+        return Err(format!(
+            "style {style_id} is not locked specifically to class {class_id} - refusing to edit it \
+             directly, since it may still be shared with other classes"
+        ));
+    }
+    let real_columns = columns_excluding_pk(cfg, "Style")?;
+    let mut set_clauses = Vec::new();
+    for (field, value) in fields {
+        if !real_columns.iter().any(|c| c == field) {
+            return Err(format!("'{field}' is not a real column on Style - refusing to update it"));
+        }
+        set_clauses.push(format!("{field} = {}", sql_literal(value)));
+    }
+    let sql = format!("UPDATE Style SET {} WHERE StyleID = {style_id};", set_clauses.join(", "));
+    run_remote_sql(cfg, &sql)?;
+    Ok(format!("updated {} field(s) on style {style_id}", fields.len()))
+}
+
+/// Changes the level a style becomes available at (`Style.SpecLevelRequirement`), granting/
+/// cloning this class its own copy first if it doesn't have one yet - see `ensure_style_owned`'s
+/// own doc comment.
+pub fn update_style_level(
+    cfg: &SshConfig,
+    class_id: i64,
+    spec_key: &str,
+    style_id: i64,
+    new_level: i64,
+) -> Result<String, String> {
+    let owned_style_id = ensure_style_owned(cfg, class_id, spec_key, style_id)?;
+    run_remote_sql(
+        cfg,
+        &format!("UPDATE Style SET SpecLevelRequirement = {new_level} WHERE StyleID = {owned_style_id};"),
+    )?;
+    Ok(format!("updated level to {new_level}"))
 }
 
 /// Fully removes whatever an exact spec KeyName already owns (Specialization, its SpellLine(s)
@@ -2219,8 +2510,8 @@ mod tests {
     }
 
     #[test]
-    fn list_owned_spell_lines_groups_spells_by_line_in_level_order() {
-        let dir = setup_test_db("list-owned-lines");
+    fn list_spell_lines_for_spec_returns_a_specs_own_lines_in_level_order() {
+        let dir = setup_test_db("list-lines-for-spec");
         let cfg = test_cfg(&dir);
 
         let assignments = vec![SpecAssignment {
@@ -2232,7 +2523,7 @@ mod tests {
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
-        let groups = list_owned_spell_lines(&cfg, 64).unwrap();
+        let groups = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
         assert_eq!(groups.len(), 1, "{groups:?}");
         let group = &groups[0];
         assert_eq!(group.spec_key, "frostbolt_tree_64");
@@ -2267,41 +2558,63 @@ mod tests {
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
-        let groups = list_owned_spell_lines(&cfg, 64).unwrap();
+        let groups = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
         let first_spell = &groups[0].spells[0];
         assert_eq!(first_spell.level, 1);
 
         update_line_spell_level(&cfg, 64, &first_spell.line_xspell_id, 5).unwrap();
 
-        let groups_after = list_owned_spell_lines(&cfg, 64).unwrap();
+        let groups_after = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
         assert_eq!(groups_after[0].spells[0].level, 5);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn update_line_spell_level_refuses_a_plain_shared_specs_line() {
-        // "Slash" is a plain/shared spec (no class suffix) - its own spell line, if it had one,
-        // would still be in active use by any other class assigned it directly, so changing its
-        // level here must be refused the same way editing/deleting a shared Spell row is.
-        let dir = setup_test_db("update-level-refuses-shared");
+    fn update_line_spell_level_clones_a_previously_shared_specs_line_on_first_touch() {
+        // A real stock class's own spec (never cloned through this tool at all, e.g. a class
+        // like Friar that's simply always had "Staff" or a caster spec assigned directly) must
+        // still be editable - this promotes it to this class's own independent clone on the
+        // spot, the same "clone on first touch" model already established for individual
+        // spells, instead of refusing outright the way this used to.
+        let dir = setup_test_db("update-level-promotes-shared");
         let cfg = test_cfg(&dir);
         run_remote_sql(
             &cfg,
-            "INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 1);\
+            "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);\
+             INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 1);\
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('slash_base', 9001, 1, 'shared-line-1');",
         )
         .unwrap();
 
-        let result = update_line_spell_level(&cfg, 64, "shared-line-1", 99);
-        assert!(result.is_err(), "editing a shared spec's own line must be refused");
+        let result = update_line_spell_level(&cfg, 64, "shared-line-1", 5).unwrap();
+        assert!(result.contains("updated level to 5"), "{result}");
 
-        let unchanged = run_remote_sql_json(
+        let assigned = run_remote_sql_json(
+            &cfg,
+            "SELECT SpecKeyName FROM ClassXSpecialization WHERE ClassID = 64;",
+        )
+        .unwrap();
+        assert_eq!(
+            str_field(&assigned[0], "SpecKeyName"),
+            "slash_64",
+            "the class's own assignment must now point at its own independent clone"
+        );
+
+        let groups = list_spell_lines_for_spec(&cfg, "slash_64").unwrap();
+        assert_eq!(groups[0].spells[0].level, 5);
+        assert!(groups[0].spells[0].is_owned);
+
+        let original_level = run_remote_sql_json(
             &cfg,
             "SELECT Level FROM LineXSpell WHERE LineXSpell_ID = 'shared-line-1';",
         )
         .unwrap();
-        assert_eq!(int_field(&unchanged[0], "Level"), 1, "the level must be untouched");
+        assert_eq!(
+            int_field(&original_level[0], "Level"),
+            1,
+            "the original, still-shared line must be untouched"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2326,7 +2639,7 @@ mod tests {
         )
         .unwrap();
 
-        let groups = list_owned_spell_lines(&cfg, 64).unwrap();
+        let groups = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
         let line = &groups[0].spells[0];
         assert!(!line.is_owned, "a legacy line's spell starts out un-owned");
         let original_spell_id = line.spell_id;
@@ -2338,7 +2651,7 @@ mod tests {
             "cloning must produce a brand-new SpellID, not reuse the shared one"
         );
 
-        let groups_after = list_owned_spell_lines(&cfg, 64).unwrap();
+        let groups_after = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
         let line_after = &groups_after[0].spells[0];
         assert!(line_after.is_owned);
         assert_eq!(line_after.spell_id, first_call_id);
@@ -2355,22 +2668,57 @@ mod tests {
     }
 
     #[test]
-    fn ensure_line_spell_owned_refuses_a_plain_shared_specs_line() {
-        let dir = setup_test_db("ensure-owned-refuses-shared");
+    fn ensure_line_spell_owned_promotes_a_previously_shared_specs_line_on_first_touch() {
+        // The stock-class counterpart to the legacy-custom-class test above: a spec this class
+        // was simply assigned directly (never cloned through this tool at all) must still become
+        // independently editable the moment it's actually touched.
+        let dir = setup_test_db("ensure-owned-promotes-shared");
         let cfg = test_cfg(&dir);
         run_remote_sql(
             &cfg,
-            "INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 1);\
+            "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);\
+             INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 1);\
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('slash_base', 9001, 1, 'shared-line-1');",
         )
         .unwrap();
 
-        let result = ensure_line_spell_owned(&cfg, 64, "shared-line-1");
-        assert!(result.is_err(), "cloning via a shared spec's own line must be refused");
+        let new_spell_id = ensure_line_spell_owned(&cfg, 64, "shared-line-1").unwrap();
+        assert_ne!(new_spell_id, 9001, "must be an independent clone, not the shared source spell");
+
+        let groups = list_spell_lines_for_spec(&cfg, "slash_64").unwrap();
+        assert_eq!(groups[0].spells[0].spell_id, new_spell_id);
+        assert!(groups[0].spells[0].is_owned);
+
+        let original = run_remote_sql_json(&cfg, "SELECT SpellID FROM Spell WHERE SpellID = 9001;").unwrap();
+        assert_eq!(original.len(), 1, "the original shared spell must survive untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_line_spell_owned_refuses_a_mechanic_locked_specs_line() {
+        // Defensive guard: a NEVER_CLONE_SPECS spec's own SpellLine (an unrealistic shape for a
+        // real weapon spec, which doesn't cast spells, but still worth guarding against) must
+        // never be cloned/renamed outright - only its combat styles can ever become
+        // class-specific, via `ensure_style_owned` instead.
+        let dir = setup_test_db("ensure-owned-refuses-uncloneable");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+                VALUES ('Staff', 'Staff', 'Staff weapons', 100, NULL, 0);
+             INSERT INTO ClassXSpecialization VALUES (64, 'Staff', 0);
+             INSERT INTO SpellLine VALUES ('staff_base', 'Staff Spells', 'Staff', 0, 1);
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('staff_base', 9001, 1, 'staff-line-1');",
+        )
+        .unwrap();
+
+        let result = ensure_line_spell_owned(&cfg, 64, "staff-line-1");
+        assert!(result.is_err(), "a mechanic-locked spec's spell line must never be cloned");
 
         let unchanged = run_remote_sql_json(
             &cfg,
-            "SELECT SpellID FROM LineXSpell WHERE LineXSpell_ID = 'shared-line-1';",
+            "SELECT SpellID FROM LineXSpell WHERE LineXSpell_ID = 'staff-line-1';",
         )
         .unwrap();
         assert_eq!(int_field(&unchanged[0], "SpellID"), 9001, "must be untouched");
@@ -3717,6 +4065,219 @@ mod tests {
             str_field(&rows[0], "SerializedSpecs"),
             "Sword|9;stealth_64|1",
             "the real spec's points must survive the migration, untouched specs must be left alone"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_class_spec_summaries_flags_combat_and_spell_specs_and_ownership() {
+        let dir = setup_test_db("spec-summaries");
+        let cfg = test_cfg(&dir);
+        // Class 64 isn't suffix-owned for either spec, and has no `ClassId = 64` style rows of
+        // its own yet - both specs must come back un-owned, correctly flagged by what they
+        // actually grant ("slash" has styles via the fixture's own Pulverize/Backlash, "smite"
+        // has a spell line).
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);\
+             INSERT INTO ClassXSpecialization VALUES (64, 'smite', 5);",
+        )
+        .unwrap();
+
+        let summaries = list_class_spec_summaries(&cfg, 64).unwrap();
+        assert_eq!(summaries.len(), 2, "{summaries:?}");
+        let slash = summaries.iter().find(|s| s.key_name == "slash").unwrap();
+        assert!(slash.has_styles);
+        assert!(!slash.has_spell_lines);
+        assert!(!slash.is_owned);
+        let smite = summaries.iter().find(|s| s.key_name == "smite").unwrap();
+        assert!(!smite.has_styles);
+        assert!(smite.has_spell_lines);
+        assert!(!smite.is_owned);
+        assert_eq!(smite.level_acquired, 5);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_class_spec_summaries_marks_a_suffix_owned_spec_as_owned() {
+        let dir = setup_test_db("spec-summaries-owned");
+        let cfg = test_cfg(&dir);
+        let assignments = vec![SpecAssignment {
+            source_key: "smite".to_string(),
+            new_key: "frostbolt_tree".to_string(),
+            new_name: "Frostbolt Tree".to_string(),
+            level_acquired: 0,
+            spell_line_selection: Vec::new(),
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        let summaries = list_class_spec_summaries(&cfg, 64).unwrap();
+        let owned = summaries.iter().find(|s| s.key_name == "frostbolt_tree_64").unwrap();
+        assert!(owned.is_owned);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_styles_for_spec_prefers_this_classs_own_locked_styles_over_anyone_elses() {
+        let dir = setup_test_db("list-styles-for-spec");
+        let cfg = test_cfg(&dir);
+        // "slash" already has Pulverize (ClassId=1) and Backlash (ClassId=0, universal) from the
+        // fixture - class 64 has neither yet, so it should fall through to the universal one.
+        let styles = list_styles_for_spec(&cfg, 64, "slash").unwrap();
+        assert_eq!(styles.len(), 1, "{styles:?}");
+        assert_eq!(str_field(&styles[0].fields, "Name"), "Backlash");
+        assert!(!styles[0].is_owned);
+
+        // Once class 64 gets its own locked copy, that must take priority over the universal one.
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Style VALUES (NULL, 64, 'Pulverize', 'slash', 5, 300, 5, 0, 1, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);",
+        )
+        .unwrap();
+        let styles_after = list_styles_for_spec(&cfg, 64, "slash").unwrap();
+        assert_eq!(styles_after.len(), 1, "{styles_after:?}");
+        assert_eq!(str_field(&styles_after[0].fields, "Name"), "Pulverize");
+        assert!(styles_after[0].is_owned);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_style_owned_grants_a_mechanic_locked_specs_own_copy_on_first_touch() {
+        let dir = setup_test_db("ensure-style-owned-uncloneable");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+                VALUES ('Sword', 'Sword', 'Sword weapons', 100, NULL, 0);
+             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);",
+        )
+        .unwrap();
+        let source_style_id = int_field(
+            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE SpecKeyName='Sword';").unwrap()[0],
+            "StyleID",
+        );
+
+        let owned_id = ensure_style_owned(&cfg, 64, "Sword", source_style_id).unwrap();
+        assert_ne!(owned_id, source_style_id, "must be class 64's own, separate row");
+
+        let owned_rows = run_remote_sql_json(
+            &cfg,
+            &format!("SELECT ClassId, Name FROM Style WHERE StyleID = {owned_id};"),
+        )
+        .unwrap();
+        assert_eq!(int_field(&owned_rows[0], "ClassId"), 64);
+        assert_eq!(str_field(&owned_rows[0], "Name"), "Whirling Blade");
+
+        // The spec itself (Specialization/SpellLine) must never be renamed for a mechanic-locked
+        // spec - still "Sword", not "sword_64" or similar.
+        let specs = run_remote_sql_json(&cfg, "SELECT KeyName FROM Specialization WHERE KeyName='Sword';").unwrap();
+        assert_eq!(specs.len(), 1);
+
+        // Calling it again must be a pure no-op - same ID, no second grant.
+        let second_call_id = ensure_style_owned(&cfg, 64, "Sword", owned_id).unwrap();
+        assert_eq!(second_call_id, owned_id);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_style_owned_promotes_a_regular_specs_whole_spec_when_needed() {
+        let dir = setup_test_db("ensure-style-owned-regular-spec");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);",
+        )
+        .unwrap();
+        let source_style_id = int_field(
+            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
+            "StyleID",
+        );
+
+        let owned_id = ensure_style_owned(&cfg, 64, "slash", source_style_id).unwrap();
+        assert_ne!(owned_id, source_style_id);
+
+        let assigned = run_remote_sql_json(
+            &cfg,
+            "SELECT SpecKeyName FROM ClassXSpecialization WHERE ClassID = 64;",
+        )
+        .unwrap();
+        assert_eq!(str_field(&assigned[0], "SpecKeyName"), "slash_64");
+
+        let owned_rows = run_remote_sql_json(
+            &cfg,
+            &format!("SELECT ClassId, SpecKeyName FROM Style WHERE StyleID = {owned_id};"),
+        )
+        .unwrap();
+        assert_eq!(int_field(&owned_rows[0], "ClassId"), 64);
+        assert_eq!(str_field(&owned_rows[0], "SpecKeyName"), "slash_64");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_style_fields_edits_an_already_owned_style_and_refuses_a_shared_one() {
+        let dir = setup_test_db("update-style-fields");
+        let cfg = test_cfg(&dir);
+        let style_id = int_field(
+            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
+            "StyleID",
+        );
+
+        // "Pulverize" is locked to class 1, not 64 - editing it as class 64 must be refused.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("EnduranceCost".to_string(), Value::from(99));
+        let refused = update_style_fields(&cfg, 64, style_id, &fields);
+        assert!(refused.is_err(), "a style not locked to this class must be refused");
+
+        // Its own owner (class 1) can edit it directly.
+        let result = update_style_fields(&cfg, 1, style_id, &fields).unwrap();
+        assert!(result.contains("updated 1 field"), "{result}");
+        let updated = run_remote_sql_json(&cfg, &format!("SELECT EnduranceCost FROM Style WHERE StyleID = {style_id};")).unwrap();
+        assert_eq!(int_field(&updated[0], "EnduranceCost"), 99);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_style_level_grants_then_updates_a_mechanic_locked_specs_level() {
+        let dir = setup_test_db("update-style-level-uncloneable");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+                VALUES ('Sword', 'Sword', 'Sword weapons', 100, NULL, 0);
+             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);",
+        )
+        .unwrap();
+        let source_style_id = int_field(
+            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE SpecKeyName='Sword';").unwrap()[0],
+            "StyleID",
+        );
+
+        let result = update_style_level(&cfg, 64, "Sword", source_style_id, 12).unwrap();
+        assert!(result.contains("updated level to 12"), "{result}");
+
+        let owned = run_remote_sql_json(
+            &cfg,
+            "SELECT SpecLevelRequirement FROM Style WHERE SpecKeyName='Sword' AND ClassId=64;",
+        )
+        .unwrap();
+        assert_eq!(int_field(&owned[0], "SpecLevelRequirement"), 12);
+
+        let original = run_remote_sql_json(
+            &cfg,
+            &format!("SELECT SpecLevelRequirement FROM Style WHERE StyleID = {source_style_id};"),
+        )
+        .unwrap();
+        assert_eq!(
+            int_field(&original[0], "SpecLevelRequirement"),
+            5,
+            "the original style must be untouched"
         );
 
         std::fs::remove_dir_all(&dir).ok();

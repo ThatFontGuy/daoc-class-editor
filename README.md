@@ -60,7 +60,8 @@ deployment path was confirmed against a real running server after an early mix-u
   combat styles, and no weapon/armor proficiency at all. Every spec you add is always cloned -
   its own independent copy of the `Specialization` row, `SpellLine`(s), `LineXSpell` entries,
   `Style` rows, and `Style` procs (`StyleXSpell`) - which you can rename and edit separately (see
-  the **Spells** section of the **Classes** tab, below). This used to also offer "reuse" (sharing
+  the "Classes" tab's own **Combat specs**/**Spells** sections, below). This used to also offer
+  "reuse" (sharing
   the exact same spec, unchanged,
   with the class you cloned from), but that was removed after a real, reproduced bug: the server
   looks up whether a class can use a style by an *exact* class-ID match, so a reused spec whose
@@ -96,12 +97,17 @@ deployment path was confirmed against a real running server after an early mix-u
     class's ID, e.g. `earthshatter_64`), plus every independently-owned `Spell` row that cleanup
     leaves orphaned. Handy for fixing or cleaning up a clone that didn't work out while debugging,
     or just as routine housekeeping.
-  - The **Spells** section below the class's own details lists every spell line one of its own
-    cloned specs owns, in level order, with an editable level per spell. Field-editing a spell's
-    values (damage, range, duration, icon, ...) clones it independently for this class the moment
-    you hit **Save**, if it isn't an independent copy already - no separate "Migrate" step to run
-    first, and no risk of also changing it for the class it was cloned from, or any other class.
-  - **Update All Class Data** re-reads the class list and the selected class's own spells fresh
+  - The **Spells** section below the class's own details is split into two plain summary lists -
+    **Combat specs** (the ones that grant combat styles, e.g. Friar's own "Staff") above
+    **Spells** (the ones that grant cast spells, e.g. Drengr's three real lines) - each spec shown
+    only by name, level, and whether it's already independent or still shared, with its own
+    **Edit** button to expand just that one spec's actual styles/spells. This works for *any*
+    class's real specs, not just ones already cloned through this tool - field-editing a style or
+    spell's values clones (or, for a mechanic-locked spec like "Staff"/"Sword" that can never be
+    renamed, grants this class its own locked copy of) just that one spec the moment you hit
+    **Save**, if it isn't independent for this class already - no separate "Migrate" step to run
+    first, and no risk of also changing it for any other class that shares the same spec.
+  - **Update All Class Data** re-reads the class list and the selected class's own specs fresh
     from the server - handy after deploying or editing something outside this tool (e.g. directly
     via the "run SQL" box, or a server restart that changed `bin/scripts/`).
 - **Save/Load a project** (top-right of the window) - designing a class is something you iterate
@@ -151,9 +157,10 @@ deployment path was confirmed against a real running server after an early mix-u
    Use **Save**/**Load** (top-right) any time to pick this back up later. (For a class you
    already deployed yourself, **Edit class file** opens the same wizard pre-filled with its
    current values instead.)
-5. Back in **Classes**, field-edit a class's own independently-cloned spells (damage, range,
-   duration, icon, ...) - Save clones a spell for this class automatically the first time it's
-   actually touched, so there's no separate step to run
+5. Back in **Classes**, expand a **Combat spec** or **Spell** to field-edit its own styles
+   (damage, endurance cost, icon, ...) or spells (damage, range, duration, icon, ...) - Save
+   clones (or, for a mechanic-locked spec like "Staff", grants) this class its own copy
+   automatically the first time it's actually touched, so there's no separate step to run
    first.
 
 ## Where the reference data comes from
@@ -175,9 +182,9 @@ show up by name in the **Classes** tab like any other class - tagged **Standard 
 in `bin/scripts/`. That also means **Edit class file**/**Delete class** aren't offered for them
 (there's no file in `bin/scripts/` for this tool to manage) - a custom class promoted out of
 `bin/scripts/` into compiled source this way needs a real server rebuild to edit, same as any
-other server-side code change. Their own spec/spell data, however, lives entirely in the database
-like any class's does, so the **Spells** section still works on them exactly the same as any
-other class's own cloned specs.
+other server-side code change. Their own spec/style/spell data, however, lives entirely in the
+database like any class's does, so the **Combat specs**/**Spells** sections still work on them
+exactly the same as any other class's own cloned specs.
 
 New custom classes always get an ID of **at least 100** (`classdata::next_free_id_from`), regardless
 of what the highest actually-visible ID is - deliberately well clear of every native slot a

@@ -226,8 +226,18 @@ fn list_owned_spells(cfg: SshConfig, class_id: i64) -> Result<Vec<serde_json::Va
 }
 
 #[tauri::command]
-fn list_owned_spell_lines(cfg: SshConfig, class_id: i64) -> Result<Vec<specs::SpellLineGroup>, String> {
-    specs::list_owned_spell_lines(&cfg, class_id)
+fn list_class_spec_summaries(cfg: SshConfig, class_id: i64) -> Result<Vec<specs::ClassSpecSummary>, String> {
+    specs::list_class_spec_summaries(&cfg, class_id)
+}
+
+#[tauri::command]
+fn list_spell_lines_for_spec(cfg: SshConfig, spec_key: String) -> Result<Vec<specs::SpellLineGroup>, String> {
+    specs::list_spell_lines_for_spec(&cfg, &spec_key)
+}
+
+#[tauri::command]
+fn list_styles_for_spec(cfg: SshConfig, class_id: i64, spec_key: String) -> Result<Vec<specs::StyleInfo>, String> {
+    specs::list_styles_for_spec(&cfg, class_id, &spec_key)
 }
 
 #[tauri::command]
@@ -238,6 +248,17 @@ fn update_line_spell_level(
     new_level: i64,
 ) -> Result<String, String> {
     specs::update_line_spell_level(&cfg, class_id, &line_xspell_id, new_level)
+}
+
+#[tauri::command]
+fn update_style_level(
+    cfg: SshConfig,
+    class_id: i64,
+    spec_key: String,
+    style_id: i64,
+    new_level: i64,
+) -> Result<String, String> {
+    specs::update_style_level(&cfg, class_id, &spec_key, style_id, new_level)
 }
 
 #[tauri::command]
@@ -272,6 +293,32 @@ fn save_line_spell_fields(
         spell_ownership::update_owned_spell_fields(&cfg, spell_id, &fields)?
     };
     Ok(SaveLineSpellResult { spell_id, message })
+}
+
+#[derive(serde::Serialize)]
+struct SaveStyleResult {
+    style_id: i64,
+    message: String,
+}
+
+/// Grants/clones this class its own copy of a combat style on the spot (if it doesn't have one
+/// already) and applies the field edits in one call - the combat-spec equivalent of
+/// `save_line_spell_fields`.
+#[tauri::command]
+fn save_style_fields(
+    cfg: SshConfig,
+    class_id: i64,
+    spec_key: String,
+    style_id: i64,
+    fields: std::collections::HashMap<String, serde_json::Value>,
+) -> Result<SaveStyleResult, String> {
+    let owned_style_id = specs::ensure_style_owned(&cfg, class_id, &spec_key, style_id)?;
+    let message = if fields.is_empty() {
+        format!("cloned style {owned_style_id} independently for this class")
+    } else {
+        specs::update_style_fields(&cfg, class_id, owned_style_id, &fields)?
+    };
+    Ok(SaveStyleResult { style_id: owned_style_id, message })
 }
 
 #[tauri::command]
@@ -321,10 +368,14 @@ pub fn run() {
             clone_realm_abilities,
             migrate_class_to_owned_spells,
             list_owned_spells,
-            list_owned_spell_lines,
+            list_class_spec_summaries,
+            list_spell_lines_for_spec,
+            list_styles_for_spec,
             update_line_spell_level,
+            update_style_level,
             update_owned_spell_fields,
             save_line_spell_fields,
+            save_style_fields,
             save_project_file,
             load_project_file,
             delete_deployed_class,
