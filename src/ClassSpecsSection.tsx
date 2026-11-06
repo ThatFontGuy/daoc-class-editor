@@ -570,8 +570,14 @@ export default function ClassSpecsSection({ sshConfig, classId }: { sshConfig: S
     });
   }
 
+  // A spec with styles is always a combat spec, full stop, even if it also happens to carry an
+  // incidental SpellLine of its own (a real, reproduced case: "Shields" has both 157 Style rows
+  // *and* a "Warrior Shields (Live)" spell line, presumably internal bookkeeping for some
+  // block/bash-related effect) - from a player's perspective that's still obviously a combat
+  // skill, not something to also list as a "spell." Combat classification takes priority; a spec
+  // only shows as a Spell if it has no styles at all.
   const combatSpecs = (summaries ?? []).filter((s) => s.has_styles);
-  const spellSpecs = (summaries ?? []).filter((s) => s.has_spell_lines);
+  const spellSpecs = (summaries ?? []).filter((s) => s.has_spell_lines && !s.has_styles);
 
   return (
     <div className="panel">
