@@ -1,5 +1,6 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { ClassInfo, ClassListResult, OwnedSpellRow, SshConfig, emptySshConfig } from "./types";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
@@ -27,6 +28,11 @@ const EDITABLE_FIELD_HINTS = [
   "Message2",
 ];
 
+interface MigrateProgress {
+  processed: number;
+  total: number;
+}
+
 export default function SpellEditorPanel() {
   const [sshConfig, setSshConfig] = useState<SshConfig>(emptySshConfig);
   const [deployedClasses, setDeployedClasses] = useState<ClassInfo[]>([]);
@@ -36,12 +42,31 @@ export default function SpellEditorPanel() {
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  const [migrateProgress, setMigrateProgress] = useState<MigrateProgress | null>(null);
+  // A real, reported problem this guards against: a slow operation (migrating dozens of spells,
+  // each its own round-trip) with no obvious visual feedback invited a double-click on the same
+  // button, racing two overlapping calls against each other. `busy` (React state) is what
+  // visually disables the button, but a very fast second click can still slip in before a
+  // re-render actually paints that - a plain ref, checked and set synchronously the instant a
+  // handler starts, closes that gap completely regardless of render timing.
+  const busyRef = useRef(false);
 
   useEffect(() => {
     invoke<SshConfig>("load_ssh_config").then(setSshConfig);
   }, []);
 
+  useEffect(() => {
+    const unlisten = listen<MigrateProgress>("migrate-progress", (event) => {
+      setMigrateProgress(event.payload);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   async function refreshClasses() {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setStatus("Loading deployed classes...");
     try {
@@ -53,11 +78,14 @@ export default function SpellEditorPanel() {
     } catch (e) {
       setStatus(`Could not list deployed classes: ${e}`);
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
 
   async function loadSpells(classId: number) {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setSelectedClassId(classId);
     setEditingSpellId(null);
     setBusy(true);
@@ -78,25 +106,45 @@ export default function SpellEditorPanel() {
       setStatus(`Could not load spells: ${e}`);
       setSpells(null);
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
 
   async function migrate() {
-    if (selectedClassId == null) return;
+    if (selectedClassId == null || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
-    setStatus("Migrating this class's spells to independent copies...");
+    setMigrateProgress({ processed: 0, total: 0 });
+    setStatus("Migrating this class's spells to independent copies - please wait, this can take a while...");
     try {
       const result = await invoke<string>("migrate_class_to_owned_spells", {
         cfg: sshConfig,
         classId: selectedClassId,
       });
       setStatus(result);
-      await loadSpells(selectedClassId);
+      await loadSpellsInner(selectedClassId);
     } catch (e) {
       setStatus(`Migration failed: ${e}`);
     } finally {
+      setMigrateProgress(null);
+      busyRef.current = false;
       setBusy(false);
+    }
+  }
+
+  // `migrate` already holds the busy guard for its own whole operation (including the refresh
+  // that follows) - this is the same body as `loadSpells` minus its own (would-be re-entrant)
+  // guard/busy toggling.
+  async function loadSpellsInner(classId: number) {
+    setSelectedClassId(classId);
+    setEditingSpellId(null);
+    try {
+      const rows = await invoke<OwnedSpellRow[]>("list_owned_spells", { cfg: sshConfig, classId });
+      setSpells(rows);
+    } catch (e) {
+      setStatus(`Could not load spells: ${e}`);
+      setSpells(null);
     }
   }
 
@@ -111,7 +159,7 @@ export default function SpellEditorPanel() {
   }
 
   async function save(original: OwnedSpellRow) {
-    if (editingSpellId == null) return;
+    if (editingSpellId == null || busyRef.current) return;
     // Only send fields that actually changed, and coerce back to a number when the original
     // value was one - the backend stores whatever JSON type is sent verbatim.
     const fields: Record<string, string | number> = {};
@@ -128,6 +176,7 @@ export default function SpellEditorPanel() {
       setEditingSpellId(null);
       return;
     }
+    busyRef.current = true;
     setBusy(true);
     setStatus("Saving...");
     try {
@@ -138,10 +187,11 @@ export default function SpellEditorPanel() {
       });
       setStatus(result);
       setEditingSpellId(null);
-      if (selectedClassId != null) await loadSpells(selectedClassId);
+      if (selectedClassId != null) await loadSpellsInner(selectedClassId);
     } catch (e) {
       setStatus(`Save failed: ${e}`);
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
@@ -182,10 +232,21 @@ export default function SpellEditorPanel() {
         </select>
         {selectedClassId != null && (
           <button onClick={migrate} disabled={busy}>
-            Migrate to independent spells
+            {busy && migrateProgress ? "Migrating..." : "Migrate to independent spells"}
           </button>
         )}
       </div>
+      {migrateProgress && (
+        <div className="progress-indicator">
+          <progress value={migrateProgress.processed} max={Math.max(migrateProgress.total, 1)} />
+          <span>
+            {migrateProgress.total === 0
+              ? "Checking what needs migrating..."
+              : `${migrateProgress.processed} / ${migrateProgress.total} spell(s)/proc(s) migrated - please wait, do not click again`}
+          </span>
+        </div>
+      )}
+      {busy && !migrateProgress && <p className="hint">⏳ Working - please wait...</p>}
       {status && <pre className="status">{status}</pre>}
 
       {spells && spells.length > 0 && (

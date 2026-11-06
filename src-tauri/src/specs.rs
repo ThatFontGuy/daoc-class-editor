@@ -51,8 +51,8 @@
 
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use crate::spell_ownership::{
-    SpellCloner, delete_owned_spells, delete_style_procs_for_styles, next_free_style_id,
-    style_x_spell_guid_column,
+    SpellCloner, clone_style_with_fresh_id, delete_owned_spells, delete_style_procs_for_styles,
+    ensure_tracking_table, style_x_spell_guid_column,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -655,7 +655,23 @@ pub fn apply_class_specs(
 /// convention `apply_class_specs` gives every clone's own KeyName. A plain/shared spec assigned
 /// directly (e.g. "Sword", via `NEVER_CLONE_SPECS`) is never migrated - its SpellLines, if any,
 /// are still genuinely shared with whatever else assigns it directly, and always will be.
-pub fn migrate_class_to_owned_spells(cfg: &SshConfig, class_id: i64) -> Result<String, String> {
+///
+/// `on_progress(processed, total)` is called once up front (processed=0, so a caller knows the
+/// real total immediately, even before anything's actually done) and again after every spell/proc
+/// actually cloned - this can genuinely take a while (dozens of slow round-trips for a class with
+/// many spec lines), and a real, reported problem this exists for is a UI with no visible
+/// progress feedback inviting an impatient double-click on the same button, which used to be
+/// able to race (see `SpellCloner::clone_for_class`'s own doc comment - now fixed regardless, but
+/// visible progress is what actually stops someone from clicking twice in the first place).
+pub fn migrate_class_to_owned_spells(
+    cfg: &SshConfig,
+    class_id: i64,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<String, String> {
+    // Must exist before the "already independently owned?" checks below ever query it - a fresh
+    // server/first-ever migration on this DB won't have it yet.
+    ensure_tracking_table(cfg)?;
+
     let suffix = format!("_{class_id}");
     let assigned = run_remote_sql_json(
         cfg,
@@ -667,16 +683,26 @@ pub fn migrate_class_to_owned_spells(cfg: &SshConfig, class_id: i64) -> Result<S
         .filter(|k| k.ends_with(&suffix))
         .collect();
 
-    let mut cloner = SpellCloner::new(cfg, class_id)?;
-    let mut batch = String::new();
-    let mut migrated_spells = 0usize;
-    let mut migrated_procs = 0usize;
     // Whatever StyleXSpell's own real GUID-style primary key column is called (see
     // `style_x_spell_guid_column`'s own doc comment), resolved once up front - falls back to
     // matching a row by its full (StyleID, SpellID) pair if this table's own PK turns out to be
     // a plain autoincrement rowid instead (no fork has been seen to actually do that, but this
     // stays correct either way rather than assuming).
     let style_x_spell_pk = style_x_spell_guid_column(cfg)?;
+
+    // First pass: gather every row that actually still needs migrating (already-independent
+    // ones are skipped here, not just silently no-op'd later), so the real total is known before
+    // any work starts - what a progress indicator actually needs to be meaningful.
+    struct LineWork {
+        line_xspell_id: String,
+        old_spell_id: i64,
+    }
+    struct ProcWork {
+        row_key: String,
+        old_spell_id: i64,
+    }
+    let mut line_work: Vec<LineWork> = Vec::new();
+    let mut proc_work: Vec<ProcWork> = Vec::new();
 
     for spec_key in &owned_keys {
         let spec_key_q = sql_quote(spec_key);
@@ -695,21 +721,18 @@ pub fn migrate_class_to_owned_spells(cfg: &SshConfig, class_id: i64) -> Result<S
             )?;
             for row in &rows {
                 let old_spell_id = int_field(row, "SpellID");
-                let row_id_q = sql_quote(&str_field(row, "LineXSpell_ID"));
                 let already_owned = run_remote_sql_json(
                     cfg,
                     &format!(
                         "SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {old_spell_id};"
                     ),
                 )?;
-                if !already_owned.is_empty() {
-                    continue;
+                if already_owned.is_empty() {
+                    line_work.push(LineWork {
+                        line_xspell_id: str_field(row, "LineXSpell_ID"),
+                        old_spell_id,
+                    });
                 }
-                let new_spell_id = cloner.clone_for_class(&mut batch, old_spell_id);
-                batch.push_str(&format!(
-                    "UPDATE LineXSpell SET SpellID = {new_spell_id} WHERE LineXSpell_ID = '{row_id_q}';\n"
-                ));
-                migrated_spells += 1;
             }
         }
 
@@ -731,9 +754,7 @@ pub fn migrate_class_to_owned_spells(cfg: &SshConfig, class_id: i64) -> Result<S
         };
         let procs = run_remote_sql_json(
             cfg,
-            &format!(
-                "SELECT {select_cols} FROM StyleXSpell WHERE StyleID IN ({style_ids_csv});"
-            ),
+            &format!("SELECT {select_cols} FROM StyleXSpell WHERE StyleID IN ({style_ids_csv});"),
         )?;
         for proc in &procs {
             let old_spell_id = int_field(proc, "SpellID");
@@ -741,30 +762,60 @@ pub fn migrate_class_to_owned_spells(cfg: &SshConfig, class_id: i64) -> Result<S
                 cfg,
                 &format!("SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {old_spell_id};"),
             )?;
-            if !already_owned.is_empty() {
-                continue;
+            if already_owned.is_empty() {
+                proc_work.push(ProcWork {
+                    row_key: if style_x_spell_pk.is_some() {
+                        str_field(proc, "RowKey")
+                    } else {
+                        int_field(proc, "RowKey").to_string()
+                    },
+                    old_spell_id,
+                });
             }
-            let new_spell_id = cloner.clone_for_class(&mut batch, old_spell_id);
-            let where_clause = match &style_x_spell_pk {
-                Some(col) => format!("{col} = '{}'", sql_quote(&str_field(proc, "RowKey"))),
-                None => format!(
-                    "StyleID = {} AND SpellID = {old_spell_id}",
-                    int_field(proc, "RowKey")
-                ),
-            };
-            batch.push_str(&format!(
-                "UPDATE StyleXSpell SET SpellID = {new_spell_id} WHERE {where_clause};\n"
-            ));
-            migrated_procs += 1;
         }
+    }
+
+    let total = line_work.len() + proc_work.len();
+    let mut processed = 0usize;
+    on_progress(processed, total);
+
+    let mut cloner = SpellCloner::new(cfg, class_id)?;
+    let mut batch = String::new();
+
+    for item in &line_work {
+        let new_spell_id = cloner.clone_for_class(cfg, item.old_spell_id)?;
+        let row_id_q = sql_quote(&item.line_xspell_id);
+        batch.push_str(&format!(
+            "UPDATE LineXSpell SET SpellID = {new_spell_id} WHERE LineXSpell_ID = '{row_id_q}';\n"
+        ));
+        processed += 1;
+        on_progress(processed, total);
+    }
+
+    for item in &proc_work {
+        let new_spell_id = cloner.clone_for_class(cfg, item.old_spell_id)?;
+        let where_clause = match &style_x_spell_pk {
+            Some(col) => format!("{col} = '{}'", sql_quote(&item.row_key)),
+            None => format!(
+                "StyleID = {} AND SpellID = {}",
+                item.row_key, item.old_spell_id
+            ),
+        };
+        batch.push_str(&format!(
+            "UPDATE StyleXSpell SET SpellID = {new_spell_id} WHERE {where_clause};\n"
+        ));
+        processed += 1;
+        on_progress(processed, total);
     }
 
     if !batch.is_empty() {
         run_remote_sql(cfg, &batch)?;
     }
     Ok(format!(
-        "migrated {migrated_spells} spell(s) and {migrated_procs} proc(s), across {} owned \
-         spec(s), to independent, editable copies\n",
+        "migrated {} spell(s) and {} proc(s), across {} owned spec(s), to independent, editable \
+         copies\n",
+        line_work.len(),
+        proc_work.len(),
         owned_keys.len()
     ))
 }
@@ -1403,7 +1454,7 @@ fn clone_spec(
                 }
             }
             let level = int_field(spell, "Level");
-            let new_spell_id = spell_cloner.clone_for_class(&mut batch, source_spell_id);
+            let new_spell_id = spell_cloner.clone_for_class(cfg, source_spell_id)?;
             let row_guid = Uuid::new_v4();
             batch.push_str(&format!(
                 "INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
@@ -1460,28 +1511,21 @@ fn clone_spec(
     // `style_x_spell_guid_column`'s own doc comment), resolved once up front and reused for
     // every proc cloned below.
     let style_x_spell_pk = style_x_spell_guid_column(cfg)?;
-    let mut next_style_id = next_free_style_id(cfg)?;
     for (_, _, rows) in &style_groups {
         let representative = &rows[0];
         let representative_style_id = int_field(representative, "StyleID");
-        let new_style_id = next_style_id;
-        next_style_id += 1;
         let class_expr = if int_field(representative, "ClassId") != 0 {
             new_class_id.to_string()
         } else {
             "0".to_string()
         };
-        batch.push_str(&format!(
-            "INSERT INTO Style (StyleID, ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, \
-             EnduranceCost, StealthRequirement, OpeningRequirementType, OpeningRequirementValue, \
-             AttackResultRequirement, WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, \
-             BonusToDefense, TwoHandAnimation, RandomProc, ArmorHitLocation, ID) \
-             SELECT {new_style_id}, {class_expr}, Name, '{new_key_q}', SpecLevelRequirement, Icon, \
-             EnduranceCost, StealthRequirement, OpeningRequirementType, OpeningRequirementValue, \
-             AttackResultRequirement, WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, \
-             BonusToDefense, TwoHandAnimation, RandomProc, ArmorHitLocation, {new_style_id} \
-             FROM Style WHERE StyleID = {representative_style_id};\n"
-        ));
+        // Clones this style's row right now (not deferred into `batch`), with its real new
+        // StyleID computed atomically inside the database rather than guessed in Rust - see
+        // `SpellCloner::clone_for_class`'s own doc comment for the exact real bug this same
+        // pattern avoids (a value precomputed once and incremented locally goes stale the
+        // instant anything else writes to the same table first).
+        let new_style_id =
+            clone_style_with_fresh_id(cfg, representative_style_id, &new_key_q, &class_expr)?;
 
         // Procs: gather every StyleXSpell row attached to *any* of this group's collapsed source
         // StyleIDs (not just the representative one - the real data's own duplicates are
@@ -1511,8 +1555,7 @@ fn clone_spec(
             }
             seen_procs.push(key);
             let (source_proc_spell_id, source_proc_class_id, chance) = key;
-            let new_proc_spell_id =
-                spell_cloner.clone_for_class(&mut batch, source_proc_spell_id);
+            let new_proc_spell_id = spell_cloner.clone_for_class(cfg, source_proc_spell_id)?;
             // Same class-lock repoint rule as the style itself: 0 means "not a substitute style"
             // (per the real schema's own ClassID doc comment) and must stay 0; any non-zero lock
             // must point at this new class, never the source's.
@@ -1859,10 +1902,25 @@ mod tests {
         )
         .unwrap();
 
-        let log = migrate_class_to_owned_spells(&cfg, 64).unwrap();
+        let mut progress_calls: Vec<(usize, usize)> = Vec::new();
+        let log = migrate_class_to_owned_spells(&cfg, 64, |processed, total| {
+            progress_calls.push((processed, total))
+        })
+        .unwrap();
         assert!(
             log.contains("migrated 2 spell(s) and 1 proc(s)"),
             "log: {log}"
+        );
+        assert_eq!(
+            progress_calls.first(),
+            Some(&(0, 3)),
+            "the real total (2 spells + 1 proc) must be reported up front, before any work: \
+             {progress_calls:?}"
+        );
+        assert_eq!(
+            progress_calls.last(),
+            Some(&(3, 3)),
+            "progress must finish at the real total: {progress_calls:?}"
         );
 
         let line_spells = run_remote_sql_json(
@@ -1893,7 +1951,7 @@ mod tests {
         assert_eq!(originals.len(), 3, "the original shared spells must survive untouched");
 
         // Running it again must be a safe no-op - everything's already independently owned.
-        let second_log = migrate_class_to_owned_spells(&cfg, 64).unwrap();
+        let second_log = migrate_class_to_owned_spells(&cfg, 64, |_, _| {}).unwrap();
         assert!(
             second_log.contains("migrated 0 spell(s) and 0 proc(s)"),
             "second run should find nothing left to migrate: {second_log}"

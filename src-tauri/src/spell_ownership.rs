@@ -107,18 +107,6 @@ fn explicit_guid_pk_column(cfg: &SshConfig, table: &str) -> Result<Option<String
     Ok(None)
 }
 
-fn next_free_id(cfg: &SshConfig, table: &str, id_column: &str) -> Result<i64, String> {
-    let rows = run_remote_sql_json(
-        cfg,
-        &format!("SELECT COALESCE(MAX({id_column}), 0) + 1 AS next FROM {table};"),
-    )?;
-    Ok(rows.first().map(|r| int_field(r, "next")).unwrap_or(1))
-}
-
-pub fn next_free_style_id(cfg: &SshConfig) -> Result<i64, String> {
-    next_free_id(cfg, "Style", "StyleID")
-}
-
 /// `StyleXSpell`'s own GUID-style primary key column, if it has one - resolved once per
 /// `clone_spec` call (see `fn explicit_guid_pk_column`'s own doc comment) and threaded through
 /// every proc this tool clones in that same call.
@@ -126,14 +114,59 @@ pub fn style_x_spell_guid_column(cfg: &SshConfig) -> Result<Option<String>, Stri
     explicit_guid_pk_column(cfg, "StyleXSpell")
 }
 
-/// Allocates and clones independent `Spell` rows on demand for one owning class, as pure
-/// string-building against a batch another caller (`clone_spec`, the migration pass below) is
-/// already composing - never its own separate write call, so it composes cleanly into whatever
-/// single, final `run_remote_sql` call the caller makes.
+/// Clones `Style` row `representative_style_id` under `new_spec_key_q` (already-`sql_quote`d),
+/// with `ClassId` set to `class_expr` (a literal, e.g. `"64"` or `"0"`) and both `StyleID` and
+/// `ID` set to the same freshly, atomically allocated value - returns that real new ID.
+///
+/// Computes its own new `StyleID` via a `(SELECT COALESCE(MAX(StyleID),0)+1 FROM Style)`
+/// subquery evaluated *inside* the same `INSERT`, wrapped in `BEGIN IMMEDIATE`/`COMMIT` - never a
+/// value pre-read into Rust earlier and incremented locally. See `SpellCloner::clone_for_class`'s
+/// own doc comment for the real, reproduced bug class this avoids: a value guessed once and
+/// incremented in Rust across many slow round-trips goes stale the instant anything else (a
+/// second click before the first call finishes, or a second class cloned moments later) writes
+/// to the same table in between - both end up computing the identical "next free" ID, and
+/// whichever actually runs second hits a real `UNIQUE constraint failed`.
+pub fn clone_style_with_fresh_id(
+    cfg: &SshConfig,
+    representative_style_id: i64,
+    new_spec_key_q: &str,
+    class_expr: &str,
+) -> Result<i64, String> {
+    let script = format!(
+        "BEGIN IMMEDIATE;\n\
+         INSERT INTO Style (StyleID, ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, \
+         EnduranceCost, StealthRequirement, OpeningRequirementType, OpeningRequirementValue, \
+         AttackResultRequirement, WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, \
+         BonusToDefense, TwoHandAnimation, RandomProc, ArmorHitLocation, ID) \
+         SELECT (SELECT COALESCE(MAX(StyleID), 0) + 1 FROM Style), {class_expr}, Name, \
+         '{new_spec_key_q}', SpecLevelRequirement, Icon, EnduranceCost, StealthRequirement, \
+         OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
+         WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, \
+         TwoHandAnimation, RandomProc, ArmorHitLocation, \
+         (SELECT COALESCE(MAX(StyleID), 0) + 1 FROM Style) \
+         FROM Style WHERE StyleID = {representative_style_id};\n\
+         SELECT MAX(StyleID) AS NewStyleID FROM Style;\n\
+         COMMIT;\n"
+    );
+    let rows = run_remote_sql_json(cfg, &script)?;
+    rows.first()
+        .map(|r| int_field(r, "NewStyleID"))
+        .ok_or_else(|| {
+            format!(
+                "could not clone style {representative_style_id} - it may no longer exist \
+                 (no row came back after insert)"
+            )
+        })
+}
+
+/// Allocates and clones independent `Spell` rows on demand for one owning class. Unlike most of
+/// this tool's other cloning (which builds one big SQL batch string and executes it once at the
+/// very end), every clone this makes executes - and is fully committed - immediately, so the
+/// returned ID is always real, not merely planned; see `clone_for_class`'s own doc comment for
+/// why.
 pub struct SpellCloner {
     owning_class_id: i64,
     columns: Vec<String>,
-    next_spell_id: i64,
     /// The same source `SpellID` cloned twice for the same class (it appears on two different
     /// spec lines, or as both a cast spell and a style's proc) must reuse the one clone already
     /// made for this class in this call, not make a second independent copy of it.
@@ -146,35 +179,69 @@ impl SpellCloner {
         Ok(Self {
             owning_class_id,
             columns: columns_excluding_pk(cfg, "Spell")?,
-            next_spell_id: next_free_id(cfg, "Spell", "SpellID")?,
             memo: HashMap::new(),
         })
     }
 
-    /// Returns this call's owning class's own independent clone of `source_spell_id`, appending
-    /// whatever `INSERT` statements are needed to make it exist to `batch` (a no-op append if
+    /// Returns this call's owning class's own independent clone of `source_spell_id`, cloning it
+    /// right now if it doesn't already have one (a no-op, returning the same ID as before, if
     /// this exact source was already cloned earlier in this same call). `source_spell_id <= 0`
     /// (no real spell - e.g. a pure melee style with no cast component) is returned unchanged;
     /// there is nothing to clone.
-    pub fn clone_for_class(&mut self, batch: &mut String, source_spell_id: i64) -> i64 {
+    ///
+    /// A real, reproduced bug this used to have: the new `SpellID` was computed once (`MAX + 1`)
+    /// when the caller's whole operation started, then just incremented in Rust for every
+    /// further spell cloned in the same call, with every actual `INSERT` deferred into one big
+    /// batch string executed only at the very end. That value is correct at the instant it's
+    /// read, but goes stale the moment anything else writes to `Spell` before this call's own
+    /// batch finally runs - a second click on the same button before the first finished (a real,
+    /// reproduced case, since this can touch dozens of spells across many slow round-trips with
+    /// no visual feedback that anything is happening), or a second class cloned/migrated moments
+    /// later, would read the exact same "next free" value and collide on insert. Fixed by never
+    /// guessing in Rust at all: the new ID is computed by a `(SELECT COALESCE(MAX(SpellID),0)+1
+    /// FROM Spell)` subquery evaluated *inside* the same `INSERT`, the whole insert-and-readback
+    /// wrapped in `BEGIN IMMEDIATE`/`COMMIT` so SQLite's own write-locking (not this tool's own
+    /// bookkeeping) is what actually serializes two overlapping calls - whichever runs second
+    /// simply computes its own, now-correct, distinct ID against the first's already-committed
+    /// state, instead of racing it.
+    pub fn clone_for_class(&mut self, cfg: &SshConfig, source_spell_id: i64) -> Result<i64, String> {
         if source_spell_id <= 0 {
-            return source_spell_id;
+            return Ok(source_spell_id);
         }
         if let Some(&existing) = self.memo.get(&source_spell_id) {
-            return existing;
+            return Ok(existing);
         }
-        let new_id = self.next_spell_id;
-        self.next_spell_id += 1;
+        let exists = run_remote_sql_json(
+            cfg,
+            &format!("SELECT 1 FROM Spell WHERE SpellID = {source_spell_id};"),
+        )?;
+        if exists.is_empty() {
+            return Err(format!(
+                "source spell {source_spell_id} does not exist in Spell - cannot clone it \
+                 (the referencing LineXSpell/StyleXSpell row may be stale)"
+            ));
+        }
         let col_list = self.columns.join(", ");
-        batch.push_str(&format!(
-            "INSERT INTO Spell ({col_list}, SpellID) SELECT {col_list}, {new_id} FROM Spell WHERE SpellID = {source_spell_id};\n"
-        ));
-        batch.push_str(&format!(
-            "INSERT INTO ClassEditorSpellClone (NewSpellID, SourceSpellID, OwningClassId) VALUES ({new_id}, {source_spell_id}, {});\n",
+        let script = format!(
+            "BEGIN IMMEDIATE;\n\
+             INSERT INTO Spell ({col_list}, SpellID) \
+             SELECT {col_list}, (SELECT COALESCE(MAX(SpellID), 0) + 1 FROM Spell) \
+             FROM Spell WHERE SpellID = {source_spell_id};\n\
+             INSERT INTO ClassEditorSpellClone (NewSpellID, SourceSpellID, OwningClassId) \
+             SELECT MAX(SpellID), {source_spell_id}, {} FROM Spell;\n\
+             SELECT MAX(SpellID) AS NewSpellID FROM Spell;\n\
+             COMMIT;\n",
             self.owning_class_id
-        ));
+        );
+        let rows = run_remote_sql_json(cfg, &script)?;
+        let new_id = rows
+            .first()
+            .map(|r| int_field(r, "NewSpellID"))
+            .ok_or_else(|| {
+                format!("could not clone spell {source_spell_id} - no row came back after insert")
+            })?;
         self.memo.insert(source_spell_id, new_id);
-        new_id
+        Ok(new_id)
     }
 }
 
@@ -345,11 +412,9 @@ mod tests {
         let dir = setup_test_db("clone-basic");
         let cfg = test_cfg(&dir);
         let mut cloner = SpellCloner::new(&cfg, 64).unwrap();
-        let mut batch = String::new();
 
-        let new_id = cloner.clone_for_class(&mut batch, 9001);
+        let new_id = cloner.clone_for_class(&cfg, 9001).unwrap();
         assert_ne!(new_id, 9001, "must be a brand-new ID, not the source's own");
-        run_remote_sql(&cfg, &batch).unwrap();
 
         let rows = run_remote_sql_json(
             &cfg,
@@ -373,13 +438,38 @@ mod tests {
         let dir = setup_test_db("clone-memo");
         let cfg = test_cfg(&dir);
         let mut cloner = SpellCloner::new(&cfg, 64).unwrap();
-        let mut batch = String::new();
 
-        let first = cloner.clone_for_class(&mut batch, 9001);
-        let second = cloner.clone_for_class(&mut batch, 9001);
+        let first = cloner.clone_for_class(&cfg, 9001).unwrap();
+        let second = cloner.clone_for_class(&cfg, 9001).unwrap();
         assert_eq!(
             first, second,
             "the same source spell cloned twice for the same class must reuse one clone"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clone_for_class_is_safe_even_if_two_calls_race_to_allocate_at_once() {
+        // The exact real bug this module's own doc comment describes: a "next free ID" computed
+        // once and incremented in Rust across many slow round-trips would go stale and collide
+        // the moment a second, concurrent clone (e.g. a double-clicked button) also wrote to
+        // Spell in between. Two independent cloners, interleaved by hand here to simulate that
+        // overlap, must each still get their own distinct, real ID - never collide.
+        let dir = setup_test_db("clone-race");
+        let cfg = test_cfg(&dir);
+        let mut cloner_a = SpellCloner::new(&cfg, 64).unwrap();
+        let mut cloner_b = SpellCloner::new(&cfg, 65).unwrap();
+
+        let id_a = cloner_a.clone_for_class(&cfg, 9001).unwrap();
+        let id_b = cloner_b.clone_for_class(&cfg, 9002).unwrap();
+        assert_ne!(id_a, id_b, "two overlapping clones must never collide on the same new ID");
+
+        let rows = run_remote_sql_json(&cfg, "SELECT SpellID FROM Spell;").unwrap();
+        assert_eq!(
+            rows.len(),
+            4,
+            "both new clones plus both originals must exist: {rows:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -390,9 +480,7 @@ mod tests {
         let dir = setup_test_db("edit-safety");
         let cfg = test_cfg(&dir);
         let mut cloner = SpellCloner::new(&cfg, 64).unwrap();
-        let mut batch = String::new();
-        let new_id = cloner.clone_for_class(&mut batch, 9001);
-        run_remote_sql(&cfg, &batch).unwrap();
+        let new_id = cloner.clone_for_class(&cfg, 9001).unwrap();
 
         let mut fields = HashMap::new();
         fields.insert("Damage".to_string(), Value::from(999));
@@ -442,9 +530,7 @@ mod tests {
         let dir = setup_test_db("edit-refuses-unknown-field");
         let cfg = test_cfg(&dir);
         let mut cloner = SpellCloner::new(&cfg, 64).unwrap();
-        let mut batch = String::new();
-        let new_id = cloner.clone_for_class(&mut batch, 9001);
-        run_remote_sql(&cfg, &batch).unwrap();
+        let new_id = cloner.clone_for_class(&cfg, 9001).unwrap();
 
         let mut fields = HashMap::new();
         fields.insert("NotARealColumn".to_string(), Value::from(1));
@@ -459,9 +545,7 @@ mod tests {
         let dir = setup_test_db("delete-safety");
         let cfg = test_cfg(&dir);
         let mut cloner = SpellCloner::new(&cfg, 64).unwrap();
-        let mut batch = String::new();
-        let owned_id = cloner.clone_for_class(&mut batch, 9001);
-        run_remote_sql(&cfg, &batch).unwrap();
+        let owned_id = cloner.clone_for_class(&cfg, 9001).unwrap();
 
         // Ask it to delete both the real owned clone and a shared/un-owned ID (9002) in the same
         // call - only the owned one may actually go.
@@ -498,9 +582,7 @@ mod tests {
         let dir = setup_test_db("delete-style-procs");
         let cfg = test_cfg(&dir);
         let mut cloner = SpellCloner::new(&cfg, 64).unwrap();
-        let mut batch = String::new();
-        let proc_spell_id = cloner.clone_for_class(&mut batch, 9002);
-        run_remote_sql(&cfg, &batch).unwrap();
+        let proc_spell_id = cloner.clone_for_class(&cfg, 9002).unwrap();
         run_remote_sql(
             &cfg,
             &format!(
@@ -530,14 +612,10 @@ mod tests {
         let dir = setup_test_db("list-owned");
         let cfg = test_cfg(&dir);
         let mut cloner_a = SpellCloner::new(&cfg, 64).unwrap();
-        let mut batch = String::new();
-        cloner_a.clone_for_class(&mut batch, 9001);
-        run_remote_sql(&cfg, &batch).unwrap();
+        cloner_a.clone_for_class(&cfg, 9001).unwrap();
 
-        let mut batch2 = String::new();
         let mut cloner_b = SpellCloner::new(&cfg, 65).unwrap();
-        cloner_b.clone_for_class(&mut batch2, 9002);
-        run_remote_sql(&cfg, &batch2).unwrap();
+        cloner_b.clone_for_class(&cfg, 9002).unwrap();
 
         let owned_64 = list_owned_spells(&cfg, 64).unwrap();
         assert_eq!(owned_64.len(), 1, "{owned_64:?}");

@@ -202,9 +202,22 @@ fn clone_realm_abilities(
     realm_abilities::clone_realm_abilities(&cfg, source_class_id, new_class_id)
 }
 
+#[derive(serde::Serialize, Clone)]
+struct MigrateProgress {
+    processed: usize,
+    total: usize,
+}
+
 #[tauri::command]
-fn migrate_class_to_owned_spells(cfg: SshConfig, class_id: i64) -> Result<String, String> {
-    specs::migrate_class_to_owned_spells(&cfg, class_id)
+fn migrate_class_to_owned_spells(
+    app: tauri::AppHandle,
+    cfg: SshConfig,
+    class_id: i64,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    specs::migrate_class_to_owned_spells(&cfg, class_id, |processed, total| {
+        let _ = app.emit("migrate-progress", MigrateProgress { processed, total });
+    })
 }
 
 #[tauri::command]
