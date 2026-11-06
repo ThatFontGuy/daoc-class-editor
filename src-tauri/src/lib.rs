@@ -3,6 +3,7 @@ mod codegen;
 mod deploy;
 mod deployed;
 mod realm_abilities;
+mod spell_ownership;
 mod specs;
 mod trainer;
 
@@ -202,6 +203,25 @@ fn clone_realm_abilities(
 }
 
 #[tauri::command]
+fn migrate_class_to_owned_spells(cfg: SshConfig, class_id: i64) -> Result<String, String> {
+    specs::migrate_class_to_owned_spells(&cfg, class_id)
+}
+
+#[tauri::command]
+fn list_owned_spells(cfg: SshConfig, class_id: i64) -> Result<Vec<serde_json::Value>, String> {
+    spell_ownership::list_owned_spells(&cfg, class_id)
+}
+
+#[tauri::command]
+fn update_owned_spell_fields(
+    cfg: SshConfig,
+    spell_id: i64,
+    fields: std::collections::HashMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    spell_ownership::update_owned_spell_fields(&cfg, spell_id, &fields)
+}
+
+#[tauri::command]
 fn save_project_file(path: String, json: String) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("could not write {path}: {e}"))
 }
@@ -246,6 +266,9 @@ pub fn run() {
             list_line_spells,
             apply_class_specs,
             clone_realm_abilities,
+            migrate_class_to_owned_spells,
+            list_owned_spells,
+            update_owned_spell_fields,
             save_project_file,
             load_project_file,
             delete_deployed_class,

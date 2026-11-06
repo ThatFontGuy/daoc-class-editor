@@ -13,6 +13,7 @@ use crate::deploy::{
     SshConfig, is_local, run_command, run_remote_sql, run_remote_sql_json, scripts_dir,
     ssh_base_args,
 };
+use crate::spell_ownership::{delete_owned_spells, delete_style_procs_for_styles};
 use serde_json::Value;
 use std::process::Command;
 
@@ -87,6 +88,10 @@ fn str_field(row: &Value, key: &str) -> String {
         .to_string()
 }
 
+fn int_field(row: &Value, key: &str) -> i64 {
+    row.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
 /// Removes a deployed class: the `.cs` file, its `ClassXSpecialization` rows, and - if
 /// `cleanup_cloned_specs` is set - every Specialization/SpellLine/LineXSpell/Style row whose
 /// KeyName/Spec carries this exact class's `_<id>` suffix (the convention `apply_class_specs`'s
@@ -141,7 +146,21 @@ pub fn delete_deployed_class(
             .map(|l| str_field(l, "KeyName"))
             .collect();
 
+        // Gather every spell this class's own cloned lines/styles own *before* deleting the rows
+        // that reference them (LineXSpell/StyleXSpell) - once those rows are gone there's no way
+        // back to which SpellID they used. `delete_owned_spells`/`delete_style_procs_for_styles`
+        // only ever remove a `Spell` row this tool itself tracked as an independent clone (see
+        // spell_ownership.rs) - a shared/un-owned SpellID is never touched here.
+        let mut owned_spell_ids: Vec<i64> = Vec::new();
         for line_key in &cloned_lines {
+            let spells = run_remote_sql_json(
+                cfg,
+                &format!(
+                    "SELECT SpellID FROM LineXSpell WHERE LineName = '{}';",
+                    sql_quote(line_key)
+                ),
+            )?;
+            owned_spell_ids.extend(spells.iter().map(|s| int_field(s, "SpellID")));
             run_remote_sql(
                 cfg,
                 &format!(
@@ -163,6 +182,17 @@ pub fn delete_deployed_class(
         }
 
         for spec_key in &cloned_keys {
+            let style_ids: Vec<i64> = run_remote_sql_json(
+                cfg,
+                &format!(
+                    "SELECT StyleID FROM Style WHERE SpecKeyName = '{}';",
+                    sql_quote(spec_key)
+                ),
+            )?
+            .iter()
+            .map(|r| int_field(r, "StyleID"))
+            .collect();
+            delete_style_procs_for_styles(cfg, &style_ids)?;
             run_remote_sql(
                 cfg,
                 &format!(
@@ -178,6 +208,7 @@ pub fn delete_deployed_class(
                 ),
             )?;
         }
+        delete_owned_spells(cfg, &owned_spell_ids)?;
         log.push_str(&format!(
             "removed {} cloned spec(s), {} spell line(s)\n",
             cloned_keys.len(),
@@ -239,6 +270,8 @@ mod tests {
             CREATE TABLE SpellLine (KeyName TEXT, Name TEXT, Spec TEXT, IsBaseLine INTEGER, ClassIDHint INTEGER);
             CREATE TABLE LineXSpell (LineName TEXT, SpellID INTEGER, Level INTEGER);
             CREATE TABLE Style (StyleID INTEGER PRIMARY KEY AUTOINCREMENT, ClassId INTEGER, Name TEXT, SpecKeyName TEXT);
+            CREATE TABLE Spell (SpellID INTEGER PRIMARY KEY, Name TEXT);
+            CREATE TABLE StyleXSpell (StyleXSpell_ID TEXT PRIMARY KEY DEFAULT '', SpellID INTEGER, ClassID INTEGER, StyleID INTEGER, Chance INTEGER);
 
             INSERT INTO Specialization VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL);
             INSERT INTO Specialization VALUES ('earthshatter_64', 'Earthshatter', 'Holy damage spells', 200, NULL);
@@ -247,8 +280,23 @@ mod tests {
             INSERT INTO SpellLine VALUES ('earthshatter_64_smite_base', 'Earthshatter Spells', 'earthshatter_64', 0, 64);
             INSERT INTO LineXSpell VALUES ('earthshatter_64_smite_base', 9001, 1);
             INSERT INTO Style VALUES (NULL, 64, 'Shatter', 'earthshatter_64');
+            INSERT INTO Spell VALUES (9001, 'Shatter Bolt');
+            INSERT INTO Spell VALUES (9002, 'Shatter Proc');
+            INSERT INTO StyleXSpell VALUES ('proc-1', 9002, 64, 1, 25);
         ";
         let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
+        assert!(status.success());
+
+        // Both of this class's own spells (the cast spell 9001, and the style proc 9002) are
+        // tracked as this tool's own clones - mirroring what `clone_spec` would have left behind
+        // for a class actually created through the normal flow, so the delete cleanup below has
+        // something real to find and remove.
+        let mark_owned = format!(
+            "CREATE TABLE IF NOT EXISTS ClassEditorSpellClone (NewSpellID INTEGER PRIMARY KEY, SourceSpellID INTEGER NOT NULL, OwningClassId INTEGER NOT NULL);
+             INSERT INTO ClassEditorSpellClone VALUES (9001, 1001, 64);
+             INSERT INTO ClassEditorSpellClone VALUES (9002, 1002, 64);"
+        );
+        let status = Command::new("sqlite3").arg(&db).arg(mark_owned).status().unwrap();
         assert!(status.success());
         dir
     }
@@ -316,6 +364,21 @@ mod tests {
         )
         .unwrap();
         assert!(styles.is_empty());
+
+        // Its own independently-cloned spells (the cast spell and the style's proc) must be
+        // gone too, along with the StyleXSpell row and the tracking table's own rows for them.
+        let spells = run_remote_sql_json(&cfg, "SELECT SpellID FROM Spell;").unwrap();
+        assert!(
+            spells.is_empty(),
+            "both owned spell clones must be removed: {spells:?}"
+        );
+        let procs = run_remote_sql_json(&cfg, "SELECT * FROM StyleXSpell;").unwrap();
+        assert!(procs.is_empty(), "the proc row itself must be removed too");
+        let tracking = run_remote_sql_json(&cfg, "SELECT * FROM ClassEditorSpellClone;").unwrap();
+        assert!(
+            tracking.is_empty(),
+            "the ownership tracking rows must be cleaned up too: {tracking:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

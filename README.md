@@ -9,6 +9,14 @@ class** for an [OpenDAoC](https://github.com/OpenDAoC/OpenDAoC-Core)/Offline DAo
 > Games. This is an unofficial, non-commercial fan tool for a self-hosted, offline-style server;
 > it is not affiliated with EA/Broadsword.
 
+**Compatibility:** this targets **OpenDAoC-Core-derived servers running a SQLite-backed
+database** - confirmed to work against at least two independent forks sharing that same schema
+(this project's own test server, and `catastrophic-impact/daoc-offline-linux-server-bots`). It
+talks to the database by shelling out to the local `sqlite3` CLI (directly, or over SSH), against
+a hardcoded `data/opendaoc.sqlite3.db` path - a **MySQL-backed** OpenDAoC server (OpenDAoC-Core
+supports both backends) isn't supported today, and a genuinely non-OpenDAoC-lineage server (e.g.
+an older vanilla DOLSharp fork with a divergent schema) is untested and likely to fail outright.
+
 ## What this actually does
 
 The core insight this tool is built around: a new class is, at minimum, a tiny C# file that
@@ -50,15 +58,22 @@ deployment path was confirmed against a real running server after an early mix-u
   raw numeric ID in the server's database (`ClassXSpecialization`), with zero inheritance from
   whatever the class's `.cs` file subclasses. Without this, a cloned class would have no specs, no
   combat styles, and no weapon/armor proficiency at all. Every spec you add is always cloned -
-  its own independent copy of the `Specialization` row, `SpellLine`(s), `LineXSpell` entries, and
-  `Style` rows - which you can rename (and, later, edit separately). This used to also offer
-  "reuse" (sharing the exact same spec, unchanged, with the class you cloned from), but that was
-  removed after a real, reproduced bug: the server looks up whether a class can use a style by an
-  *exact* class-ID match, so a reused spec whose styles happened to be locked to some other class
-  (not even necessarily the class you cloned from - a shared spec can be locked to an entirely
-  unrelated third class) would train and show a level with zero usable styles, invisibly, with no
-  error anywhere. Cloning always repoints any class-locked style to your new class, so this can't
-  happen.
+  its own independent copy of the `Specialization` row, `SpellLine`(s), `LineXSpell` entries,
+  `Style` rows, and `Style` procs (`StyleXSpell`) - which you can rename and edit separately (see
+  **Edit spells**, below). This used to also offer "reuse" (sharing the exact same spec, unchanged,
+  with the class you cloned from), but that was removed after a real, reproduced bug: the server
+  looks up whether a class can use a style by an *exact* class-ID match, so a reused spec whose
+  styles happened to be locked to some other class (not even necessarily the class you cloned from
+  - a shared spec can be locked to an entirely unrelated third class) would train and show a level
+  with zero usable styles, invisibly, with no error anywhere. Cloning always repoints any
+  class-locked style to your new class, so this can't happen.
+- **Every cloned spell is its own independent copy, not a shared pointer** - a second, deeper
+  version of the same gap: `LineXSpell`/`StyleXSpell` entries used to just reuse the *source*
+  spell's own literal `SpellID` verbatim, so a clone's spells were never actually independent data
+  - editing one's damage/range/duration/etc. would have silently edited it for every class/spec
+  line referencing that same row, including the class you cloned from. Every spell (cast or proc)
+  a clone needs now gets its own fully independent `Spell` row, tracked internally so it can later
+  be safely edited or deleted without ever touching a row some other class still depends on.
 - Deploying the generated file to your server's `bin/scripts/` folder and restarting it, over
   SSH or locally.
 - **Listing, editing, and deleting already-deployed classes** - a "Deployed classes" tab lists
@@ -68,9 +83,16 @@ deployment path was confirmed against a real running server after an early mix-u
   every stat/profession/race field pre-filled with its *current* values, diffed against whatever
   it actually subclasses - change what you want and redeploy. **Delete** removes the `.cs` file,
   its `ClassXSpecialization` rows, and - optionally - every `Specialization`/`SpellLine`/
-  `LineXSpell`/`Style` row this tool cloned specifically for it (identified precisely, because
-  cloned spec keys always embed the owning class's ID, e.g. `earthshatter_64`). Handy for fixing
-  or cleaning up a clone that didn't work out while debugging, or just as routine housekeeping.
+  `LineXSpell`/`Style`/`StyleXSpell` row this tool cloned specifically for it (identified
+  precisely, because cloned spec keys always embed the owning class's ID, e.g. `earthshatter_64`),
+  plus every independently-owned `Spell` row that cleanup leaves orphaned. Handy for fixing or
+  cleaning up a clone that didn't work out while debugging, or just as routine housekeeping.
+- **Edit spells** - a tab listing every spell a given deployed class independently owns (cast
+  spells and style procs alike), editable field-by-field (damage, range, duration, icon, ...) with
+  no risk of also changing it for the class it was cloned from, or any other class. A class
+  deployed *before* this existed still has its spells pointing at shared, un-owned rows - use
+  **Migrate to independent spells** there first (safe to run more than once; anything already
+  independent is left alone) to convert it.
 - **Save/Load a project** (top-right of the window) - designing a class is something you iterate
   into existence over multiple sessions, not finish in one sitting; a project file captures the
   source class, every override, and every spec assignment so far.
@@ -85,9 +107,6 @@ deployment path was confirmed against a real running server after an early mix-u
   a location, done) - no hand-written C# or manual `Mob` row needed.
 
 **Not automated yet** (planned next, see the phased plan in project history/issues, or ask):
-- Individual spell and melee-style *details* (damage, duration, range, growth rate, procs, etc.) -
-  currently you can only assign/clone whole spec lines, not edit what's inside them field by
-  field yet.
 - Starter equipment and a starting location aren't generated yet for a smooth first-level
   experience - reuse an existing one via SQL (there's a "run SQL on the server" box for exactly
   this) or extend the class-editing form later.
@@ -116,6 +135,9 @@ deployment path was confirmed against a real running server after an early mix-u
    clones as its own independent copy, optionally rename each), override only what stat/race
    fields you want to change, generate,
    preview, and deploy. Use **Save**/**Load** (top-right) any time to pick this back up later.
+5. In **Edit spells**: pick a deployed class to field-edit its own independently-cloned spells
+   (damage, range, duration, icon, ...). A class deployed before this feature existed needs
+   **Migrate to independent spells** run once first.
 
 ## Where the reference data comes from
 

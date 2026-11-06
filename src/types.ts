@@ -114,6 +114,11 @@ export interface SpecAssignmentPayload {
   spell_line_selection: SpellLineSelectionPayload[];
 }
 
+// Mirrors src-tauri/src/spell_ownership.rs. A Spell row's real schema has dozens of fields that
+// vary between server forks (damage, range, duration, procs, message text, ...), so this is
+// deliberately untyped - the editor renders whatever columns actually come back.
+export type OwnedSpellRow = Record<string, string | number | boolean | null>;
+
 // Mirrors src-tauri/src/trainer.rs.
 
 export interface TrainerRequest {

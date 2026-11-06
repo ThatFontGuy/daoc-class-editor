@@ -8,18 +8,29 @@
 //! not carry this over; it has to be done here, as data.
 //!
 //! Every spec assignment is a full, independent clone - the Specialization row itself, its
-//! SpellLine(s), their LineXSpell entries, its Style (melee skill) rows, and its SpecXAbility
+//! SpellLine(s), their LineXSpell entries, its Style (melee skill) rows, its SpecXAbility
 //! (level-granted abilities, e.g. Stealth's "Safe Fall"/"Detect Hidden", or a "Career" spec's
-//! auto-trained bonuses) are all duplicated under a new KeyName/display Name the caller chooses.
-//! This used to also offer a "reuse" mode (sharing the exact same spec/styles with the source
-//! class, no duplication) - removed after a real, reproduced bug: `SkillBase.GetStyleList(specID,
-//! classId)` looks up a class-locked style's availability by an *exact* class-ID match, so a
-//! reused spec whose styles are locked to the *source* class's ID (a very common case for any
-//! real combat spec) would train and show a level, but its styles would never actually appear
-//! for the new class at all - silently, nothing in the UI or server logs flags it. Cloning always
-//! repoints a class-locked style's (and ability's - the exact same bug class applies to
-//! SpecXAbility's own ClassId) ClassId to the new class, so this can't happen. Procs
-//! (StyleXSpell) are not cloned yet - a known gap, noted in the UI.
+//! auto-trained bonuses), and its Style procs (StyleXSpell) are all duplicated under a new
+//! KeyName/display Name the caller chooses. This used to also offer a "reuse" mode (sharing the
+//! exact same spec/styles with the source class, no duplication) - removed after a real,
+//! reproduced bug: `SkillBase.GetStyleList(specID, classId)` looks up a class-locked style's
+//! availability by an *exact* class-ID match, so a reused spec whose styles are locked to the
+//! *source* class's ID (a very common case for any real combat spec) would train and show a
+//! level, but its styles would never actually appear for the new class at all - silently, nothing
+//! in the UI or server logs flags it. Cloning always repoints a class-locked style's (and
+//! ability's - the exact same bug class applies to SpecXAbility's own ClassId) ClassId to the new
+//! class, so this can't happen.
+//!
+//! A second, deeper gap in the same spirit, found later and fixed in `spell_ownership.rs`:
+//! LineXSpell/StyleXSpell entries used to just point at the *source*'s own literal SpellID
+//! verbatim - so a clone's spells were never actually independent data, just new pointers at
+//! whatever the source (or any other class entirely, if that spell happens to be reused
+//! elsewhere) already had. Editing a spell's own values would have silently edited it everywhere
+//! it's referenced. Every spell (cast or proc) this function clones now gets its own fully
+//! independent `Spell` row via `SpellCloner`, tracked in `ClassEditorSpellClone` so it can later
+//! be safely deleted or edited without ever touching a row this class doesn't itself own.
+//! `migrate_class_to_owned_spells` (below) does the same conversion for a class that was cloned
+//! before this fix existed.
 //!
 //! Renaming a spec that's already assigned to the class being edited does *not* remove the old
 //! ClassXSpecialization assignment under its original key - a real, reproduced bug found live:
@@ -39,6 +50,10 @@
 //! those may still be in active use by other classes.
 
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
+use crate::spell_ownership::{
+    SpellCloner, delete_owned_spells, delete_style_procs_for_styles, next_free_style_id,
+    style_x_spell_guid_column,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -625,6 +640,135 @@ pub fn apply_class_specs(
     Ok(log)
 }
 
+/// One-time conversion for a class that was cloned *before* `clone_spec` started independently
+/// cloning its own spells (see this module's own doc comment, and `spell_ownership.rs`) - finds
+/// every spell this class's own cloned specs reference that still isn't an independent clone,
+/// and converts it to one in place (new `Spell` row, `LineXSpell`/`StyleXSpell` repointed at it),
+/// without touching the Specialization/SpellLine/Style rows themselves at all. Idempotent: a
+/// spell already independently owned by *any* class (this one or otherwise - once a `SpellID` is
+/// a tracked clone at all, it's definitionally not shared with anything else) is left alone, so
+/// running this again (or against a class that was never affected in the first place) is a safe
+/// no-op.
+///
+/// Only ever touches specs this tool itself cloned specifically for `class_id` - identified the
+/// same way `delete_deployed_class`'s own cleanup already does, via the `_<class_id>` suffix
+/// convention `apply_class_specs` gives every clone's own KeyName. A plain/shared spec assigned
+/// directly (e.g. "Sword", via `NEVER_CLONE_SPECS`) is never migrated - its SpellLines, if any,
+/// are still genuinely shared with whatever else assigns it directly, and always will be.
+pub fn migrate_class_to_owned_spells(cfg: &SshConfig, class_id: i64) -> Result<String, String> {
+    let suffix = format!("_{class_id}");
+    let assigned = run_remote_sql_json(
+        cfg,
+        &format!("SELECT SpecKeyName FROM ClassXSpecialization WHERE ClassID = {class_id};"),
+    )?;
+    let owned_keys: Vec<String> = assigned
+        .iter()
+        .map(|r| str_field(r, "SpecKeyName"))
+        .filter(|k| k.ends_with(&suffix))
+        .collect();
+
+    let mut cloner = SpellCloner::new(cfg, class_id)?;
+    let mut batch = String::new();
+    let mut migrated_spells = 0usize;
+    let mut migrated_procs = 0usize;
+    // Whatever StyleXSpell's own real GUID-style primary key column is called (see
+    // `style_x_spell_guid_column`'s own doc comment), resolved once up front - falls back to
+    // matching a row by its full (StyleID, SpellID) pair if this table's own PK turns out to be
+    // a plain autoincrement rowid instead (no fork has been seen to actually do that, but this
+    // stays correct either way rather than assuming).
+    let style_x_spell_pk = style_x_spell_guid_column(cfg)?;
+
+    for spec_key in &owned_keys {
+        let spec_key_q = sql_quote(spec_key);
+
+        let lines = run_remote_sql_json(
+            cfg,
+            &format!("SELECT KeyName FROM SpellLine WHERE Spec = '{spec_key_q}';"),
+        )?;
+        for line in &lines {
+            let line_key_q = sql_quote(&str_field(line, "KeyName"));
+            let rows = run_remote_sql_json(
+                cfg,
+                &format!(
+                    "SELECT LineXSpell_ID, SpellID FROM LineXSpell WHERE LineName = '{line_key_q}';"
+                ),
+            )?;
+            for row in &rows {
+                let old_spell_id = int_field(row, "SpellID");
+                let row_id_q = sql_quote(&str_field(row, "LineXSpell_ID"));
+                let already_owned = run_remote_sql_json(
+                    cfg,
+                    &format!(
+                        "SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {old_spell_id};"
+                    ),
+                )?;
+                if !already_owned.is_empty() {
+                    continue;
+                }
+                let new_spell_id = cloner.clone_for_class(&mut batch, old_spell_id);
+                batch.push_str(&format!(
+                    "UPDATE LineXSpell SET SpellID = {new_spell_id} WHERE LineXSpell_ID = '{row_id_q}';\n"
+                ));
+                migrated_spells += 1;
+            }
+        }
+
+        let styles = run_remote_sql_json(
+            cfg,
+            &format!("SELECT StyleID FROM Style WHERE SpecKeyName = '{spec_key_q}';"),
+        )?;
+        let style_ids_csv = styles
+            .iter()
+            .map(|r| int_field(r, "StyleID").to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if style_ids_csv.is_empty() {
+            continue;
+        }
+        let select_cols = match &style_x_spell_pk {
+            Some(col) => format!("{col} AS RowKey, SpellID"),
+            None => "StyleID AS RowKey, SpellID".to_string(),
+        };
+        let procs = run_remote_sql_json(
+            cfg,
+            &format!(
+                "SELECT {select_cols} FROM StyleXSpell WHERE StyleID IN ({style_ids_csv});"
+            ),
+        )?;
+        for proc in &procs {
+            let old_spell_id = int_field(proc, "SpellID");
+            let already_owned = run_remote_sql_json(
+                cfg,
+                &format!("SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {old_spell_id};"),
+            )?;
+            if !already_owned.is_empty() {
+                continue;
+            }
+            let new_spell_id = cloner.clone_for_class(&mut batch, old_spell_id);
+            let where_clause = match &style_x_spell_pk {
+                Some(col) => format!("{col} = '{}'", sql_quote(&str_field(proc, "RowKey"))),
+                None => format!(
+                    "StyleID = {} AND SpellID = {old_spell_id}",
+                    int_field(proc, "RowKey")
+                ),
+            };
+            batch.push_str(&format!(
+                "UPDATE StyleXSpell SET SpellID = {new_spell_id} WHERE {where_clause};\n"
+            ));
+            migrated_procs += 1;
+        }
+    }
+
+    if !batch.is_empty() {
+        run_remote_sql(cfg, &batch)?;
+    }
+    Ok(format!(
+        "migrated {migrated_spells} spell(s) and {migrated_procs} proc(s), across {} owned \
+         spec(s), to independent, editable copies\n",
+        owned_keys.len()
+    ))
+}
+
 /// Fully removes whatever an exact spec KeyName already owns (Specialization, its SpellLine(s)
 /// and their LineXSpell entries, Style, SpecXAbility, and its ClassXSpecialization assignment) -
 /// everything clone_spec creates - if it exists at all. A clean no-op otherwise. Lets
@@ -645,8 +789,16 @@ fn delete_existing_clone(cfg: &SshConfig, key: &str) -> Result<(), String> {
         cfg,
         &format!("SELECT KeyName FROM SpellLine WHERE Spec = '{key_q}';"),
     )?;
+    // Gather every spell this clone owns *before* deleting the rows that reference them - once
+    // the LineXSpell row is gone there's no way back to which SpellID it used.
+    let mut owned_spell_ids: Vec<i64> = Vec::new();
     for line in &lines {
         let line_key_q = sql_quote(&str_field(line, "KeyName"));
+        let spells = run_remote_sql_json(
+            cfg,
+            &format!("SELECT SpellID FROM LineXSpell WHERE LineName = '{line_key_q}';"),
+        )?;
+        owned_spell_ids.extend(spells.iter().map(|s| int_field(s, "SpellID")));
         run_remote_sql(
             cfg,
             &format!("DELETE FROM LineXSpell WHERE LineName = '{line_key_q}';"),
@@ -656,6 +808,17 @@ fn delete_existing_clone(cfg: &SshConfig, key: &str) -> Result<(), String> {
         cfg,
         &format!("DELETE FROM SpellLine WHERE Spec = '{key_q}';"),
     )?;
+
+    // Same for any styles' own procs - gathered before the styles themselves (and their
+    // StyleXSpell rows) are deleted below.
+    let style_ids: Vec<i64> = run_remote_sql_json(
+        cfg,
+        &format!("SELECT StyleID FROM Style WHERE SpecKeyName = '{key_q}';"),
+    )?
+    .iter()
+    .map(|r| int_field(r, "StyleID"))
+    .collect();
+    delete_style_procs_for_styles(cfg, &style_ids)?;
     run_remote_sql(
         cfg,
         &format!("DELETE FROM Style WHERE SpecKeyName = '{key_q}';"),
@@ -672,6 +835,7 @@ fn delete_existing_clone(cfg: &SshConfig, key: &str) -> Result<(), String> {
         cfg,
         &format!("DELETE FROM Specialization WHERE KeyName = '{key_q}';"),
     )?;
+    delete_owned_spells(cfg, &owned_spell_ids)?;
     Ok(())
 }
 
@@ -1069,6 +1233,13 @@ fn prune_spell_lines_in_place(
             .find(|s| s.source_line_key == line_key);
 
         if selection.is_none_or(|s| !s.included) {
+            let spell_ids: Vec<i64> = run_remote_sql_json(
+                cfg,
+                &format!("SELECT SpellID FROM LineXSpell WHERE LineName = '{line_key_q}';"),
+            )?
+            .iter()
+            .map(|r| int_field(r, "SpellID"))
+            .collect();
             run_remote_sql(
                 cfg,
                 &format!("DELETE FROM LineXSpell WHERE LineName = '{line_key_q}';"),
@@ -1077,6 +1248,7 @@ fn prune_spell_lines_in_place(
                 cfg,
                 &format!("DELETE FROM SpellLine WHERE KeyName = '{line_key_q}';"),
             )?;
+            delete_owned_spells(cfg, &spell_ids)?;
             log.push_str(&format!(
                 "removed the whole '{}' spell line (excluded from the customization)\n",
                 line_key
@@ -1098,6 +1270,7 @@ fn prune_spell_lines_in_place(
                     "DELETE FROM LineXSpell WHERE LineName = '{line_key_q}' AND SpellID IN ({ids});"
                 ),
             )?;
+            delete_owned_spells(cfg, &s.excluded_spell_ids)?;
             log.push_str(&format!(
                 "removed {} excluded spell(s) from '{}'\n",
                 s.excluded_spell_ids.len(),
@@ -1145,6 +1318,12 @@ fn clone_spec(
          SELECT '{new_key_q}', '{new_name_q}', Description, Icon, Implementation, {client_style_group} \
          FROM Specialization WHERE KeyName = '{source_key_q}';\n"
     );
+
+    // Every spell (cast or proc) this clone needs gets its own fully independent `Spell` row -
+    // see spell_ownership.rs's own module doc comment for the real bug this closes. One cloner
+    // per `clone_spec` call so the same source spell referenced twice (e.g. on two different
+    // spell lines) is only ever cloned once for this new class.
+    let mut spell_cloner = SpellCloner::new(cfg, new_class_id)?;
 
     // Spell lines attached to this spec each need their own new unique KeyName - read them first
     // so each clone statement can be built with a name we already know is unique (derived from
@@ -1213,20 +1392,22 @@ fn clone_spec(
             &format!("SELECT SpellID, Level FROM LineXSpell WHERE LineName = '{old_line_key_q}';"),
         )?;
         for spell in &spells {
-            let spell_id = int_field(spell, "SpellID");
+            let source_spell_id = int_field(spell, "SpellID");
             // "Remove specific spells from the line we copy over" - a selected line can still
             // exclude individual spells within it, independent of whether whole other lines were
-            // excluded above.
+            // excluded above. Checked against the *source*'s own SpellID (what the picker UI
+            // actually shows and the caller selects against), before this spell is ever cloned.
             if let Some(s) = selection {
-                if s.excluded_spell_ids.contains(&spell_id) {
+                if s.excluded_spell_ids.contains(&source_spell_id) {
                     continue;
                 }
             }
             let level = int_field(spell, "Level");
+            let new_spell_id = spell_cloner.clone_for_class(&mut batch, source_spell_id);
             let row_guid = Uuid::new_v4();
             batch.push_str(&format!(
                 "INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
-                 VALUES ('{new_line_key_q}', {spell_id}, {level}, '{row_guid}');\n"
+                 VALUES ('{new_line_key_q}', {new_spell_id}, {level}, '{row_guid}');\n"
             ));
         }
     }
@@ -1241,44 +1422,129 @@ fn clone_spec(
     // repoint *any* non-zero lock to the new class unconditionally. ClassId 0 (genuinely
     // unrestricted) is left as-is.
     //
-    // GROUP BY Name, SpecLevelRequirement collapses exactly that "same style, one row per
+    // Grouping by (Name, SpecLevelRequirement) collapses exactly that "same style, one row per
     // originally-eligible class" pattern into a single row before the clone - without it, cloning
     // a spec like that would produce several duplicate, identically-named styles all now locked
     // to the same new class (confirmed real: Celtic Dual has every style name three times, once
     // per class, with every other field - EnduranceCost, Icon, etc. - identical between them).
-    let style_class_expr = format!("CASE WHEN ClassId != 0 THEN {new_class_id} ELSE 0 END");
-    batch.push_str(&format!(
-        "INSERT INTO Style (ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, EnduranceCost, \
-         StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
-         WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, \
-         RandomProc, ArmorHitLocation) \
-         SELECT {style_class_expr}, Name, '{new_key_q}', SpecLevelRequirement, Icon, EnduranceCost, \
-         StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
-         WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, \
-         RandomProc, ArmorHitLocation \
-         FROM Style WHERE SpecKeyName = '{source_key_q}' GROUP BY Name, SpecLevelRequirement;\n"
-    ));
+    //
+    // Done as one explicit-ID INSERT per group (not a single bulk INSERT...SELECT, which this
+    // used before) because a style's own procs (StyleXSpell, cloned below) need to know this
+    // clone's real new StyleID up front, in Rust, to build the proc INSERT alongside it in the
+    // same batch - the DB's own autoincrement assignment isn't visible until the whole batch
+    // actually runs, in one shot, at the very end of this function. Each group's new StyleID is
+    // instead chosen explicitly, from the same kind of "next free ID in this table" counter
+    // `SpellCloner` uses for `Spell` - and conveniently also removes the need for the old
+    // separate "UPDATE Style SET ID = StyleID" pass, since ID is now set correctly at insert time.
+    let source_styles = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT StyleID, ClassId, Name, SpecLevelRequirement FROM Style \
+             WHERE SpecKeyName = '{source_key_q}';"
+        ),
+    )?;
+    let mut style_groups: Vec<(String, i64, Vec<Value>)> = Vec::new();
+    for row in &source_styles {
+        let name = str_field(row, "Name");
+        let level_req = int_field(row, "SpecLevelRequirement");
+        match style_groups
+            .iter_mut()
+            .find(|(n, l, _)| *n == name && *l == level_req)
+        {
+            Some((_, _, rows)) => rows.push(row.clone()),
+            None => style_groups.push((name, level_req, vec![row.clone()])),
+        }
+    }
+
+    // StyleXSpell's own GUID-style primary key column (if it has one at all - see
+    // `style_x_spell_guid_column`'s own doc comment), resolved once up front and reused for
+    // every proc cloned below.
+    let style_x_spell_pk = style_x_spell_guid_column(cfg)?;
+    let mut next_style_id = next_free_style_id(cfg)?;
+    for (_, _, rows) in &style_groups {
+        let representative = &rows[0];
+        let representative_style_id = int_field(representative, "StyleID");
+        let new_style_id = next_style_id;
+        next_style_id += 1;
+        let class_expr = if int_field(representative, "ClassId") != 0 {
+            new_class_id.to_string()
+        } else {
+            "0".to_string()
+        };
+        batch.push_str(&format!(
+            "INSERT INTO Style (StyleID, ClassId, Name, SpecKeyName, SpecLevelRequirement, Icon, \
+             EnduranceCost, StealthRequirement, OpeningRequirementType, OpeningRequirementValue, \
+             AttackResultRequirement, WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, \
+             BonusToDefense, TwoHandAnimation, RandomProc, ArmorHitLocation, ID) \
+             SELECT {new_style_id}, {class_expr}, Name, '{new_key_q}', SpecLevelRequirement, Icon, \
+             EnduranceCost, StealthRequirement, OpeningRequirementType, OpeningRequirementValue, \
+             AttackResultRequirement, WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, \
+             BonusToDefense, TwoHandAnimation, RandomProc, ArmorHitLocation, {new_style_id} \
+             FROM Style WHERE StyleID = {representative_style_id};\n"
+        ));
+
+        // Procs: gather every StyleXSpell row attached to *any* of this group's collapsed source
+        // StyleIDs (not just the representative one - the real data's own duplicates are
+        // expected to carry the same procs, but this stays correct even if that ever isn't
+        // true), deduped by (SpellID, ClassID, Chance) so an identical proc recorded under
+        // several of the duplicate rows doesn't get attached to the new style more than once.
+        let old_style_ids_csv = rows
+            .iter()
+            .map(|r| int_field(r, "StyleID").to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let procs = run_remote_sql_json(
+            cfg,
+            &format!(
+                "SELECT SpellID, ClassID, Chance FROM StyleXSpell WHERE StyleID IN ({old_style_ids_csv});"
+            ),
+        )?;
+        let mut seen_procs: Vec<(i64, i64, i64)> = Vec::new();
+        for proc in &procs {
+            let key = (
+                int_field(proc, "SpellID"),
+                int_field(proc, "ClassID"),
+                int_field(proc, "Chance"),
+            );
+            if seen_procs.contains(&key) {
+                continue;
+            }
+            seen_procs.push(key);
+            let (source_proc_spell_id, source_proc_class_id, chance) = key;
+            let new_proc_spell_id =
+                spell_cloner.clone_for_class(&mut batch, source_proc_spell_id);
+            // Same class-lock repoint rule as the style itself: 0 means "not a substitute style"
+            // (per the real schema's own ClassID doc comment) and must stay 0; any non-zero lock
+            // must point at this new class, never the source's.
+            let proc_class_expr = if source_proc_class_id != 0 {
+                new_class_id
+            } else {
+                0
+            };
+            let (pk_col, pk_val) = match &style_x_spell_pk {
+                Some(col) => (format!(", {col}"), format!(", '{}'", Uuid::new_v4())),
+                None => (String::new(), String::new()),
+            };
+            batch.push_str(&format!(
+                "INSERT INTO StyleXSpell (SpellID, ClassID, StyleID, Chance{pk_col}) \
+                 VALUES ({new_proc_spell_id}, {proc_class_expr}, {new_style_id}, {chance}{pk_val});\n"
+            ));
+        }
+    }
 
     // Style.ID is a *separate* field from the DB primary key StyleID - it's what a chain style's
     // own OpeningRequirementValue references (AttackResultRequirement=7, "a style is required")
     // to name its prerequisite, confirmed in the real server source and packet code
-    // (`it.Item1.ID == style.OpeningRequirementValue`). The INSERT above never set it (so every
-    // cloned style got the column's bare default, 0 - no two clones distinguishable at all), and
-    // even if it had just copied the source's own ID verbatim, that value belongs to the
-    // *un-cloned* prerequisite style, not whichever row this clone got - a real, reproduced bug
-    // found live: a cloned "Gale" style still pointed at the source class's "Snow Shower" (by its
-    // old ID), which doesn't exist in the new spec's own ID space, so the client showed no
-    // prerequisite for it at all.
-    //
-    // Fixed in two passes, both scoped to exactly the rows this clone just inserted - first, give
-    // every cloned style its own StyleID (the DB primary key, already guaranteed unique) as its
-    // ID too, which is all a plain, non-chain style needs. Then, for every chain style among
-    // them, look up its prerequisite by matching *names* between the original spec's styles and
-    // this clone's own (now-ID-correct) styles, and repoint OpeningRequirementValue at the
-    // clone's own prerequisite's new ID - never the original's.
-    batch.push_str(&format!(
-        "UPDATE Style SET ID = StyleID WHERE SpecKeyName = '{new_key_q}';\n"
-    ));
+    // (`it.Item1.ID == style.OpeningRequirementValue`). Simply copying the source's own ID
+    // verbatim would be wrong regardless - that value belongs to the *un-cloned* prerequisite
+    // style, not whichever row this clone got - a real, reproduced bug found live: a cloned
+    // "Gale" style still pointed at the source class's "Snow Shower" (by its old ID), which
+    // doesn't exist in the new spec's own ID space, so the client showed no prerequisite for it
+    // at all. The INSERT above already sets ID = StyleID for every row this clone just made (all
+    // a plain, non-chain style needs); for every chain style among them, look up its prerequisite
+    // by matching *names* between the original spec's styles and this clone's own (now-ID
+    // -correct) styles, and repoint OpeningRequirementValue at the clone's own prerequisite's new
+    // ID - never the original's.
     batch.push_str(&format!(
         "UPDATE Style SET OpeningRequirementValue = COALESCE((\
              SELECT new_style.StyleID FROM Style AS old_style \
@@ -1373,6 +1639,7 @@ mod tests {
                 AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
             CREATE TABLE DOLCharacters (Name TEXT, Class INTEGER, RespecAmountAllSkill INTEGER DEFAULT 0, SerializedSpecs TEXT DEFAULT '');
             CREATE TABLE Spell (SpellID INTEGER PRIMARY KEY, Name TEXT, SpellGroup INTEGER DEFAULT 0);
+            CREATE TABLE StyleXSpell (StyleXSpell_ID TEXT PRIMARY KEY DEFAULT '', SpellID INTEGER, ClassID INTEGER, StyleID INTEGER, Chance INTEGER);
 
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL, 0);
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('smite', 'Smite', 'Holy damage spells', 200, NULL, 0);
@@ -1496,6 +1763,140 @@ mod tests {
             int_field(original_pulverize, "ClassId"),
             1,
             "source style must be untouched"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clone_deep_clones_a_styles_proc_as_its_own_independent_spell() {
+        // Closes the second half of the gap this module's own doc comment describes: Style
+        // procs (StyleXSpell) used to not be cloned at all. "Pulverize" (ClassId=1, locked to
+        // the source class) gets a proc here - the clone must get its own StyleXSpell row,
+        // pointing at the new style, repointed to the new class, and referencing its own
+        // independent Spell row (not the source's own SpellID 9099).
+        let dir = setup_test_db("clone-style-proc");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('seed-proc-1', 9099, 1, \
+             (SELECT StyleID FROM Style WHERE Name='Pulverize' AND SpecKeyName='slash'), 25);",
+        )
+        .unwrap();
+
+        let assignments = vec![SpecAssignment {
+            source_key: "slash".to_string(),
+            new_key: "earthshatter".to_string(),
+            new_name: "Earthshatter".to_string(),
+            level_acquired: 0,
+            spell_line_selection: Vec::new(),
+        }];
+        apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
+
+        let new_style_id = int_field(
+            &run_remote_sql_json(
+                &cfg,
+                "SELECT StyleID FROM Style WHERE Name='Pulverize' AND SpecKeyName='earthshatter_64';",
+            )
+            .unwrap()[0],
+            "StyleID",
+        );
+        let procs = run_remote_sql_json(
+            &cfg,
+            &format!("SELECT SpellID, ClassID, Chance FROM StyleXSpell WHERE StyleID = {new_style_id};"),
+        )
+        .unwrap();
+        assert_eq!(procs.len(), 1, "{procs:?}");
+        assert_eq!(int_field(&procs[0], "Chance"), 25);
+        assert_eq!(
+            int_field(&procs[0], "ClassID"),
+            64,
+            "a class-locked proc must repoint to the new class"
+        );
+        let new_proc_spell_id = int_field(&procs[0], "SpellID");
+        assert_ne!(
+            new_proc_spell_id, 9099,
+            "the proc's own spell must be its own independent clone, not the source's SpellID"
+        );
+        let proc_spell = run_remote_sql_json(
+            &cfg,
+            &format!("SELECT Name FROM Spell WHERE SpellID = {new_proc_spell_id};"),
+        )
+        .unwrap();
+        assert_eq!(str_field(&proc_spell[0], "Name"), "Blinding Light");
+
+        // The source's own proc must be completely untouched.
+        let original_procs = run_remote_sql_json(
+            &cfg,
+            "SELECT 1 FROM StyleXSpell WHERE StyleID = \
+             (SELECT StyleID FROM Style WHERE Name='Pulverize' AND SpecKeyName='slash');",
+        )
+        .unwrap();
+        assert_eq!(original_procs.len(), 1, "the source proc must be untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_converts_an_old_classs_spells_and_procs_to_independent_clones() {
+        // Simulates a class that was cloned *before* `clone_spec` started independently cloning
+        // spells - its LineXSpell/StyleXSpell still point straight at the real stock spec's own
+        // shared SpellIDs, exactly the shape every class created before this feature existed is
+        // left in.
+        let dir = setup_test_db("migrate-old-class");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+                VALUES ('earthshatter_64', 'Earthshatter', 'Slashing weapons', 100, NULL, 0);
+             INSERT INTO ClassXSpecialization VALUES (64, 'earthshatter_64', 0);
+             INSERT INTO SpellLine VALUES ('earthshatter_64_smite_base', 'Earthshatter Spells', 'earthshatter_64', 0, 64);
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('earthshatter_64_smite_base', 9001, 1, 'old-line-1');
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('earthshatter_64_smite_base', 9002, 10, 'old-line-2');
+             INSERT INTO Style VALUES (NULL, 64, 'Shatter', 'earthshatter_64', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);
+             INSERT INTO StyleXSpell VALUES ('old-proc-1', 9099, 64, (SELECT StyleID FROM Style WHERE SpecKeyName='earthshatter_64'), 25);",
+        )
+        .unwrap();
+
+        let log = migrate_class_to_owned_spells(&cfg, 64).unwrap();
+        assert!(
+            log.contains("migrated 2 spell(s) and 1 proc(s)"),
+            "log: {log}"
+        );
+
+        let line_spells = run_remote_sql_json(
+            &cfg,
+            "SELECT SpellID FROM LineXSpell WHERE LineName='earthshatter_64_smite_base' ORDER BY Level;",
+        )
+        .unwrap();
+        assert_eq!(line_spells.len(), 2);
+        let new_cast_a = int_field(&line_spells[0], "SpellID");
+        let new_cast_b = int_field(&line_spells[1], "SpellID");
+        assert_ne!(new_cast_a, 9001, "must no longer point at the shared source spell");
+        assert_ne!(new_cast_b, 9002, "must no longer point at the shared source spell");
+
+        let proc_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT SpellID FROM StyleXSpell WHERE StyleXSpell_ID='old-proc-1';",
+        )
+        .unwrap();
+        let new_proc_id = int_field(&proc_rows[0], "SpellID");
+        assert_ne!(new_proc_id, 9099, "the proc must also now be its own independent clone");
+
+        // The original, shared spells (9001/9002/9099) must be completely untouched.
+        let originals = run_remote_sql_json(
+            &cfg,
+            "SELECT SpellID FROM Spell WHERE SpellID IN (9001, 9002, 9099);",
+        )
+        .unwrap();
+        assert_eq!(originals.len(), 3, "the original shared spells must survive untouched");
+
+        // Running it again must be a safe no-op - everything's already independently owned.
+        let second_log = migrate_class_to_owned_spells(&cfg, 64).unwrap();
+        assert!(
+            second_log.contains("migrated 0 spell(s) and 0 proc(s)"),
+            "second run should find nothing left to migrate: {second_log}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1979,6 +2380,18 @@ mod tests {
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
+        // The Edit flow's own picker always reads back *current* state (via `list_line_spells`)
+        // to build its checkboxes - which, now that spells are independently cloned, means the
+        // IDs it offers to exclude are this class's own already-cloned ones, not the original
+        // source spec's. Look up the clone of "Greater Smite" (originally 9002, level 10) the
+        // same way the real picker would.
+        let current_spells = run_remote_sql_json(
+            &cfg,
+            "SELECT SpellID FROM LineXSpell WHERE LineName='frostbolt_tree_64_smite_base' AND Level=10;",
+        )
+        .unwrap();
+        let cloned_greater_smite_id = int_field(&current_spells[0], "SpellID");
+
         // Resubmit it exactly as the Edit flow's picker would after excluding one spell from the
         // line - source_key is its own already-cloned key (self-source), but this time with a
         // real, non-empty spell_line_selection.
@@ -1990,7 +2403,7 @@ mod tests {
             spell_line_selection: vec![SpellLineSelection {
                 source_line_key: "frostbolt_tree_64_smite_base".to_string(),
                 included: true,
-                excluded_spell_ids: vec![9002],
+                excluded_spell_ids: vec![cloned_greater_smite_id],
             }],
         }];
         let log = apply_class_specs(&cfg, 64, &resubmit, &[]).unwrap();
@@ -2001,11 +2414,12 @@ mod tests {
 
         let spells = run_remote_sql_json(
             &cfg,
-            "SELECT SpellID FROM LineXSpell WHERE LineName='frostbolt_tree_64_smite_base';",
+            "SELECT Spell.Name FROM LineXSpell JOIN Spell ON Spell.SpellID = LineXSpell.SpellID \
+             WHERE LineXSpell.LineName='frostbolt_tree_64_smite_base';",
         )
         .unwrap();
         assert_eq!(spells.len(), 1, "{spells:?}");
-        assert_eq!(int_field(&spells[0], "SpellID"), 9001, "9002 must be excluded");
+        assert_eq!(str_field(&spells[0], "Name"), "Smite", "9002/Greater Smite must be excluded");
 
         // The spec and its line must still exist - only the one excluded spell is gone.
         let specs = list_specializations(&cfg).unwrap();
@@ -2125,18 +2539,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spells.len(), 2, "{spells:?}");
-        assert_eq!(int_field(&spells[0], "SpellID"), 9001);
+        let first_spell_id = int_field(&spells[0], "SpellID");
+        let second_spell_id = int_field(&spells[1], "SpellID");
+        assert_ne!(
+            first_spell_id, 9001,
+            "each cloned spell must be its own independent Spell row, not a pointer back at the \
+             source's own SpellID"
+        );
+        assert_ne!(second_spell_id, 9002, "same for the second spell");
         assert_eq!(int_field(&spells[0], "Level"), 1);
-        assert_eq!(int_field(&spells[1], "SpellID"), 9002);
         assert_eq!(int_field(&spells[1], "Level"), 10);
 
-        // Original spell line/assignments untouched.
+        // The clone's own independent Spell rows must still carry the same real data the source
+        // spells had (Name, SpellGroup, ...) - only the ID itself differs.
+        let cloned_spells = run_remote_sql_json(
+            &cfg,
+            &format!(
+                "SELECT SpellID, Name FROM Spell WHERE SpellID IN ({first_spell_id}, {second_spell_id}) ORDER BY SpellID;"
+            ),
+        )
+        .unwrap();
+        assert_eq!(cloned_spells.len(), 2, "{cloned_spells:?}");
+        assert!(
+            cloned_spells.iter().any(|s| str_field(s, "Name") == "Smite"),
+            "{cloned_spells:?}"
+        );
+        assert!(
+            cloned_spells
+                .iter()
+                .any(|s| str_field(s, "Name") == "Greater Smite"),
+            "{cloned_spells:?}"
+        );
+
+        // Original spell line/assignments, and the original Spell rows themselves, untouched.
         let original_spells = run_remote_sql_json(
             &cfg,
             "SELECT SpellID FROM LineXSpell WHERE LineName='smite_base';",
         )
         .unwrap();
         assert_eq!(original_spells.len(), 2);
+        let original_spell_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT Name FROM Spell WHERE SpellID IN (9001, 9002) ORDER BY SpellID;",
+        )
+        .unwrap();
+        assert_eq!(
+            original_spell_rows.len(),
+            2,
+            "the source Spell rows must still exist, untouched: {original_spell_rows:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2257,11 +2708,24 @@ mod tests {
 
         let spells = run_remote_sql_json(
             &cfg,
-            &format!("SELECT SpellID FROM LineXSpell WHERE LineName='{new_line_key}';"),
+            &format!(
+                "SELECT Spell.SpellID, Spell.Name FROM LineXSpell \
+                 JOIN Spell ON Spell.SpellID = LineXSpell.SpellID \
+                 WHERE LineXSpell.LineName='{new_line_key}';"
+            ),
         )
         .unwrap();
         assert_eq!(spells.len(), 1, "{spells:?}");
-        assert_eq!(int_field(&spells[0], "SpellID"), 9001, "9002 must be excluded");
+        assert_eq!(
+            str_field(&spells[0], "Name"),
+            "Smite",
+            "the excluded spell (Greater Smite, 9002) must be gone, leaving only the clone of 9001"
+        );
+        assert_ne!(
+            int_field(&spells[0], "SpellID"),
+            9001,
+            "the remaining spell must be its own independent clone, not the source's own row"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
