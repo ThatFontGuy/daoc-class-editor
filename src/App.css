@@ -408,6 +408,20 @@ button.danger {
   margin: 0.5rem 0;
 }
 
+/* "Create from scratch" (new combat spec / new spell line, Classes tab) - a bordered box to set
+   it apart from the ordinary summary tables below it, same accent color each realm's section
+   already uses elsewhere so it still reads as part of that same class's own area. */
+.new-spec-actions {
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 1rem;
+}
+
+.new-spec-actions h3 {
+  margin-top: 0;
+}
+
 .spec-table th {
   text-align: left;
   font-weight: 600;

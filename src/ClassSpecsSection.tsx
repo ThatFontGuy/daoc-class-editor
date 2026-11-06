@@ -607,12 +607,80 @@ function SpecSummaryRow({
   );
 }
 
+/** A collapsed "Create" button that expands into a small inline Name + Level form - used for both
+ * "New Combat Spec" and "New Spell Line" at the top of the section, each seeding one immediately
+ * editable placeholder (see `create_new_combat_spec`/`create_new_spell_spec` on the Rust side for
+ * what "placeholder" means here and why neither hands the user a literal blank form). */
+function NewSpecForm({
+  label,
+  busy,
+  onCreate,
+}: {
+  label: string;
+  busy: boolean;
+  onCreate: (name: string, levelAcquired: number) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [level, setLevel] = useState(1);
+
+  if (!open) {
+    return (
+      <button onClick={() => setOpen(true)} disabled={busy}>
+        {label}
+      </button>
+    );
+  }
+
+  return (
+    <div className="compact-field-grid">
+      <label className="field">
+        <span>Name</span>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="e.g. Earthshatter"
+          autoFocus
+        />
+      </label>
+      <label className="field">
+        <span>Level acquired</span>
+        <input type="number" value={level} onChange={(e) => setLevel(Number(e.target.value))} />
+      </label>
+      <div>
+        <button
+          disabled={busy || !name.trim()}
+          onClick={async () => {
+            await onCreate(name.trim(), level);
+            setName("");
+            setLevel(1);
+            setOpen(false);
+          }}
+        >
+          Create
+        </button>
+        <button onClick={() => setOpen(false)} disabled={busy}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /** Embeddable "this class's own specs" section - used by ClassBrowserPanel's class-detail view.
  * Shows two plain summary lists (names, level, and whether each spec is already independent or
  * still shared) - combat specs first, then spells - so the user sees just what's there before
  * picking what to actually expand and edit, instead of every spec's full data dumped on screen
  * at once. A spec with both combat styles and spell lines (rare) shows up in both lists. */
-export default function ClassSpecsSection({ sshConfig, classId }: { sshConfig: SshConfig; classId: number }) {
+export default function ClassSpecsSection({
+  sshConfig,
+  classId,
+  isCustom,
+}: {
+  sshConfig: SshConfig;
+  classId: number;
+  isCustom: boolean;
+}) {
   const [summaries, setSummaries] = useState<ClassSpecSummary[] | null>(null);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
@@ -654,6 +722,29 @@ export default function ClassSpecsSection({ sshConfig, classId }: { sshConfig: S
     });
   }
 
+  /** Creates a brand-new spec (combat or spell, per `command`) and immediately expands it so its
+   * one seeded placeholder (a Style or Spell) is right there to edit - there is no separate "now
+   * go find what you just made" step. */
+  async function createSpec(command: "create_new_combat_spec" | "create_new_spell_spec", name: string, levelAcquired: number) {
+    setBusy(true);
+    setStatus(`Creating "${name}"...`);
+    try {
+      const summary = await invoke<ClassSpecSummary>(command, {
+        cfg: sshConfig,
+        classId,
+        name,
+        levelAcquired,
+      });
+      await load();
+      setExpanded((prev) => new Set(prev).add(summary.key_name));
+      setStatus(`Created "${summary.name}" - edit its placeholder below to make it do what you actually want.`);
+    } catch (e) {
+      setStatus(`Could not create "${name}": ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // A spec with styles is always a combat spec, full stop, even if it also happens to carry an
   // incidental SpellLine of its own (a real, reproduced case: "Shields" has both 157 Style rows
   // *and* a "Warrior Shields (Live)" spell line, presumably internal bookkeeping for some
@@ -667,6 +758,19 @@ export default function ClassSpecsSection({ sshConfig, classId }: { sshConfig: S
     <div className="panel">
       {busy && <p className="hint">⏳ Working - please wait...</p>}
       {status && <pre className="status">{status}</pre>}
+
+      {isCustom && (
+        <div className="new-spec-actions">
+          <h3>Create from scratch</h3>
+          <p className="hint">
+            Adds a brand-new spec to this class - not cloned from anything else - seeded with one
+            placeholder (a style or spell) ready to rename and tune below. Only offered for
+            cloned/custom classes, to keep every stock class's own data untouched.
+          </p>
+          <NewSpecForm label="New Combat Spec" busy={busy} onCreate={(name, lvl) => createSpec("create_new_combat_spec", name, lvl)} />{" "}
+          <NewSpecForm label="New Spell Line" busy={busy} onCreate={(name, lvl) => createSpec("create_new_spell_spec", name, lvl)} />
+        </div>
+      )}
 
       {combatSpecs.length > 0 && (
         <div>

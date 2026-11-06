@@ -124,6 +124,14 @@ deployment path was confirmed against a real running server after an early mix-u
     parameter fed into whatever handler Type selects) is a dropdown of every real value the
     server actually recognizes (`eSpellType`, vendored the same way the class list is), not a
     free-text field a typo could silently turn into a spell the server can't dispatch at all.
+  - For a **Cloned Class**, a **Create from scratch** box above the two summary lists offers
+    **New Combat Spec**/**New Spell Line** - adds a brand-new spec to the class that isn't cloned
+    from anything (no source spell line/style to pick a template from), seeded with one
+    placeholder style or spell so it shows up immediately and is immediately editable the same way
+    any cloned spec's own styles/spells already are. Rename/retune the placeholder via the normal
+    field editor (including the **Type** dropdown above, to make a from-scratch spell actually do
+    something specific) into whatever the new skill/spell is really meant to be. Only offered for
+    classes you've cloned, to keep every stock class's own data untouched.
   - **Update All Class Data** re-reads the class list and the selected class's own specs fresh
     from the server - handy after deploying or editing something outside this tool (e.g. directly
     via the "run SQL" box, or a server restart that changed `bin/scripts/`).

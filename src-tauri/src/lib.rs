@@ -247,6 +247,28 @@ fn list_styles_for_spec(cfg: SshConfig, class_id: i64, spec_key: String) -> Resu
 }
 
 #[tauri::command]
+fn create_new_combat_spec(
+    cfg: SshConfig,
+    class_id: i64,
+    name: String,
+    level_acquired: i64,
+) -> Result<specs::ClassSpecSummary, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::create_new_combat_spec(&cfg, class_id, &name, level_acquired)
+}
+
+#[tauri::command]
+fn create_new_spell_spec(
+    cfg: SshConfig,
+    class_id: i64,
+    name: String,
+    level_acquired: i64,
+) -> Result<specs::ClassSpecSummary, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::create_new_spell_spec(&cfg, class_id, &name, level_acquired)
+}
+
+#[tauri::command]
 fn update_line_spell_level(
     cfg: SshConfig,
     class_id: i64,
@@ -423,6 +445,8 @@ pub fn run() {
             list_class_spec_summaries,
             list_spell_lines_for_spec,
             list_styles_for_spec,
+            create_new_combat_spec,
+            create_new_spell_spec,
             update_line_spell_level,
             update_style_level,
             update_owned_spell_fields,

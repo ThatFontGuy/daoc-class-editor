@@ -456,6 +456,177 @@ pub fn list_class_spec_summaries(cfg: &SshConfig, class_id: i64) -> Result<Vec<C
         .collect())
 }
 
+/// A reasonable, unique-enough DB key from whatever the user named a brand-new spec - mirrors
+/// `ClonePanel.tsx`'s own `deriveSpecKey` exactly (strip to plain alphanumerics, lowercase), so a
+/// from-scratch spec's key reads the same way a cloned one's does.
+fn derive_spec_key(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    if slug.is_empty() { "spec".to_string() } else { slug }
+}
+
+/// `derive_spec_key(name)` plus this class's own `_<class_id>` suffix - the same ownership
+/// convention every cloned spec's own key already follows (see `ClassSpecSummary::is_owned`'s own
+/// doc comment), so a from-scratch spec is recognized as already independent the instant it's
+/// created, with no separate "is this mine" bookkeeping needed. Falls back to appending a small
+/// numeric suffix of its own if that exact key is somehow already taken (e.g. two new specs
+/// created back-to-back with the same name) - checked against the real table, not guessed.
+fn unique_spec_key(cfg: &SshConfig, name: &str, class_id: i64) -> Result<String, String> {
+    let base = derive_spec_key(name);
+    let mut attempt = 1;
+    loop {
+        let candidate = if attempt == 1 {
+            format!("{base}_{class_id}")
+        } else {
+            format!("{base}{attempt}_{class_id}")
+        };
+        let candidate_q = sql_quote(&candidate);
+        let existing = run_remote_sql_json(
+            cfg,
+            &format!("SELECT 1 FROM Specialization WHERE KeyName = '{candidate_q}';"),
+        )?;
+        if existing.is_empty() {
+            return Ok(candidate);
+        }
+        attempt += 1;
+    }
+}
+
+/// Creates a brand-new `Specialization` (not cloned from anything) for `class_id`, with one
+/// placeholder `Style` already under it so it's immediately visible in the "Combat specs"
+/// summary and immediately editable via the existing style field editor - there is no separate
+/// "empty spec" UI state to build, just a spec that already has exactly the one thing the Combat
+/// specs list actually keys its classification on (`ClassSpecSummary::has_styles`).
+///
+/// The placeholder style is cloned from a real existing row (via `clone_style_with_fresh_id`,
+/// the same primitive `clone_spec` itself uses) rather than hand-built from a literal column
+/// list - `Style` has almost twenty columns this tool otherwise never needs to know the exact
+/// constraints of, and cloning a real row guarantees every one of them starts out populated with
+/// some value SQLite already accepted once before. The template is deliberately chosen with
+/// `AttackResultRequirement = 0` ("Any attack result" - see `eAttackResultRequirement.Any` in the
+/// real server source) specifically to avoid seeding a chain style (`AttackResultRequirement = 7`,
+/// "a style is required") - `clone_spec`'s own chain-repoint pass only works because it clones a
+/// whole spec's styles at once and can search among them for the matching new prerequisite; a
+/// single placeholder style here has no sibling to repoint at, so a cloned chain requirement
+/// would dangle, pointing at a `Style.ID` that doesn't exist anywhere in this new spec.
+pub fn create_new_combat_spec(
+    cfg: &SshConfig,
+    class_id: i64,
+    name: &str,
+    level_acquired: i64,
+) -> Result<ClassSpecSummary, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("a new combat spec needs a name".to_string());
+    }
+    let final_key = unique_spec_key(cfg, trimmed, class_id)?;
+    let final_key_q = sql_quote(&final_key);
+    let name_q = sql_quote(trimmed);
+
+    run_remote_sql(
+        cfg,
+        &format!(
+            "INSERT INTO Specialization (KeyName, Name, Icon, Description, Implementation) \
+             VALUES ('{final_key_q}', '{name_q}', 0, '', NULL);\n\
+             INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) \
+             VALUES ({class_id}, '{final_key_q}', {level_acquired});"
+        ),
+    )?;
+
+    let template_rows = run_remote_sql_json(
+        cfg,
+        "SELECT StyleID FROM Style WHERE AttackResultRequirement = 0 ORDER BY StyleID LIMIT 1;",
+    )?;
+    let template_style_id = template_rows.first().map(|r| int_field(r, "StyleID")).ok_or_else(|| {
+        "could not find any existing style to seed this new spec's first style from".to_string()
+    })?;
+    let new_style_id =
+        clone_style_with_fresh_id(cfg, template_style_id, &final_key_q, &class_id.to_string())?;
+    run_remote_sql(
+        cfg,
+        &format!(
+            "UPDATE Style SET Name = 'New Style', SpecLevelRequirement = 1 WHERE StyleID = {new_style_id};"
+        ),
+    )?;
+
+    Ok(ClassSpecSummary {
+        key_name: final_key,
+        name: trimmed.to_string(),
+        level_acquired,
+        is_owned: true,
+        has_styles: true,
+        has_spell_lines: false,
+    })
+}
+
+/// Creates a brand-new `Specialization` plus one `SpellLine` under it (not cloned from anything)
+/// for `class_id`, with one placeholder `Spell` already on that line so it's immediately visible
+/// in the "Spells" summary and immediately editable via the existing spell field editor - the
+/// spell-line equivalent of `create_new_combat_spec`, same reasoning throughout.
+///
+/// The placeholder spell is cloned via `SpellCloner` (the same primitive `clone_spec` itself
+/// uses for every spell it clones) from the very first real `Spell` row on the server, picked
+/// purely because it's guaranteed to exist and already satisfies the schema's real constraints
+/// whatever they are - its own Name/Type/Damage/etc. are expected to be immediately rewritten via
+/// the existing spell field editor into whatever the new spell is actually meant to be.
+pub fn create_new_spell_spec(
+    cfg: &SshConfig,
+    class_id: i64,
+    name: &str,
+    level_acquired: i64,
+) -> Result<ClassSpecSummary, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("a new spell line needs a name".to_string());
+    }
+    let final_key = unique_spec_key(cfg, trimmed, class_id)?;
+    let final_key_q = sql_quote(&final_key);
+    let name_q = sql_quote(trimmed);
+    let line_key = format!("{final_key}_line");
+    let line_key_q = sql_quote(&line_key);
+
+    run_remote_sql(
+        cfg,
+        &format!(
+            "INSERT INTO Specialization (KeyName, Name, Icon, Description, Implementation) \
+             VALUES ('{final_key_q}', '{name_q}', 0, '', NULL);\n\
+             INSERT INTO ClassXSpecialization (ClassID, SpecKeyName, LevelAcquired) \
+             VALUES ({class_id}, '{final_key_q}', {level_acquired});\n\
+             INSERT INTO SpellLine (KeyName, Name, Spec, IsBaseLine, ClassIDHint) \
+             VALUES ('{line_key_q}', '{name_q}', '{final_key_q}', 0, {class_id});"
+        ),
+    )?;
+
+    let template_rows =
+        run_remote_sql_json(cfg, "SELECT SpellID FROM Spell ORDER BY SpellID LIMIT 1;")?;
+    let template_spell_id = template_rows.first().map(|r| int_field(r, "SpellID")).ok_or_else(|| {
+        "could not find any existing spell to seed this new spell line's first spell from".to_string()
+    })?;
+    let mut cloner = SpellCloner::new(cfg, class_id)?;
+    let new_spell_id = cloner.clone_for_class(cfg, template_spell_id)?;
+    run_remote_sql(
+        cfg,
+        &format!(
+            "UPDATE Spell SET Name = 'New Spell' WHERE SpellID = {new_spell_id};\n\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
+             VALUES ('{line_key_q}', {new_spell_id}, 1, '{}');",
+            Uuid::new_v4()
+        ),
+    )?;
+
+    Ok(ClassSpecSummary {
+        key_name: final_key,
+        name: trimmed.to_string(),
+        level_acquired,
+        is_owned: true,
+        has_styles: false,
+        has_spell_lines: true,
+    })
+}
+
 /// Every SpellLine attached to `spec_key` - the source list for the Edit flow's "customize which
 /// lines to include" picker (see `SpellLineSelection`'s own doc comment for why this exists).
 pub fn list_spec_spell_lines(
@@ -2849,6 +3020,115 @@ mod tests {
         )
         .unwrap();
         assert_eq!(str_field(&rows[0], "Name"), "Earthshatter");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_new_combat_spec_seeds_an_immediately_editable_placeholder_style() {
+        // A from-scratch spec with nothing in it at all would be invisible to both the "Combat
+        // specs" and "Spells" summary lists (ClassSpecSummary::has_styles/has_spell_lines are
+        // both false) - this proves the new spec is seeded with exactly enough to show up in the
+        // former and be immediately editable via the already-built style field editor, with no
+        // new "empty spec" UI state required.
+        let dir = setup_test_db("create-combat-spec");
+        let cfg = test_cfg(&dir);
+
+        let summary = create_new_combat_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        assert_eq!(summary.key_name, "earthshatter_2");
+        assert!(summary.is_owned);
+        assert!(summary.has_styles);
+        assert!(!summary.has_spell_lines);
+
+        let spec_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT Name FROM Specialization WHERE KeyName = 'earthshatter_2';",
+        )
+        .unwrap();
+        assert_eq!(str_field(&spec_rows[0], "Name"), "Earthshatter");
+
+        let assignment_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT LevelAcquired FROM ClassXSpecialization WHERE ClassID = 2 AND SpecKeyName = 'earthshatter_2';",
+        )
+        .unwrap();
+        assert_eq!(int_field(&assignment_rows[0], "LevelAcquired"), 5);
+
+        let style_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT Name, ClassId, AttackResultRequirement FROM Style WHERE SpecKeyName = 'earthshatter_2';",
+        )
+        .unwrap();
+        assert_eq!(style_rows.len(), 1);
+        assert_eq!(str_field(&style_rows[0], "Name"), "New Style");
+        assert_eq!(int_field(&style_rows[0], "ClassId"), 2);
+        // The seeded style must never be a chain style (AttackResultRequirement = 7) - there is
+        // no sibling style in this brand-new spec for its OpeningRequirementValue to resolve
+        // against, unlike clone_spec's own chain-repoint pass.
+        assert_ne!(int_field(&style_rows[0], "AttackResultRequirement"), 7);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_new_spell_spec_seeds_an_immediately_editable_placeholder_spell() {
+        let dir = setup_test_db("create-spell-spec");
+        let cfg = test_cfg(&dir);
+
+        let summary = create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        assert_eq!(summary.key_name, "earthshatter_2");
+        assert!(summary.is_owned);
+        assert!(!summary.has_styles);
+        assert!(summary.has_spell_lines);
+
+        let line_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT Name, Spec, IsBaseLine FROM SpellLine WHERE KeyName = 'earthshatter_2_line';",
+        )
+        .unwrap();
+        assert_eq!(str_field(&line_rows[0], "Name"), "Earthshatter");
+        assert_eq!(str_field(&line_rows[0], "Spec"), "earthshatter_2");
+        assert_eq!(int_field(&line_rows[0], "IsBaseLine"), 0);
+
+        let spell_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT ls.Level, s.Name, s.SpellID FROM LineXSpell ls \
+             JOIN Spell s ON s.SpellID = ls.SpellID WHERE ls.LineName = 'earthshatter_2_line';",
+        )
+        .unwrap();
+        assert_eq!(spell_rows.len(), 1);
+        assert_eq!(int_field(&spell_rows[0], "Level"), 1);
+        assert_eq!(str_field(&spell_rows[0], "Name"), "New Spell");
+
+        // The seeded spell must be this class's own independent clone, not a bare reuse of the
+        // template spell's own ID - otherwise editing it later would silently edit whatever else
+        // still points at that same source Spell row (see spell_ownership.rs's own module doc
+        // comment for the exact bug class this guards against).
+        let new_spell_id = int_field(&spell_rows[0], "SpellID");
+        assert_ne!(new_spell_id, 9001);
+        let ownership_rows = run_remote_sql_json(
+            &cfg,
+            &format!(
+                "SELECT SourceSpellID, OwningClassId FROM ClassEditorSpellClone WHERE NewSpellID = {new_spell_id};"
+            ),
+        )
+        .unwrap();
+        assert_eq!(int_field(&ownership_rows[0], "SourceSpellID"), 9001);
+        assert_eq!(int_field(&ownership_rows[0], "OwningClassId"), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_new_combat_spec_avoids_a_key_collision_with_an_earlier_same_named_spec() {
+        let dir = setup_test_db("create-combat-spec-collision");
+        let cfg = test_cfg(&dir);
+
+        let first = create_new_combat_spec(&cfg, 2, "Earthshatter", 1).unwrap();
+        let second = create_new_combat_spec(&cfg, 2, "Earthshatter", 1).unwrap();
+        assert_eq!(first.key_name, "earthshatter_2");
+        assert_eq!(second.key_name, "earthshatter2_2");
+        assert_ne!(first.key_name, second.key_name);
 
         std::fs::remove_dir_all(&dir).ok();
     }

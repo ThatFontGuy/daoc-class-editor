@@ -273,6 +273,7 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
             key={`${selected.id}-${spellsRefreshKey}`}
             sshConfig={sshConfig}
             classId={selected.id}
+            isCustom={selected.is_custom}
           />
         </div>
       )}
