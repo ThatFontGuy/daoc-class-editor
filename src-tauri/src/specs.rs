@@ -1681,7 +1681,8 @@ mod tests {
             CREATE TABLE SpecXAbility (SpecXabilityID INTEGER PRIMARY KEY AUTOINCREMENT, Spec TEXT, SpecLevel INTEGER,
                 AbilityKey TEXT, AbilityLevel INTEGER, ClassId INTEGER);
             CREATE TABLE DOLCharacters (Name TEXT, Class INTEGER, RespecAmountAllSkill INTEGER DEFAULT 0, SerializedSpecs TEXT DEFAULT '');
-            CREATE TABLE Spell (SpellID INTEGER PRIMARY KEY, Name TEXT, SpellGroup INTEGER DEFAULT 0);
+            CREATE TABLE Spell (SpellID INTEGER NOT NULL DEFAULT 0, Name TEXT, SpellGroup INTEGER DEFAULT 0, Spell_ID TEXT NOT NULL DEFAULT '', PRIMARY KEY (Spell_ID));
+            CREATE UNIQUE INDEX U_Spell_SpellID ON Spell (SpellID);
             CREATE TABLE StyleXSpell (StyleXSpell_ID TEXT PRIMARY KEY DEFAULT '', SpellID INTEGER, ClassID INTEGER, StyleID INTEGER, Chance INTEGER);
 
             INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) VALUES ('slash', 'Slash', 'Slashing weapons', 100, NULL, 0);
@@ -1693,9 +1694,9 @@ mod tests {
             INSERT INTO SpellLine VALUES ('smite_base', 'Smiting Spells', 'smite', 0, 1);
             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_base', 9001, 1, 'seed-smite-1');
             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('smite_base', 9002, 10, 'seed-smite-2');
-            INSERT INTO Spell (SpellID, Name, SpellGroup) VALUES (9001, 'Smite', 500);
-            INSERT INTO Spell (SpellID, Name, SpellGroup) VALUES (9002, 'Greater Smite', 500);
-            INSERT INTO Spell (SpellID, Name, SpellGroup) VALUES (9099, 'Blinding Light', 0);
+            INSERT INTO Spell (SpellID, Name, SpellGroup, Spell_ID) VALUES (9001, 'Smite', 500, 'seed-spell-9001');
+            INSERT INTO Spell (SpellID, Name, SpellGroup, Spell_ID) VALUES (9002, 'Greater Smite', 500, 'seed-spell-9002');
+            INSERT INTO Spell (SpellID, Name, SpellGroup, Spell_ID) VALUES (9099, 'Blinding Light', 0, 'seed-spell-9099');
         ";
         let status = Command::new("sqlite3")
             .arg(&db)

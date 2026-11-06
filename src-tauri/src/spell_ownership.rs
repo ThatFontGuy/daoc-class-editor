@@ -19,6 +19,7 @@
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use serde_json::Value;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 fn int_field(row: &Value, key: &str) -> i64 {
     row.get(key).and_then(Value::as_i64).unwrap_or(0)
@@ -166,7 +167,22 @@ pub fn clone_style_with_fresh_id(
 /// why.
 pub struct SpellCloner {
     owning_class_id: i64,
+    /// Every real `Spell` column except `SpellID` itself (needs a fresh, separately-unique
+    /// numeric value on every clone - see `clone_for_class`'s own doc comment) and whatever the
+    /// table's own real primary key is, if it's a distinct column from `SpellID` at all.
     columns: Vec<String>,
+    /// `Spell`'s own GUID-style primary key column, if it has one distinct from `SpellID` - a
+    /// real, reproduced case found live: the actual server schema's `Spell` table is primary-
+    /// keyed on a separate `Spell_ID` (TEXT) column, with `SpellID` itself just an ordinary,
+    /// *separately* unique-indexed business field (`U_Spell_SpellID`) - not the table's own SQL
+    /// primary key at all, the same GUID-style-PK shape this project already knew to special
+    /// -case for `LineXSpell_ID`/`StyleXSpell_ID`, just not yet applied here. Treating `SpellID`
+    /// as if it were the thing `columns_excluding_pk` would exclude (it isn't - only `Spell_ID`
+    /// is) silently left `SpellID` doubly listed in the INSERT's own column list, and never gave
+    /// the real `Spell_ID` primary key a fresh value at all - this is what actually caused
+    /// `UNIQUE constraint failed: Spell.SpellID` live, independent from (and still present after)
+    /// the separate ID-allocation race this module's other fix already closed.
+    guid_pk_column: Option<String>,
     /// The same source `SpellID` cloned twice for the same class (it appears on two different
     /// spec lines, or as both a cast spell and a style's proc) must reuse the one clone already
     /// made for this class in this call, not make a second independent copy of it.
@@ -176,9 +192,17 @@ pub struct SpellCloner {
 impl SpellCloner {
     pub fn new(cfg: &SshConfig, owning_class_id: i64) -> Result<Self, String> {
         ensure_tracking_table(cfg)?;
+        let guid_pk_column = explicit_guid_pk_column(cfg, "Spell")?;
+        let mut columns = columns_excluding_pk(cfg, "Spell")?;
+        // SpellID is never just verbatim-copied - it always gets its own fresh value (see
+        // clone_for_class), whether or not it also happens to be excluded already by virtue of
+        // being flagged as the table's own PK (it isn't, on the real schema, but a future or
+        // different fork's schema might shape this differently - stay correct either way).
+        columns.retain(|c| c != "SpellID");
         Ok(Self {
             owning_class_id,
-            columns: columns_excluding_pk(cfg, "Spell")?,
+            columns,
+            guid_pk_column,
             memo: HashMap::new(),
         })
     }
@@ -222,10 +246,14 @@ impl SpellCloner {
             ));
         }
         let col_list = self.columns.join(", ");
+        let (pk_col, pk_val_expr) = match &self.guid_pk_column {
+            Some(col) => (format!(", {col}"), format!(", '{}'", Uuid::new_v4())),
+            None => (String::new(), String::new()),
+        };
         let script = format!(
             "BEGIN IMMEDIATE;\n\
-             INSERT INTO Spell ({col_list}, SpellID) \
-             SELECT {col_list}, (SELECT COALESCE(MAX(SpellID), 0) + 1 FROM Spell) \
+             INSERT INTO Spell ({col_list}, SpellID{pk_col}) \
+             SELECT {col_list}, (SELECT COALESCE(MAX(SpellID), 0) + 1 FROM Spell){pk_val_expr} \
              FROM Spell WHERE SpellID = {source_spell_id};\n\
              INSERT INTO ClassEditorSpellClone (NewSpellID, SourceSpellID, OwningClassId) \
              SELECT MAX(SpellID), {source_spell_id}, {} FROM Spell;\n\
@@ -394,12 +422,24 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("data")).unwrap();
         let db = dir.join("data/opendaoc.sqlite3.db");
+        // Mirrors the *real* server schema's own shape, confirmed live: `Spell`'s actual SQL
+        // primary key is `Spell_ID` (a separate GUID-style TEXT column, the exact same ORM
+        // pattern as `LineXSpell_ID`/`StyleXSpell_ID`) - `SpellID` (the game-meaningful numeric
+        // field everything else in this codebase actually cares about) is merely a *separately*
+        // unique-indexed ordinary column, not the table's own primary key at all. A real,
+        // reproduced bug found live: treating `SpellID` as if it were the thing to exclude as
+        // "the primary key" (it isn't) duplicated it in a clone's own INSERT column list and
+        // never gave the real `Spell_ID` a fresh value, causing `UNIQUE constraint failed:
+        // Spell.SpellID` on every single clone attempt, deterministically - this exact fixture
+        // shape (a flat `SpellID INTEGER PRIMARY KEY`) would never have caught that; the fixture
+        // must mirror the real dual-identity shape, not simplify it away.
         let sql = "
-            CREATE TABLE Spell (SpellID INTEGER PRIMARY KEY, Name TEXT, Damage INTEGER DEFAULT 0, SpellGroup INTEGER DEFAULT 0);
+            CREATE TABLE Spell (SpellID INTEGER NOT NULL DEFAULT 0, Name TEXT, Damage INTEGER DEFAULT 0, SpellGroup INTEGER DEFAULT 0, Spell_ID TEXT NOT NULL DEFAULT '', PRIMARY KEY (Spell_ID));
+            CREATE UNIQUE INDEX U_Spell_SpellID ON Spell (SpellID);
             CREATE TABLE Style (StyleID INTEGER PRIMARY KEY AUTOINCREMENT, ClassId INTEGER);
             CREATE TABLE StyleXSpell (StyleXSpell_ID TEXT PRIMARY KEY DEFAULT '', SpellID INTEGER, ClassID INTEGER, StyleID INTEGER, Chance INTEGER);
-            INSERT INTO Spell (SpellID, Name, Damage, SpellGroup) VALUES (9001, 'Smite', 50, 500);
-            INSERT INTO Spell (SpellID, Name, Damage, SpellGroup) VALUES (9002, 'Greater Smite', 80, 500);
+            INSERT INTO Spell (SpellID, Name, Damage, SpellGroup, Spell_ID) VALUES (9001, 'Smite', 50, 500, 'seed-spell-9001');
+            INSERT INTO Spell (SpellID, Name, Damage, SpellGroup, Spell_ID) VALUES (9002, 'Greater Smite', 80, 500, 'seed-spell-9002');
             INSERT INTO Style (StyleID, ClassId) VALUES (1, 64);
         ";
         let status = Command::new("sqlite3").arg(&db).arg(sql).status().unwrap();
