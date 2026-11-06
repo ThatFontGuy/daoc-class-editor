@@ -1,0 +1,342 @@
+/* Divided Realms Character Planner - shared styles across all pages in this folder.
+   Palette matches the Divided Realms server page (https://whozon.ca/othlyn) and this project's
+   own desktop app (src/App.css) - a dark parchment/gold theme, kept consistent everywhere so
+   this reads as part of the same project, not a bolted-on separate tool. */
+
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+  --bg: #14100c;
+  --panel: #1f1912;
+  --panel-raised: #271f16;
+  --border: #4a3a24;
+  --gold: #c8a95c;
+  --text: #e8ddc8;
+  --muted: #a8977e;
+  --danger: #e0a0a0;
+
+  /* Traditional DAoC realm colors - Albion red, Midgard a light "snow" blue, Hibernia a light
+     "grass" green - same values the desktop app's own Classes tab uses. */
+  --albion: #e0a0a0;
+  --albion-border: #8a4a4a;
+  --albion-bg: #2a1616;
+  --midgard: #a8d4e8;
+  --midgard-border: #4a7a8a;
+  --midgard-bg: #141f26;
+  --hibernia: #a8d8a0;
+  --hibernia-border: #4a7a4a;
+  --hibernia-bg: #16221a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+a {
+  color: var(--gold);
+}
+
+header.site-header {
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+header.site-header h1 {
+  font-size: 1.3rem;
+  margin: 0;
+  color: var(--gold);
+  letter-spacing: 0.02em;
+}
+
+header.site-header nav {
+  display: flex;
+  gap: 0.5rem;
+}
+
+header.site-header nav a {
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+  color: var(--text);
+}
+
+header.site-header nav a.active,
+header.site-header nav a:hover {
+  background: var(--gold);
+  color: #1a1308;
+  border-color: var(--gold);
+  font-weight: 600;
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+main.wide {
+  max-width: 1400px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.25rem;
+}
+
+h2 {
+  color: var(--gold);
+  margin-top: 0;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+footer.site-footer {
+  text-align: center;
+  padding: 1.5rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+code, pre {
+  background: var(--panel-raised);
+  border-radius: 4px;
+  padding: 0.1rem 0.35rem;
+}
+
+pre {
+  padding: 0.75rem;
+  overflow-x: auto;
+}
+
+button, select, input {
+  font-family: inherit;
+  background: var(--panel-raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.7rem;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--gold);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--gold);
+  color: #1a1308;
+  border-color: var(--gold);
+  font-weight: 600;
+}
+
+/* ---- Character Planner page ---- */
+
+.planner-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: flex-end;
+}
+
+.planner-toolbar .field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.planner-toolbar .field span {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.realm-tabs {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.realm-tabs button {
+  border-radius: 999px;
+  padding: 0.35rem 1rem;
+}
+
+.realm-tabs button.active.realm-Albion {
+  background: var(--albion-bg);
+  color: var(--albion);
+  border-color: var(--albion-border);
+}
+
+.realm-tabs button.active.realm-Midgard {
+  background: var(--midgard-bg);
+  color: var(--midgard);
+  border-color: var(--midgard-border);
+}
+
+.realm-tabs button.active.realm-Hibernia {
+  background: var(--hibernia-bg);
+  color: var(--hibernia);
+  border-color: var(--hibernia-border);
+}
+
+.points-summary {
+  display: flex;
+  gap: 1.5rem;
+  font-size: 0.95rem;
+}
+
+.points-summary strong {
+  color: var(--gold);
+}
+
+.points-summary .over-budget {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.spec-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.75rem;
+}
+
+.spec-card {
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem;
+}
+
+.spec-card .spec-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.spec-card h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.stepper button {
+  padding: 0.1rem 0.55rem;
+  line-height: 1.2;
+}
+
+.stepper .value {
+  min-width: 1.6rem;
+  text-align: center;
+  font-weight: 600;
+  color: var(--gold);
+}
+
+.spec-card .spec-cost {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.unlock-list {
+  margin-top: 0.5rem;
+  font-size: 0.82rem;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 0.6rem;
+}
+
+.unlock-list .unlock-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.15rem 0.3rem 0.15rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.unlock-list .unlock-row:hover {
+  background: var(--panel);
+}
+
+.unlock-list .unlock-row.locked {
+  opacity: 0.4;
+}
+
+.unlock-list .unlock-level {
+  color: var(--muted);
+  min-width: 2.4rem;
+}
+
+.ra-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.ra-table th,
+.ra-table td {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.ra-table th {
+  color: var(--gold);
+}
+
+.ra-description {
+  color: var(--muted);
+  font-size: 0.8rem;
+  max-width: 420px;
+}
+
+.ra-cost-note {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.badge.disabled {
+  color: var(--danger);
+  border-color: var(--danger);
+}

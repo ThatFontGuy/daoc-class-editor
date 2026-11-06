@@ -213,8 +213,22 @@ deployment path was confirmed against a real running server after an early mix-u
 `src-tauri/resources/classes/` is a vendored, periodically-updated copy of the relevant files from
 the server repo (`playerclasses/`, `trainer/`, and a handful of core enums/base classes - including
 `eSpellType.cs`, the full list a spell's own `Type` field can be, used for its dropdown in the
-spell field editor) - bundled with the app so it doesn't need the server repo checked out locally.
-If the server repo's class system changes meaningfully, re-sync this folder from there.
+spell field editor; `SkillConstants.cs`, resolving a class's own `AutotrainableSkills` field to
+real spec names; and `realmabilities/`, the Realm Ability handler source the Character Planner's
+own cost/level resolver reads - see `realm_ability_costs.rs`) - bundled with the app so it doesn't
+need the server repo checked out locally. If the server repo's class system changes meaningfully,
+re-sync this folder from there.
+
+## Character Planner (`Charplanner/`)
+
+A separate, self-contained static website - a Character Planner players can use to plan out a
+build's specs/spells/styles/Realm Abilities before ever logging in, modeled on
+[Eden's own planner](https://eden-daoc.net/charplan) and styled to match the Divided Realms server
+page. It draws its data from the same live server this app already connects to, with real
+spec-point/autotrain/Realm Ability math ported directly from the server's own source - see
+[`Charplanner/README.md`](Charplanner/README.md) for how to regenerate its data
+(`cargo run --bin export_charplanner` in `src-tauri/`) and deploy it. Entirely independent of the
+rest of this app - no build step, nothing to install, just static files to copy onto a webserver.
 
 ## Compatibility with Divided Realms (github.com/ThatFontGuy/daoc-divided-linux)
 

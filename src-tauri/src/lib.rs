@@ -1,10 +1,11 @@
-mod classdata;
+pub mod classdata;
 mod codegen;
-mod deploy;
-mod deployed;
-mod realm_abilities;
-mod spell_ownership;
-mod specs;
+pub mod deploy;
+pub mod deployed;
+pub mod realm_abilities;
+pub mod realm_ability_costs;
+pub mod spell_ownership;
+pub mod specs;
 mod trainer;
 
 use classdata::{ClassInfo, KnownOptions};

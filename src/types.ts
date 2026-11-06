@@ -22,6 +22,9 @@ export interface ClassInfo {
   is_custom: boolean;
   filename: string | null;
   superseded_by: string | null;
+  /** Real spec names (e.g. ["Slash", "Thrust"] for Armsman) this class trains for free up to
+   * level/4 (min 1) - see classdata.rs's ClassInfo::autotrainable_specs for the full citation. */
+  autotrainable_specs: string[];
   raw_source: string;
 }
 

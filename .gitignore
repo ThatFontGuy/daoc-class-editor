@@ -25,3 +25,8 @@ dist-ssr
 
 # Saved class-design project files - personal work in progress, not source
 *.daocclass.json
+
+# Character Planner's own generated data export - live server data that changes every time
+# `cargo run --bin export_charplanner` is run, not something to commit; regenerate it locally
+# before uploading the Charplanner folder to a webserver.
+Charplanner/data/classes.json

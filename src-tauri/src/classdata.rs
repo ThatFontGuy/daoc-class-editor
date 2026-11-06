@@ -59,6 +59,16 @@ pub struct ClassInfo {
     /// marking it unavailable with no further context.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// Real spec names (e.g. `["Slash", "Thrust"]` for Armsman) this class trains for free up to
+    /// `level / 4` (minimum 1) - confirmed directly in `GamePlayer.cs`'s `GetAutoTrainPoints`.
+    /// Resolved from this class's own `AutotrainableSkills` field (a `Specs.X` array - see
+    /// `extract_autotrainable_specs`'s own doc comment for why this needs its own vendored
+    /// `SkillConstants.cs` lookup, not just the raw identifier) - never inherited from a parent,
+    /// since every real example of this field found live defines it directly on the leaf class
+    /// itself, same as every other class actually trains a fixed, specific weapon/stealth/etc.
+    /// line regardless of what it was cloned from.
+    #[serde(default)]
+    pub autotrainable_specs: Vec<String>,
     /// Full original source, kept so the UI can show "what you're cloning" for reference.
     pub raw_source: String,
 }
@@ -168,6 +178,7 @@ fn parse_fields(
         is_custom,
         filename: None,
         superseded_by: None,
+        autotrainable_specs: Vec::new(),
         raw_source,
     })
 }
@@ -250,6 +261,53 @@ pub fn parse_enum_ids(enum_file: &Path) -> (HashMap<String, i32>, i32) {
         }
     }
     (map, max_id)
+}
+
+/// Extracts the real `Specs.X -> "display name"` mapping straight from the vendored
+/// `SkillConstants.cs` (`public const string Slash = "Slash";`) - needed because a class's own
+/// `AutotrainableSkills` field only ever references the *constant identifier* (`Specs.Slash`),
+/// not its real string value, and the two aren't always identical: confirmed directly in the
+/// real source, `Specs.RecurveBow` is actually `"Recurve Bow"` (with a space) - the exact kind of
+/// silent mismatch this project has already been burned by elsewhere when assuming a C# constant
+/// name and its real string value are interchangeable.
+fn parse_specs_constants(path: &Path) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(re) = Regex::new(r#"public const string (\w+)\s*=\s*"([^"]+)""#) {
+            for cap in re.captures_iter(&text) {
+                map.insert(cap[1].to_string(), cap[2].to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Resolves a class's own `AutotrainableSkills` field (if it has one) into real spec display
+/// names - see `ClassInfo::autotrainable_specs`'s own doc comment for what this means in game.
+/// Every real example of this field is a single-line `new[] { Specs.X, Specs.Y };` - a token this
+/// fork's own fields always use `Specs.`-prefixed identifiers for, never a bare string literal,
+/// so matching `Specs\.(\w+)` tokens within the array and resolving each through
+/// `parse_specs_constants`'s own map is both correct and simpler than a more general C#-array
+/// parser. A `Specs.X` identifier the map doesn't recognize is kept as-is (the bare identifier)
+/// rather than silently dropped - a future constant the vendored `SkillConstants.cs` copy doesn't
+/// have yet should still show up as *something*, not vanish.
+fn extract_autotrainable_specs(raw_source: &str, specs_map: &HashMap<String, String>) -> Vec<String> {
+    let Ok(array_re) = Regex::new(r"AutotrainableSkills\s*=\s*new\[\]\s*\{([^}]*)\}") else {
+        return Vec::new();
+    };
+    let Some(array_body) = array_re.captures(raw_source).and_then(|c| c.get(1)) else {
+        return Vec::new();
+    };
+    let Ok(token_re) = Regex::new(r"Specs\.(\w+)") else {
+        return Vec::new();
+    };
+    token_re
+        .captures_iter(array_body.as_str())
+        .map(|c| {
+            let ident = &c[1];
+            specs_map.get(ident).cloned().unwrap_or_else(|| ident.to_string())
+        })
+        .collect()
 }
 
 /// Extracts the real race -> realm mapping straight from PlayerRace.cs
@@ -398,7 +456,7 @@ fn resolve_effective_scalars(classes: &mut [ClassInfo]) {
 /// then sorts them - shared by the vendored-only list and the vendored+deployed combined list, so
 /// a deployed class whose own clone didn't touch races still inherits correctly from whichever
 /// vendored (or other deployed) class it was cloned from.
-fn finalize_classes(classes: &mut Vec<ClassInfo>, race_realms: &HashMap<String, String>) {
+fn finalize_classes(classes: &mut Vec<ClassInfo>, race_realms: &HashMap<String, String>, specs_map: &HashMap<String, String>) {
     resolve_effective_eligible_races(classes);
     resolve_effective_scalars(classes);
     for class in classes.iter_mut() {
@@ -410,6 +468,7 @@ fn finalize_classes(classes: &mut Vec<ClassInfo>, race_realms: &HashMap<String, 
         if let Some((_, successor)) = SLOT_SUCCESSORS.iter().find(|(id, _)| *id == class.id) {
             class.superseded_by = Some((*successor).to_string());
         }
+        class.autotrainable_specs = extract_autotrainable_specs(&class.raw_source, specs_map);
     }
     classes.sort_by(|a, b| a.realm.cmp(&b.realm).then(a.name.cmp(&b.name)));
 }
@@ -417,8 +476,9 @@ fn finalize_classes(classes: &mut Vec<ClassInfo>, race_realms: &HashMap<String, 
 /// Walks the bundled `playerclasses/` resource folder and parses every class file found.
 pub fn load_all_classes(resources_dir: &Path) -> Vec<ClassInfo> {
     let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
+    let specs_map = parse_specs_constants(&resources_dir.join("core").join("SkillConstants.cs"));
     let mut out = load_vendored_unfinalized(resources_dir);
-    finalize_classes(&mut out, &race_realms);
+    finalize_classes(&mut out, &race_realms, &specs_map);
     out
 }
 
@@ -427,9 +487,10 @@ pub fn load_all_classes(resources_dir: &Path) -> Vec<ClassInfo> {
 /// can be picked as a clone source too, i.e. "clone of a clone").
 pub fn load_all_classes_with_extra(resources_dir: &Path, extra: Vec<ClassInfo>) -> Vec<ClassInfo> {
     let race_realms = parse_race_realms(&resources_dir.join("core").join("PlayerRace.cs"));
+    let specs_map = parse_specs_constants(&resources_dir.join("core").join("SkillConstants.cs"));
     let mut out = load_vendored_unfinalized(resources_dir);
     out.extend(extra);
-    finalize_classes(&mut out, &race_realms);
+    finalize_classes(&mut out, &race_realms, &specs_map);
     out
 }
 
@@ -740,9 +801,10 @@ namespace DOL.GS
         )
         .unwrap();
         let race_realms = parse_race_realms(&resources().join("core").join("PlayerRace.cs"));
+        let specs_map = parse_specs_constants(&resources().join("core").join("SkillConstants.cs"));
         let mut combined = vendored;
         combined.push(deployed);
-        finalize_classes(&mut combined, &race_realms);
+        finalize_classes(&mut combined, &race_realms, &specs_map);
 
         let grovekeeper = combined
             .iter()
@@ -756,6 +818,24 @@ namespace DOL.GS
             grovekeeper.effective_eligible_races,
             druid.effective_eligible_races
         );
+    }
+
+    #[test]
+    fn resolves_real_autotrainable_specs_with_their_actual_display_names() {
+        // A real, reproduced case this test deliberately covers: Specs.RecurveBow's own string
+        // value is "Recurve Bow" (with a space), not the bare identifier "RecurveBow" - Ranger's
+        // own AutotrainableSkills field exercises exactly this mismatch live.
+        let classes = load_all_classes(&resources());
+        let armsman = classes.iter().find(|c| c.name == "Armsman").unwrap();
+        assert_eq!(armsman.autotrainable_specs, vec!["Slash", "Thrust"]);
+
+        let ranger = classes.iter().find(|c| c.name == "Ranger").unwrap();
+        assert_eq!(ranger.autotrainable_specs, vec!["Archery", "Recurve Bow"]);
+
+        // A class with no AutotrainableSkills field at all (most casters) must resolve to an
+        // empty list, never a panic or a stale/leftover value from another class.
+        let wizard = classes.iter().find(|c| c.name == "Wizard").unwrap();
+        assert!(wizard.autotrainable_specs.is_empty());
     }
 
     #[test]
