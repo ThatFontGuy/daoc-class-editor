@@ -44,6 +44,7 @@ export default function SpellEditorPanel() {
   const [sshConfig, setSshConfig] = useState<SshConfig>(emptySshConfig);
   const [deployedClasses, setDeployedClasses] = useState<ClassInfo[]>([]);
   const [selectedClassId, setSelectedClassId] = useState<number | null>(null);
+  const [manualClassId, setManualClassId] = useState("");
   const [spellLines, setSpellLines] = useState<SpellLineGroup[] | null>(null);
   const [editingSpellId, setEditingSpellId] = useState<number | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
@@ -264,12 +265,37 @@ export default function SpellEditorPanel() {
             </option>
           ))}
         </select>
+        {/* The dropdown above only lists classes found by scanning loose bin/scripts/ files - a
+            class compiled directly into the server (a native client-slot class like a promoted
+            Drengr) never shows up there at all, even though its spec/spell data (and this whole
+            feature) lives entirely in the database, not in a script file. This lets any class ID
+            be reached directly regardless of how it's deployed. */}
+        <label
+          className="field"
+          style={{ display: "inline-flex", flexDirection: "row", gap: "0.3rem", alignItems: "center" }}
+        >
+          <span>or class ID:</span>
+          <input
+            type="number"
+            value={manualClassId}
+            onChange={(e) => setManualClassId(e.target.value)}
+            style={{ width: "5em" }}
+            disabled={busy}
+          />
+        </label>
+        <button
+          onClick={() => manualClassId.trim() !== "" && loadSpellLines(Number(manualClassId))}
+          disabled={busy || manualClassId.trim() === ""}
+        >
+          Load
+        </button>
         {selectedClassId != null && (
           <button onClick={migrate} disabled={busy}>
             {busy && migrateProgress ? "Migrating..." : "Migrate to independent spells"}
           </button>
         )}
       </div>
+      {selectedClassId != null && <p className="hint">Currently editing class {selectedClassId}.</p>}
       {migrateProgress && (
         <div className="progress-indicator">
           <progress value={migrateProgress.processed} max={Math.max(migrateProgress.total, 1)} />
