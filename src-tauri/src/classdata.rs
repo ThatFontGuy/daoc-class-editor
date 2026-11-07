@@ -506,22 +506,32 @@ pub fn next_free_id_from(classes: &[ClassInfo]) -> i32 {
     (classes.iter().map(|c| c.id).max().unwrap_or(0) + 1).max(CUSTOM_CLASS_ID_FLOOR)
 }
 
-/// Walks `parent_ident` up from `class_ident` until it reaches a true archetype (one whose own
-/// parent is `CharacterClassBase`) - e.g. Shadowblade *and* a Nosferatu cloned from Shadowblade
-/// both resolve to Midgard Rogue. A trainer's promotion gating needs this: in classic DAoC,
-/// nothing beyond the client's built-in class list is directly selectable at creation, so a
-/// player creates a character as this archetype and a trainer promotes them into the specific
-/// (possibly custom) class at some level - exactly how Sluaghbinder itself works from Acolyte.
-/// Bounded to 10 hops so a malformed/cyclical parent chain can't loop forever.
-pub fn root_archetype<'a>(classes: &'a [ClassInfo], class_ident: &str) -> Option<&'a ClassInfo> {
+/// Walks `parent_ident` up from `class_ident` to find the *real, directly-creatable* class a
+/// player actually gets assigned at character creation - e.g. both Shadowblade itself and a
+/// Nosferatu cloned from it resolve to Shadowblade, not Midgard Rogue. A real, confirmed bug this
+/// fixes: the obvious-seeming "walk all the way up to the true shared archetype" (Midgard Rogue,
+/// whose own parent is `CharacterClassBase`) is one level too far - nothing in the real game ever
+/// actually assigns a character that shared archetype's own class ID directly (it's a pure C#
+/// implementation detail, never exposed at character creation or anywhere else); the class a
+/// player is really created as is the one *directly below* it. Found live: the already-deployed
+/// trainers for both Nosferatu (checking Midgard Rogue's ID, 38) and Jentu (checking Viking's ID,
+/// 35) could never have actually promoted anyone, since no real character is ever assigned either
+/// of those IDs - they needed Shadowblade (23) and Warrior (22) respectively.
+///
+/// In classic DAoC, nothing beyond the client's built-in class list is directly selectable at
+/// creation, so a player creates a character as this real class and a trainer promotes them into
+/// the specific (possibly custom) one at some level - exactly how Sluaghbinder itself works from
+/// Acolyte. Bounded to 10 hops so a malformed/cyclical parent chain can't loop forever.
+pub fn trainer_prerequisite_class<'a>(classes: &'a [ClassInfo], class_ident: &str) -> Option<&'a ClassInfo> {
     let mut current = classes.iter().find(|c| c.class_ident == class_ident)?;
     for _ in 0..10 {
-        if current.parent_ident == "CharacterClassBase" {
+        let parent = classes.iter().find(|c| c.class_ident == current.parent_ident)?;
+        if parent.parent_ident == "CharacterClassBase" {
+            // `parent` is the true shared archetype (e.g. Midgard Rogue/Viking) - `current`,
+            // one level below it, is the real class a player is actually assigned.
             return Some(current);
         }
-        current = classes
-            .iter()
-            .find(|c| c.class_ident == current.parent_ident)?;
+        current = parent;
     }
     None
 }
@@ -855,15 +865,22 @@ namespace DOL.GS
     }
 
     #[test]
-    fn root_archetype_resolves_a_single_level_class() {
+    fn trainer_prerequisite_class_resolves_a_real_directly_creatable_class_to_itself() {
+        // Shadowblade is itself directly selectable at character creation (no trainer-promotion
+        // needed at all) - a Nosferatu cloned from it needs to check for *this* real class, not
+        // its own shared archetype (Midgard Rogue), which no real character is ever assigned.
         let classes = load_all_classes(&resources());
-        let archetype = root_archetype(&classes, "ClassShadowblade").expect("should resolve");
-        assert_eq!(archetype.class_ident, "ClassMidgardRogue");
-        assert_eq!(archetype.name, "Rogue");
+        let prereq = trainer_prerequisite_class(&classes, "ClassShadowblade").expect("should resolve");
+        assert_eq!(prereq.class_ident, "ClassShadowblade");
     }
 
     #[test]
-    fn root_archetype_resolves_through_a_custom_class_two_levels_deep() {
+    fn trainer_prerequisite_class_resolves_through_a_custom_class_two_levels_deep() {
+        // A real, confirmed bug this guards against: the already-deployed NosferatuTrainer.cs
+        // checked for Midgard Rogue's own class ID (38) - a real character can never actually be
+        // assigned that ID at all, so the promotion could never have worked. The correct answer
+        // here is Shadowblade (23), the real class a Rogue-archetype player is actually created
+        // as, one level below the shared Midgard Rogue archetype Nosferatu was cloned past.
         let vendored = load_vendored_unfinalized(&resources());
         let deployed = parse_deployed_source(
             r#"[CharacterClass(64, "Nosferatu", "Rogue")]
@@ -873,8 +890,24 @@ namespace DOL.GS
         let mut combined = vendored;
         combined.push(deployed);
 
-        let archetype = root_archetype(&combined, "ClassNosferatu").expect("should resolve");
-        assert_eq!(archetype.class_ident, "ClassMidgardRogue");
+        let prereq = trainer_prerequisite_class(&combined, "ClassNosferatu").expect("should resolve");
+        assert_eq!(prereq.class_ident, "ClassShadowblade");
+    }
+
+    #[test]
+    fn trainer_prerequisite_class_resolves_through_three_real_tiers() {
+        // A real, confirmed bug this guards against: the already-deployed JentuTrainer.cs
+        // (cloned from Drengr, itself cloned from Warrior) checked for Viking's own class ID
+        // (35) - a real character can never actually be assigned that ID either, confirmed live:
+        // an actual level 20 test character came back as Class 22 (Warrior), never 35. The
+        // correct answer is Warrior, one level below the shared Viking archetype - Drengr's own
+        // chain (Drengr -> Warrior -> Viking -> CharacterClassBase) has one more real tier than
+        // Shadowblade's (Shadowblade -> Midgard Rogue -> CharacterClassBase), so this is the
+        // dedicated test that actually exercises climbing past a real (non-custom) intermediate
+        // class (Drengr itself) to reach the correct one (Warrior), not just a custom one.
+        let classes = load_all_classes(&resources());
+        let prereq = trainer_prerequisite_class(&classes, "ClassDrengr").expect("should resolve");
+        assert_eq!(prereq.class_ident, "ClassWarrior");
     }
 
     #[test]

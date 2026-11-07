@@ -34,8 +34,8 @@ pub struct TrainerRequest {
     /// script to an NPC.
     pub guild_name: String,
     pub realm: String,
-    /// The archetype a player must currently be (and have reached `min_level` as) to be offered
-    /// promotion - see `classdata::root_archetype`.
+    /// The real, directly-creatable class a player must currently be (and have reached
+    /// `min_level` as) to be offered promotion - see `classdata::trainer_prerequisite_class`.
     pub archetype_id: i32,
     pub archetype_name: String,
     pub min_level: i32,

@@ -32,11 +32,15 @@ export default function TrainerPanel({
     setArchetypeError("");
     try {
       // Nothing beyond the game client's built-in class list is directly selectable at
-      // creation - the player creates this archetype instead, and the trainer promotes them.
-      // Resolving from the *source* (the class actually cloned, e.g. Shadowblade), not classId
-      // itself, since a brand-new class that hasn't been deployed yet has no entry of its own
-      // in `classes` to walk up from - but it would resolve to the exact same archetype anyway.
-      const resolved = await invoke<ClassInfo | null>("root_archetype", {
+      // creation - the player creates this real, directly-creatable class instead (not the
+      // shared archetype above it, e.g. Viking/Midgard Rogue - a real, confirmed bug found live:
+      // no actual character can ever be assigned that shared archetype's own class ID, so a
+      // trainer checking for it could never have promoted anyone), and the trainer promotes
+      // them. Resolving from the *source* (the class actually cloned, e.g. Shadowblade), not
+      // classId itself, since a brand-new class that hasn't been deployed yet has no entry of
+      // its own in `classes` to walk up from - but it would resolve to the exact same real class
+      // anyway.
+      const resolved = await invoke<ClassInfo | null>("trainer_prerequisite_class", {
         classes,
         classIdent: source.class_ident,
       });

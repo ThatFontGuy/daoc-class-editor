@@ -75,11 +75,11 @@ fn suggest_next_id(app: tauri::AppHandle, cfg: SshConfig) -> Result<i32, String>
 
 /// Takes the frontend's already-fetched combined class list (vendored + deployed) rather than
 /// refetching it, since the caller (the trainer-setup step) already has it in memory from
-/// `list_classes_with_deployed` - this just reuses `classdata::root_archetype`'s tested
-/// inheritance walk instead of duplicating it in TypeScript.
+/// `list_classes_with_deployed` - this just reuses `classdata::trainer_prerequisite_class`'s
+/// tested inheritance walk instead of duplicating it in TypeScript.
 #[tauri::command]
-fn root_archetype(classes: Vec<ClassInfo>, class_ident: String) -> Option<ClassInfo> {
-    classdata::root_archetype(&classes, &class_ident).cloned()
+fn trainer_prerequisite_class(classes: Vec<ClassInfo>, class_ident: String) -> Option<ClassInfo> {
+    classdata::trainer_prerequisite_class(&classes, &class_ident).cloned()
 }
 
 #[tauri::command]
@@ -460,7 +460,7 @@ pub fn run() {
             write_safety_status,
             backup_database,
             revert_database,
-            root_archetype,
+            trainer_prerequisite_class,
             generate_trainer_code,
             find_trainer_npcs,
             spawn_trainer_npc,
