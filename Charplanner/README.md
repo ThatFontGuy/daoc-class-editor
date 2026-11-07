@@ -45,6 +45,11 @@ Upload this whole folder (including the freshly regenerated `data/classes.json`)
 webserver, preserving the folder structure. That's it - no server-side code, no database
 connection from the public-facing site at all.
 
+`get-started.html`'s own download button expects the actual launcher zip to live right alongside
+it in this same folder - place it there and update the button's `href` (and the "Includes no Dark
+Age of Camelot game files" line, if its size/date matter to you) in `get-started.html` to match
+whatever you actually name it.
+
 ## Known limitations (by design, not bugs)
 
 - **Realm Abilities tab/Misc** (Eden's own planner has these too) - training costs and granted

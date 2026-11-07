@@ -403,3 +403,29 @@ button.primary {
   color: var(--danger);
   border-color: var(--danger);
 }
+
+/* Matches the Divided Realms server page's own download button exactly (whozon.ca/othlyn) -
+   same class name too, so this stays a drop-in match if that page's own markup is ever reused
+   directly. */
+.download-btn {
+  display: inline-block;
+  background: var(--gold);
+  color: #1a1308;
+  font-weight: bold;
+  text-decoration: none;
+  padding: 0.85rem 1.75rem;
+  border-radius: 6px;
+  font-size: 1.1rem;
+  border: 1px solid #8a703a;
+}
+
+.download-btn:hover {
+  background: #d8b96c;
+}
+
+.download-meta {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin-top: 0.75rem;
+}
+
