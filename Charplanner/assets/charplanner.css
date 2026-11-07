@@ -14,7 +14,11 @@
   --gold: #c8a95c;
   --text: #e8ddc8;
   --muted: #a8977e;
-  --danger: #e0a0a0;
+  /* A clearly, unmistakably red warning color (not the muted parchment-pink this used to be,
+   * which read as barely-there against the dark background) - used for "you've overspent your
+   * points" and "this class is disabled" warnings specifically, where standing out matters more
+   * than matching the rest of the palette. */
+  --danger: #ff5c5c;
 
   /* Traditional DAoC realm colors - Albion red, Midgard a light "snow" blue, Hibernia a light
      "grass" green - same values the desktop app's own Classes tab uses. */

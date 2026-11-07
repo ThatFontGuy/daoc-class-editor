@@ -59,6 +59,13 @@ const STYLE_FIELDS: &[&str] = &[
     "OpeningRequirementValue",
     "StealthRequirement",
     "ArmorHitLocation",
+    // Not shown directly in the quick-edit form (ClassSpecsSection.tsx's own
+    // EDITABLE_STYLE_FIELD_HINTS doesn't include it either) - this is Style's *other* ID column,
+    // separate from the real DB primary key StyleID, that a chain style's own
+    // OpeningRequirementValue actually references (confirmed in specs.rs's own clone_spec chain
+    // -repoint logic). Exported purely so the Character Planner can resolve a chain requirement
+    // to the prerequisite style's real Name instead of a meaningless raw number.
+    "ID",
 ];
 
 fn pick_fields(fields: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {

@@ -455,12 +455,65 @@
     ["ArmorHitLocation", "Armor Hit Location"],
   ];
 
+  // eObjectType (Enums/eObjectType.cs) - only the weapon-relevant values are realistically ever
+  // seen in a style's own WeaponTypeRequirement, but the full enum is small enough to just
+  // include outright rather than silently falling back to a bare number for an unusual one.
+  const WEAPON_TYPES = {
+    0: "Any",
+    1: "Generic Weapon",
+    2: "Crushing",
+    3: "Slashing",
+    4: "Thrusting",
+    5: "Fired",
+    6: "Two-Handed",
+    7: "Polearm",
+    8: "Staff",
+    9: "Longbow",
+    10: "Crossbow",
+    11: "Sword",
+    12: "Hammer",
+    13: "Axe",
+    14: "Spear",
+    15: "Composite Bow",
+    16: "Thrown",
+    17: "Left Axe",
+    18: "Recurved Bow",
+    19: "Blades",
+    20: "Blunt",
+    21: "Piercing",
+    22: "Large Weapons",
+    23: "Celtic Spear",
+    24: "Flexible",
+    25: "Hand to Hand",
+    26: "Scythe",
+    27: "Fist Wraps",
+    28: "Mauler Staff",
+    42: "Shield",
+    // Style.SpecialWeaponType - not real eObjectType values, two sentinels specific to styles.
+    1000: "Dual Wield (both hands)",
+    1001: "Any Weapon (1h/2h/dual)",
+  };
+
+  // eAttackResultRequirement (styles/Style.cs) - 7 ("Style") is handled separately above as a
+  // resolved chain prerequisite, so it never reaches this lookup.
+  const ATTACK_RESULT_REQUIREMENTS = {
+    0: "Any",
+    1: "Miss",
+    2: "Hit",
+    3: "Parry",
+    4: "Block",
+    5: "Evade",
+    6: "Fumble",
+  };
+
   /** Fills the sticky details panel with everything known about one level's unlock(s) - called
    * on hover, not through the normal render() cycle (a full re-render on every mouse movement
    * would be wasteful and would also fight with the hover itself). More than one unlock can
    * share the same level (rare, but real - e.g. two spells in the same progression); each gets
-   * its own heading. */
-  function showSpecDetails(group) {
+   * its own heading. `specStyles` (all of this spec's own styles, not just the ones in `group`)
+   * is needed to resolve a chain style's own prerequisite - see the AttackResultRequirement===7
+   * special case below. */
+  function showSpecDetails(group, specStyles) {
     const panel = $("#spec-details");
     if (!panel) return;
     panel.innerHTML = "";
@@ -468,11 +521,31 @@
       panel.appendChild(el("h3", { text: `${u.name} (Lv ${u.level})` }));
       const dl = el("dl");
       const fields = u.kind === "spell" ? SPELL_DETAIL_FIELDS : STYLE_DETAIL_FIELDS;
+      // A style whose AttackResultRequirement is 7 ("a style is required" - eAttackResultRequirement.Style,
+      // confirmed in the real server source) needs a *prerequisite style*, not a mechanical
+      // combat result - its own OpeningRequirementValue is that prerequisite's real Style.ID
+      // (a separate field from the DB's own StyleID primary key - see specs.rs's own clone_spec
+      // chain-repoint logic for the full citation), not a meaningful number on its own. Resolve
+      // it to the prerequisite's actual Name instead of showing a raw, opaque ID - a real,
+      // reported case: "Perforate" (ID 214) showing as a bare "214" gave no indication at all
+      // that Spear's own "Gungnir's Fury" chains off of it.
+      const isChainStyle = u.kind === "style" && Number(u.data.AttackResultRequirement) === 7;
+      if (isChainStyle && u.data.OpeningRequirementValue) {
+        const prereq = (specStyles || []).find((s) => s.ID === u.data.OpeningRequirementValue);
+        dl.appendChild(el("dt", { text: "Requires Style" }));
+        dl.appendChild(el("dd", { text: prereq ? prereq.Name : `Unknown (ID ${u.data.OpeningRequirementValue})` }));
+      }
       for (const [key, label] of fields) {
+        // Already shown above (resolved to a name) - and AttackResultRequirement=7 alone is a
+        // meaningless bare "7" without that resolution, so it's skipped here too.
+        if (isChainStyle && (key === "OpeningRequirementValue" || key === "AttackResultRequirement")) continue;
         const value = u.data[key];
         if (value === undefined || value === null || value === "" || value === 0) continue;
+        let display = String(value);
+        if (key === "WeaponTypeRequirement") display = WEAPON_TYPES[value] || display;
+        if (key === "AttackResultRequirement") display = ATTACK_RESULT_REQUIREMENTS[value] || display;
         dl.appendChild(el("dt", { text: label }));
-        dl.appendChild(el("dd", { text: String(value) }));
+        dl.appendChild(el("dd", { text: display }));
       }
       panel.appendChild(dl);
     }
@@ -529,8 +602,8 @@
           class: `level-pip${level <= current ? " unlocked" : ""}`,
           text: String(level),
           title: group.map((u) => u.name).join(" / "),
-          onmouseenter: () => showSpecDetails(group),
-          onfocus: () => showSpecDetails(group),
+          onmouseenter: () => showSpecDetails(group, spec.styles),
+          onfocus: () => showSpecDetails(group, spec.styles),
           onclick: () => setLevel(Math.min(cap, level)),
         })
       );

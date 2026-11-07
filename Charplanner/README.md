@@ -60,3 +60,11 @@ connection from the public-facing site at all.
   same way it would in the real game.
 - Race/realm-rank-based stat bonuses aren't computed - this planner is about specs/spells/styles/
   Realm Abilities, not a full stat calculator.
+
+## Style detail decoding (hover panel)
+
+A chain style's own "Requires Style" is resolved to the prerequisite's real name (by matching
+`Style.ID` - a separate field from the DB primary key `StyleID` - never shown as a bare number),
+and `Weapon Type Requirement`/`Attack Result Requirement` are translated from the server's own
+`eObjectType`/`eAttackResultRequirement` enums (hardcoded in `planner.js` - small, stable enums,
+not worth a round-trip through the export tool) instead of showing raw numeric codes.
