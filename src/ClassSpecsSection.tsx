@@ -336,7 +336,7 @@ function SpellSpecEditor({
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [specKey]);
+  }, [classId, specKey]);
 
   async function load() {
     if (busyRef.current) return;
@@ -347,6 +347,7 @@ function SpellSpecEditor({
     try {
       const rows = await invoke<SpellLineGroup[]>("list_spell_lines_for_spec", {
         cfg: sshConfig,
+        classId,
         specKey,
       });
       setGroups(rows);
@@ -483,7 +484,24 @@ function SpellSpecEditor({
             );
             return (
               <div key={group.line_key}>
-                {groups.length > 1 && <h4>{group.line_name}</h4>}
+                {groups.length > 1 && (
+                  <h4>
+                    {group.line_name}
+                    {group.is_base_line && (
+                      <span
+                        title="Granted to every class with this spec regardless of spec points spent - scales with character level, not spec level."
+                        style={{
+                          marginLeft: "0.5em",
+                          fontSize: "0.75em",
+                          fontWeight: "normal",
+                          color: "var(--muted, #888)",
+                        }}
+                      >
+                        (base line - no spec investment needed)
+                      </span>
+                    )}
+                  </h4>
+                )}
                 <table className="spec-table">
                   <thead>
                     <tr>

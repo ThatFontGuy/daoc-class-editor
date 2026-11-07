@@ -197,7 +197,7 @@ fn export_one_class(
         // ("Shields" has both styles and an incidental spell line) for why has_styles implies
         // this spec is never also shown as a spell line set.
         if s.has_spell_lines && !s.has_styles {
-            let lines = specs::list_spell_lines_for_spec(cfg, &s.key_name)?;
+            let lines = specs::list_spell_lines_for_spec(cfg, class_id, &s.key_name)?;
             for line in &lines {
                 let spells_json: Vec<Value> = line
                     .spells
@@ -208,8 +208,15 @@ fn export_one_class(
                         Value::Object(obj)
                     })
                     .collect();
+                // is_base_line: a line the class gets regardless of spec investment (scales
+                // with character level) vs. one gated behind actually spending points here (see
+                // `resolve_spec_lines_for_class`'s own doc comment) - planner.js shows these two
+                // kinds in separate sections instead of silently merging them, a real, confirmed
+                // bug found live (Cleric Smite's always-on Direct Damage/Stun lines were shown
+                // mixed in with its spec-gated Damage Add/Mesmerize/etc. lines).
                 spell_lines_json.push(json!({
                     "line_name": line.line_name,
+                    "is_base_line": line.is_base_line,
                     "spells": spells_json,
                 }));
             }

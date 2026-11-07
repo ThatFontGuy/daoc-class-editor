@@ -246,6 +246,25 @@ button.primary {
   padding: 0.5rem 0.75rem;
 }
 
+/* Groups a spec's always-available base-line block together with its own trainable row, so the
+   two visually read as "one spec, two halves" rather than two unrelated rows - see planner.js's
+   own renderBaseLineBlock doc comment for the real mechanic this distinguishes. */
+.spec-row-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.spec-row-baseline {
+  background: var(--panel);
+  border-style: dashed;
+}
+
+.spec-row-baseline .spec-row-name {
+  font-weight: 500;
+  font-style: italic;
+}
+
 .spec-row-top {
   display: flex;
   align-items: center;

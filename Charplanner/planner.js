@@ -551,6 +551,63 @@
     }
   }
 
+  /** Builds a row of clickable level pips from a flat `unlocks` list (already `{level, name,
+   * kind, data}` tuples) - shared between the trainable spec row (gated by spec investment,
+   * clicking a pip trains to it) and the always-available base-line row (gated purely by
+   * character level, clicking does nothing since there's no spec investment to set). */
+  function renderPips(unlocks, isUnlocked, specStyles, onPipClick) {
+    const byLevel = new Map();
+    for (const u of unlocks) {
+      if (!byLevel.has(u.level)) byLevel.set(u.level, []);
+      byLevel.get(u.level).push(u);
+    }
+    const pips = el("div", { class: "level-pips" });
+    for (const [level, group] of [...byLevel.entries()].sort((a, b) => a[0] - b[0])) {
+      pips.appendChild(
+        el("button", {
+          class: `level-pip${isUnlocked(level) ? " unlocked" : ""}`,
+          text: String(level),
+          title: group.map((u) => u.name).join(" / "),
+          onmouseenter: () => showSpecDetails(group, specStyles),
+          onfocus: () => showSpecDetails(group, specStyles),
+          onclick: onPipClick ? () => onPipClick(level) : null,
+        })
+      );
+    }
+    return pips;
+  }
+
+  /** The "Direct Damage"/"Stun" half of Cleric's own Smite, real and confirmed live: spells
+   * granted to every class with this spec regardless of points spent (IsBaseLine=1 server-side -
+   * see specs.rs's own `resolve_spec_lines_for_class` doc comment), scaling purely with
+   * character level - a real, confirmed bug found live merged these into the same list as
+   * Smite's actual spec-gated lines (Damage Add, Mesmerise, etc.), with no way to tell a player
+   * "you already have this" from "you need to spend points to get this". Rendered as its own
+   * small block, gated by `state.level` alone - there's nothing to train here, so no stepper and
+   * clicking a pip does nothing. */
+  function renderBaseLineBlock(spec, baseLines) {
+    const unlocks = [];
+    for (const line of baseLines) {
+      for (const spell of line.spells) {
+        unlocks.push({ level: spell.level, name: spell.Name, kind: "spell", data: spell });
+      }
+    }
+    if (!unlocks.length) return null;
+    unlocks.sort((a, b) => a.level - b.level);
+
+    const block = el("div", { class: "spec-row spec-row-baseline" });
+    block.appendChild(
+      el("div", { class: "spec-row-top" }, [
+        el("span", { class: "spec-row-name" }, [
+          `${spec.name} (base)`,
+          el("span", { class: "badge", text: "no spec needed" }),
+        ]),
+      ])
+    );
+    block.appendChild(renderPips(unlocks, (level) => level <= state.level, spec.styles, null));
+    return block;
+  }
+
   function renderSpecRow(cls, spec, cap) {
     const current = Math.min(cap, state.specLevels[spec.key_name] || 0);
     state.specLevels[spec.key_name] = current;
@@ -559,6 +616,12 @@
       state.specLevels[spec.key_name] = v;
       render();
     };
+
+    // See renderBaseLineBlock's own doc comment: base-line spells are always available (scaling
+    // off character level, not spec investment) and shown in their own separate block, never
+    // mixed into this spec's own trainable pips below.
+    const gatedLines = spec.spell_lines.filter((line) => !line.is_base_line);
+    const baseLines = spec.spell_lines.filter((line) => line.is_base_line);
 
     const row = el("div", { class: "spec-row" });
     const cost = effectiveSpecCost(current, autotrains, state.level);
@@ -580,36 +643,20 @@
     for (const style of spec.styles) {
       unlocks.push({ level: style.level, name: style.Name, kind: "style", data: style });
     }
-    for (const line of spec.spell_lines) {
+    for (const line of gatedLines) {
       for (const spell of line.spells) {
         unlocks.push({ level: spell.level, name: spell.Name, kind: "spell", data: spell });
       }
     }
     unlocks.sort((a, b) => a.level - b.level);
 
-    // Group unlocks sharing the same level into one pip - a real spec line can legitimately have
-    // more than one unlock at the exact same level (e.g. two spells in a progression).
-    const byLevel = new Map();
-    for (const u of unlocks) {
-      if (!byLevel.has(u.level)) byLevel.set(u.level, []);
-      byLevel.get(u.level).push(u);
-    }
+    row.appendChild(
+      renderPips(unlocks, (level) => level <= current, spec.styles, (level) => setLevel(Math.min(cap, level)))
+    );
 
-    const pips = el("div", { class: "level-pips" });
-    for (const [level, group] of [...byLevel.entries()].sort((a, b) => a[0] - b[0])) {
-      pips.appendChild(
-        el("button", {
-          class: `level-pip${level <= current ? " unlocked" : ""}`,
-          text: String(level),
-          title: group.map((u) => u.name).join(" / "),
-          onmouseenter: () => showSpecDetails(group, spec.styles),
-          onfocus: () => showSpecDetails(group, spec.styles),
-          onclick: () => setLevel(Math.min(cap, level)),
-        })
-      );
-    }
-    row.appendChild(pips);
-    return row;
+    const baseBlock = renderBaseLineBlock(spec, baseLines);
+    if (!baseBlock) return row;
+    return el("div", { class: "spec-row-group" }, [baseBlock, row]);
   }
 
   function renderRealmAbilityPanel(cls) {

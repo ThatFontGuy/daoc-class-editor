@@ -1128,35 +1128,96 @@ pub struct SpellLineGroup {
     pub spec_key: String,
     pub line_key: String,
     pub line_name: String,
+    /// True for a line the class gets regardless of spec investment (scales with character
+    /// level), false for one that only exists/progresses once points are actually spent on this
+    /// spec - see `resolve_spec_lines_for_class`'s own doc comment for the real mechanic this
+    /// mirrors. The "Classes" tab and the Character Planner both need this to show the two
+    /// kinds separately instead of silently merging them into one list.
+    pub is_base_line: bool,
     pub spells: Vec<OwnedSpellInLine>,
 }
 
-/// Every spell line belonging to `spec_key` - a class's own cloned spec, or a stock/shared one
-/// it's merely been assigned (any class with this spec in its spec list can call this, not just
-/// one that's already cloned it) - each with its own spells in level order. Scoped to one spec at
-/// a time (rather than a whole class's worth up front) so expanding just the one spec a user
-/// actually wants to look at in the "Classes" tab doesn't also have to fetch every other spec's
-/// own data nobody asked to see yet.
-pub fn list_spell_lines_for_spec(cfg: &SshConfig, spec_key: &str) -> Result<Vec<SpellLineGroup>, String> {
+/// A real, confirmed-live bug found via Character Planner data: several classes share one `Spec`
+/// KeyName (e.g. Healer/Shaman/Valkyrie all list "Mending"), and the server's own `SpellLine`
+/// table carries *multiple* rows for that one Spec - tagged per class via `ClassIDHint` (0 for a
+/// shared/neutral row, a real class ID for one that only applies to that class) and per
+/// `IsBaseLine` (a baseline row is granted to every class with this spec regardless of points
+/// spent, scaling off character level; a non-baseline row only exists once spec points are
+/// actually invested, scaling off spec level). A naive `WHERE Spec = key` query returns every
+/// class's rows mixed together - this was showing Valkyrie's own "Mending" spells under Healer,
+/// and merging Smite's always-on baseline (Direct Damage/Stun) with its spec-gated lines
+/// (Damage Add/Mesmerize/etc.) into one undifferentiated block.
+///
+/// Mirrors the real server's own resolution exactly (`Specialization.GetSpellLinesForLiving` /
+/// `Specialization.SpecLinesForClass`, both in `gameutils/Specialization.cs`): baseline and
+/// non-baseline are resolved independently; for each, a class's own `ClassIDHint`-tagged rows
+/// are used if any exist, falling back to the neutral (`ClassIDHint = 0`) rows only when it has
+/// none of its own. Maulers (class IDs 60-62) are the one documented exception for non-baseline
+/// rows: their own lines are *added to* the neutral ones (their realm-gift lines extend the
+/// shared Aura Manipulation line), not swapped in for them.
+fn resolve_spec_lines_for_class(lines: &[Value], class_id: i64) -> Vec<Value> {
+    let is_mauler = (60..=62).contains(&class_id);
+    let bucket = |want_base_line: bool| -> Vec<Value> {
+        let matches_bucket = |l: &&Value| (int_field(l, "IsBaseLine") != 0) == want_base_line;
+        let own: Vec<Value> = lines
+            .iter()
+            .filter(matches_bucket)
+            .filter(|l| int_field(l, "ClassIDHint") == class_id)
+            .cloned()
+            .collect();
+        let neutral: Vec<Value> = lines
+            .iter()
+            .filter(matches_bucket)
+            .filter(|l| int_field(l, "ClassIDHint") == 0)
+            .cloned()
+            .collect();
+        if own.is_empty() {
+            neutral
+        } else if !want_base_line && is_mauler {
+            neutral.into_iter().chain(own).collect()
+        } else {
+            own
+        }
+    };
+    bucket(true).into_iter().chain(bucket(false)).collect()
+}
+
+/// Every spell line that actually applies to `class_id` for `spec_key` - a class's own cloned
+/// spec, or a stock/shared one it's merely been assigned (any class with this spec in its spec
+/// list can call this, not just one that's already cloned it) - each with its own spells in level
+/// order, baseline lines first. Scoped to one spec at a time (rather than a whole class's worth
+/// up front) so expanding just the one spec a user actually wants to look at in the "Classes" tab
+/// doesn't also have to fetch every other spec's own data nobody asked to see yet. See
+/// `resolve_spec_lines_for_class` for why `class_id` is required at all, not just `spec_key`.
+pub fn list_spell_lines_for_spec(
+    cfg: &SshConfig,
+    class_id: i64,
+    spec_key: &str,
+) -> Result<Vec<SpellLineGroup>, String> {
     ensure_tracking_table(cfg)?;
 
     let spec_key_q = sql_quote(spec_key);
-    let lines = run_remote_sql_json(
+    let all_lines = run_remote_sql_json(
         cfg,
-        &format!("SELECT KeyName, Name, Spec FROM SpellLine WHERE Spec = '{spec_key_q}';"),
+        &format!(
+            "SELECT KeyName, Name, Spec, IsBaseLine, ClassIDHint FROM SpellLine WHERE Spec = '{spec_key_q}';"
+        ),
     )?;
+    let lines = resolve_spec_lines_for_class(&all_lines, class_id);
     let mut groups: Vec<SpellLineGroup> = lines
         .iter()
         .map(|l| SpellLineGroup {
             spec_key: str_field(l, "Spec"),
             line_key: str_field(l, "KeyName"),
             line_name: str_field(l, "Name"),
+            is_base_line: int_field(l, "IsBaseLine") != 0,
             spells: Vec::new(),
         })
         .collect();
     if groups.is_empty() {
         return Ok(groups);
     }
+
 
     let line_keys_csv = groups
         .iter()
@@ -2718,7 +2779,7 @@ mod tests {
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
-        let groups = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
+        let groups = list_spell_lines_for_spec(&cfg, 64, "frostbolt_tree_64").unwrap();
         assert_eq!(groups.len(), 1, "{groups:?}");
         let group = &groups[0];
         assert_eq!(group.spec_key, "frostbolt_tree_64");
@@ -2740,6 +2801,143 @@ mod tests {
     }
 
     #[test]
+    fn list_spell_lines_for_spec_never_leaks_another_classs_own_lines() {
+        // The real, confirmed-live bug this guards against: Healer, Shaman and Valkyrie all
+        // share the "Mending" spec, but the real server's own SpellLine table carries a
+        // *separate* ClassIDHint-tagged row per class - a naive `WHERE Spec = key` query (what
+        // this function used to run) returned all three classes' own rows mixed together,
+        // showing spells meant only for Valkyrie under Healer's own Mending display.
+        let dir = setup_test_db("no-cross-class-leak");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('mending_neutral_base', 'Mending', 'mending', 1, 0);\
+             INSERT INTO SpellLine VALUES ('healer_mending_spec', 'Mending', 'mending', 0, 26);\
+             INSERT INTO SpellLine VALUES ('valkyrie_mending_spec', 'Mending', 'mending', 0, 34);\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('healer_mending_spec', 9001, 1, 'healer-line-1');\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('valkyrie_mending_spec', 9002, 1, 'valkyrie-line-1');",
+        )
+        .unwrap();
+
+        let groups = list_spell_lines_for_spec(&cfg, 26, "mending").unwrap();
+        let keys: Vec<&str> = groups.iter().map(|g| g.line_key.as_str()).collect();
+        assert!(keys.contains(&"mending_neutral_base"), "{keys:?}");
+        assert!(keys.contains(&"healer_mending_spec"), "{keys:?}");
+        assert!(
+            !keys.contains(&"valkyrie_mending_spec"),
+            "Healer must never see Valkyrie's own Mending line: {keys:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_spell_lines_for_spec_prefers_a_classs_own_baseline_over_the_shared_neutral_one() {
+        // Valkyrie has its own baseline Mending line (distinct spells from the shared one every
+        // other Mending class falls back to) - real, confirmed live, via SpellLine rows
+        // 'Mending' (ClassIDHint=0) and 'Valkyrie Mending' (ClassIDHint=34), both IsBaseLine=1.
+        let dir = setup_test_db("baseline-own-over-neutral");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('mending_neutral_base', 'Mending', 'mending', 1, 0);\
+             INSERT INTO SpellLine VALUES ('valkyrie_mending_base', 'Valkyrie Mending', 'mending', 1, 34);",
+        )
+        .unwrap();
+
+        let healer_groups = list_spell_lines_for_spec(&cfg, 26, "mending").unwrap();
+        assert_eq!(
+            healer_groups.iter().map(|g| g.line_key.as_str()).collect::<Vec<_>>(),
+            vec!["mending_neutral_base"],
+            "a class with no baseline of its own falls back to the shared neutral one"
+        );
+
+        let valkyrie_groups = list_spell_lines_for_spec(&cfg, 34, "mending").unwrap();
+        assert_eq!(
+            valkyrie_groups.iter().map(|g| g.line_key.as_str()).collect::<Vec<_>>(),
+            vec!["valkyrie_mending_base"],
+            "a class with its own baseline uses only its own, not the shared neutral one too"
+        );
+        assert!(valkyrie_groups[0].is_base_line);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_spell_lines_for_spec_separates_base_lines_from_spec_gated_lines() {
+        // Cleric Smite, real and confirmed live: every Cleric gets a Direct Damage and a Stun
+        // line for free regardless of spec investment (IsBaseLine=1, scaling off character
+        // level), but only gains a Damage Add / Mesmerize / etc. line once points are actually
+        // spent in Smite (IsBaseLine=0, scaling off spec level) - these must never be merged
+        // into one undifferentiated list, which was this tool's own second real bug found live.
+        let dir = setup_test_db("base-vs-spec-gated");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('smite_dd_base', 'Direct Damage', 'smite', 1, 0);\
+             INSERT INTO SpellLine VALUES ('smite_stun_base', 'Stun', 'smite', 1, 0);\
+             INSERT INTO SpellLine VALUES ('smite_dmgadd_spec', 'Damage Add', 'smite', 0, 2);\
+             INSERT INTO SpellLine VALUES ('smite_mez_spec', 'Mesmerise', 'smite', 0, 2);",
+        )
+        .unwrap();
+
+        let groups = list_spell_lines_for_spec(&cfg, 2, "smite").unwrap();
+        let base: Vec<&str> = groups
+            .iter()
+            .filter(|g| g.is_base_line)
+            .map(|g| g.line_key.as_str())
+            .collect();
+        let gated: Vec<&str> = groups
+            .iter()
+            .filter(|g| !g.is_base_line)
+            .map(|g| g.line_key.as_str())
+            .collect();
+        assert_eq!(base, vec!["smite_dd_base", "smite_stun_base"], "{groups:?}");
+        assert_eq!(gated, vec!["smite_dmgadd_spec", "smite_mez_spec"], "{groups:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_spell_lines_for_spec_a_maulers_own_lines_extend_the_neutral_ones_instead_of_replacing_them() {
+        // Maulers (class IDs 60-62) are the one documented exception: their own realm-gift lines
+        // extend the shared Aura Manipulation line (every other class's own lines replace the
+        // neutral fallback entirely) - see Specialization.SpecLinesForClass's own doc comment.
+        let dir = setup_test_db("mauler-extends-neutral");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('aura_neutral', 'Aura Manipulation', 'aura', 0, 0);\
+             INSERT INTO SpellLine VALUES ('aura_mauler_gift', 'Discipline of Laresh', 'aura', 0, 61);\
+             INSERT INTO SpellLine VALUES ('aura_other_own', 'Other Aura', 'aura', 0, 5);",
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_spell_lines_for_spec(&cfg, 61, "aura")
+                .unwrap()
+                .iter()
+                .map(|g| g.line_key.clone())
+                .collect::<Vec<_>>(),
+            vec!["aura_neutral", "aura_mauler_gift"],
+            "a Mauler keeps the shared line and gains its own on top of it"
+        );
+
+        // Any other class with its own non-baseline row still replaces the neutral one outright.
+        assert_eq!(
+            list_spell_lines_for_spec(&cfg, 5, "aura")
+                .unwrap()
+                .iter()
+                .map(|g| g.line_key.clone())
+                .collect::<Vec<_>>(),
+            vec!["aura_other_own"],
+            "a non-Mauler's own line replaces the neutral one entirely"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn update_line_spell_level_changes_the_level_on_this_classs_own_line() {
         let dir = setup_test_db("update-level-owned");
         let cfg = test_cfg(&dir);
@@ -2753,13 +2951,13 @@ mod tests {
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
 
-        let groups = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
+        let groups = list_spell_lines_for_spec(&cfg, 64, "frostbolt_tree_64").unwrap();
         let first_spell = &groups[0].spells[0];
         assert_eq!(first_spell.level, 1);
 
         update_line_spell_level(&cfg, 64, &first_spell.line_xspell_id, 5).unwrap();
 
-        let groups_after = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
+        let groups_after = list_spell_lines_for_spec(&cfg, 64, "frostbolt_tree_64").unwrap();
         assert_eq!(groups_after[0].spells[0].level, 5);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2796,7 +2994,7 @@ mod tests {
             "the class's own assignment must now point at its own independent clone"
         );
 
-        let groups = list_spell_lines_for_spec(&cfg, "slash_64").unwrap();
+        let groups = list_spell_lines_for_spec(&cfg, 64, "slash_64").unwrap();
         assert_eq!(groups[0].spells[0].level, 5);
         assert!(groups[0].spells[0].is_owned);
 
@@ -2834,7 +3032,7 @@ mod tests {
         )
         .unwrap();
 
-        let groups = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
+        let groups = list_spell_lines_for_spec(&cfg, 64, "frostbolt_tree_64").unwrap();
         let line = &groups[0].spells[0];
         assert!(!line.is_owned, "a legacy line's spell starts out un-owned");
         let original_spell_id = line.spell_id;
@@ -2846,7 +3044,7 @@ mod tests {
             "cloning must produce a brand-new SpellID, not reuse the shared one"
         );
 
-        let groups_after = list_spell_lines_for_spec(&cfg, "frostbolt_tree_64").unwrap();
+        let groups_after = list_spell_lines_for_spec(&cfg, 64, "frostbolt_tree_64").unwrap();
         let line_after = &groups_after[0].spells[0];
         assert!(line_after.is_owned);
         assert_eq!(line_after.spell_id, first_call_id);
@@ -2880,7 +3078,7 @@ mod tests {
         let new_spell_id = ensure_line_spell_owned(&cfg, 64, "shared-line-1").unwrap();
         assert_ne!(new_spell_id, 9001, "must be an independent clone, not the shared source spell");
 
-        let groups = list_spell_lines_for_spec(&cfg, "slash_64").unwrap();
+        let groups = list_spell_lines_for_spec(&cfg, 64, "slash_64").unwrap();
         assert_eq!(groups[0].spells[0].spell_id, new_spell_id);
         assert!(groups[0].spells[0].is_owned);
 

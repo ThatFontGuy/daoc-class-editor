@@ -150,6 +150,7 @@ export interface SpellLineGroup {
   spec_key: string;
   line_key: string;
   line_name: string;
+  is_base_line: boolean;
   spells: OwnedSpellInLine[];
 }
 
