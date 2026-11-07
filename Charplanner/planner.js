@@ -577,22 +577,39 @@
     return pips;
   }
 
-  /** One `SpellLine` (e.g. Healer's shared baseline "Mending") commonly holds several genuinely
-   * distinct progressions mixed together - real, confirmed live: Mending alone has "Minor Heal",
-   * "Heal", "Heal (group)" and "Resurrect" all on one line. Flattening them into a single pip row
-   * (what this used to do) mixed unrelated spells that only happen to share a level into one pip
-   * - hovering level 40 showed both "Remigration from Valhalla" (Resurrect) and "Cure Senses"
-   * (an unrelated Heal-line spell) at once, with no indication they're different progressions at
-   * all. Splits spells into progressions using the exact same key the real server itself groups
+  /** One `SpellLine` (e.g. Healer's shared baseline "Pacification") commonly holds several
+   * genuinely distinct progressions mixed together - real, confirmed live: Pacification alone
+   * has a Mesmerize progression, a Stun progression ("Halt Aggression"/"Halt Hostility"/etc, all
+   * Spell.Type="Stun") and an Amnesia progression ("Wake Senseless"/"Wake Forgetful"/etc, all
+   * Spell.Type="Amnesia"). Flattening them into a single pip row (what this used to do) mixed
+   * unrelated spells that only happen to share a level into one pip - hovering a shared level
+   * showed two unrelated spells from different progressions at once, with nothing distinguishing
+   * them. Splits spells into progressions using the exact same key the real server itself groups
    * by for trainer-window display (LiveSpellHybridSpecialization.GetLinesSpellsForLiving,
    * gameutils/Specializations/LiveSpellHybridSpecialization.cs): Spell.Group (the DB's own
    * SpellGroup column) when it's set, falling back to a (Type, Target, IsAoE, IsInstantCast,
    * HasSubSpell) shape tuple when it's 0 - IsAoE/IsInstantCast/HasSubSpell are themselves just
-   * Radius>0/CastTime<=0/SubSpellID>0 (Spell.cs's own exact definitions). Each progression is
-   * labeled with its own lowest-level spell's name (e.g. "Minor Mending" for Mending's own
-   * SpellGroup 130) - derived from the real data actually on the line, not a hardcoded guess at
-   * what Eden or any other planner happens to call it.
+   * Radius>0/CastTime<=0/SubSpellID>0 (Spell.cs's own exact definitions).
+   *
+   * Each progression is labeled with its own spells' shared Spell.Type, humanized (see
+   * humanizeType below - e.g. "Stun"/"Amnesia" above, "Health Regen Buff" for Skald's own
+   * "HealthRegenBuff") - confirmed live to be exactly what the Eden-DAoC planner this was
+   * modeled on shows on the left for each line too, rather than any individual spell's own
+   * display Name (which was this function's first attempt - "Halt Aggression" instead of "Stun"
+   * - before this was reported as not matching the convention the owner wanted to mirror).
    */
+  /** Spell.Type is a bare C# enum member name (eSpellType, e.g. "HealthRegenBuff"), never meant
+   * to be shown to a player as-is - splits it into words exactly where a human reading camelCase
+   * naturally would ("HealthRegenBuff" -> "Health Regen Buff"): before an uppercase letter that
+   * follows a lowercase letter or digit, and before the last uppercase letter of a run of them
+   * that's followed by a lowercase one (so an acronym-like "AoEDamage" still splits as "AoE
+   * Damage", not "Ao E Damage"). */
+  function humanizeType(type) {
+    return String(type)
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+  }
+
   function groupSpellUnlocksIntoProgressions(spellUnlocks) {
     const progressionKey = (u) => {
       const d = u.data;
@@ -612,7 +629,7 @@
     const progressions = [];
     for (const unlocks of byKey.values()) {
       unlocks.sort((a, b) => a.level - b.level);
-      progressions.push({ label: unlocks[0].name, unlocks });
+      progressions.push({ label: humanizeType(unlocks[0].data.Type || unlocks[0].name), unlocks });
     }
     progressions.sort((a, b) => a.unlocks[0].level - b.unlocks[0].level);
     return progressions;
