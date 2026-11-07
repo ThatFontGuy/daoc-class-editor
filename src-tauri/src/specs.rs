@@ -54,6 +54,7 @@ use crate::spell_ownership::{
     SpellCloner, clone_style_with_fresh_id, columns_excluding_pk, delete_owned_spells,
     delete_style_procs_for_styles, ensure_tracking_table, sql_literal, style_x_spell_guid_column,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -1269,6 +1270,148 @@ pub fn list_spell_lines_for_spec(
         }
     }
     Ok(groups)
+}
+
+/// Matches the real server's own "(Live)"/"(1.130)" spell-line suffix convention exactly
+/// (`gameutils/SpellLineMerge.cs`'s own `Suffix` regex: `@" \((Live|1\.130)( II| III)?\)$"`).
+static VERSIONED_LINE_SUFFIX: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r" \((Live|1\.130)( II| III)?\)$").unwrap());
+
+/// The stock line name a line belongs to - `"Cursing (Live)"` -> `"Cursing"` - or `None` if
+/// `line_key` isn't a versioned extra line at all. Mirrors `SpellLineMerge.BaseKey`/`IsExtraLine`.
+fn versioned_line_base_key(line_key: &str) -> Option<String> {
+    if VERSIONED_LINE_SUFFIX.is_match(line_key) {
+        Some(VERSIONED_LINE_SUFFIX.replace(line_key, "").into_owned())
+    } else {
+        None
+    }
+}
+
+/// A real, confirmed-live bug found via the Character Planner: the 1.130 class migrations put
+/// spells whose level clashed with an existing stock spell into extra `SpellLine` rows named
+/// `"<line> (Live)"`/`"<line> (1.130)"` beside the stock line (e.g. Spiritmaster's own
+/// "Summoning"/"Summoning (1.130)"/"Summoning (Live)") - on the real client these always merge
+/// back into one spellbook line, with every spell assigned its own display level (not necessarily
+/// its raw DB `LineXSpell.Level`, which exists purely to avoid a level collision in the data).
+/// Exporting each versioned line's spells at their own raw DB level (what this used to do) showed
+/// a spell at a level nothing is actually trained at in-game - confirmed live: the planner showed
+/// "Gates of Valhalla" (from "Summoning (Live)", raw DB level 50) at level 50, while the real
+/// client shows a different spell ("Otherworldly Destruction", the stock line's own real level-50
+/// spell) there instead, since level 50 was already taken by it.
+///
+/// Mirrors `SpellLineMerge.ClientSpellLines`/`AssignClientSlots` exactly: within one base-name
+/// group, the stock line's own spells are assigned first (each keeping its own raw level, since
+/// nothing is taken yet), then every extra line's spells, ordered by raw level - each keeps its
+/// own raw level if free, else steps down toward 1 looking for a free one, else (if even 1 is
+/// taken) steps up from level+1 instead. Groups with no extra line at all pass through unchanged.
+pub fn merge_versioned_spell_lines(groups: Vec<SpellLineGroup>) -> Vec<SpellLineGroup> {
+    let mut by_base: std::collections::HashMap<String, Vec<SpellLineGroup>> = std::collections::HashMap::new();
+    let mut passthrough = Vec::new();
+    let mut base_keys_with_extras: Vec<String> = Vec::new();
+    for g in groups {
+        if let Some(base_key) = versioned_line_base_key(&g.line_key) {
+            if !by_base.contains_key(&base_key) {
+                base_keys_with_extras.push(base_key.clone());
+            }
+            by_base.entry(base_key).or_default().push(g);
+        } else {
+            passthrough.push(g);
+        }
+    }
+    if base_keys_with_extras.is_empty() {
+        return passthrough;
+    }
+
+    // A stock line sharing one of these base keys belongs in its own merge group too, not left
+    // in `passthrough` - move it over before merging.
+    let mut i = 0;
+    while i < passthrough.len() {
+        if by_base.contains_key(&passthrough[i].line_key) {
+            let stock = passthrough.remove(i);
+            by_base.get_mut(&stock.line_key).unwrap().insert(0, stock);
+        } else {
+            i += 1;
+        }
+    }
+
+    let spec_key_fallback = passthrough
+        .first()
+        .map(|g| g.spec_key.clone())
+        .unwrap_or_default();
+
+    let mut merged = Vec::new();
+    for base_key in base_keys_with_extras {
+        let members = by_base.remove(&base_key).unwrap();
+        // Prefer the literal stock-named member as the merged line's own identity; if none
+        // exists in this set (every member is itself a suffixed extra line), fall back to the
+        // first member, renamed - mirrors ClientSpellLines's own `head` fallback exactly.
+        let stock_index = members.iter().position(|g| g.line_key == base_key);
+        let (line_key, line_name, is_base_line, spec_key) = match stock_index {
+            Some(i) => (
+                members[i].line_key.clone(),
+                members[i].line_name.clone(),
+                members[i].is_base_line,
+                members[i].spec_key.clone(),
+            ),
+            None => (base_key.clone(), base_key.clone(), members[0].is_base_line, members[0].spec_key.clone()),
+        };
+        let spec_key = if spec_key.is_empty() { spec_key_fallback.clone() } else { spec_key };
+
+        let mut entries: Vec<(&str, &OwnedSpellInLine)> = members
+            .iter()
+            .flat_map(|g| g.spells.iter().map(move |sp| (g.line_key.as_str(), sp)))
+            .collect();
+        entries.sort_by(|a, b| {
+            let a_stock = if a.0 == base_key { 0 } else { 1 };
+            let b_stock = if b.0 == base_key { 0 } else { 1 };
+            a_stock
+                .cmp(&b_stock)
+                .then(a.1.level.cmp(&b.1.level))
+                .then(a.0.cmp(b.0))
+                .then(a.1.spell_id.cmp(&b.1.spell_id))
+        });
+
+        let mut taken: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut assigned: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for (_, sp) in &entries {
+            if assigned.contains_key(&sp.spell_id) {
+                continue;
+            }
+            let mut slot = sp.level;
+            while slot > 1 && taken.contains(&slot) {
+                slot -= 1;
+            }
+            if taken.contains(&slot) {
+                slot = sp.level + 1;
+                while taken.contains(&slot) {
+                    slot += 1;
+                }
+            }
+            taken.insert(slot);
+            assigned.insert(sp.spell_id, slot);
+        }
+
+        let mut spells: Vec<OwnedSpellInLine> = members
+            .into_iter()
+            .flat_map(|g| g.spells.into_iter())
+            .map(|mut sp| {
+                sp.level = assigned.get(&sp.spell_id).copied().unwrap_or(sp.level);
+                sp
+            })
+            .collect();
+        spells.sort_by_key(|sp| sp.level);
+
+        merged.push(SpellLineGroup {
+            spec_key,
+            line_key,
+            line_name,
+            is_base_line,
+            spells,
+        });
+    }
+
+    passthrough.extend(merged);
+    passthrough
 }
 
 /// Promotes a spec `class_id` currently has assigned under a plain/shared key (e.g. a stock
@@ -2935,6 +3078,102 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn test_spell(spell_id: i64, level: i64) -> OwnedSpellInLine {
+        OwnedSpellInLine {
+            line_xspell_id: format!("lxs-{spell_id}"),
+            level,
+            spell_id,
+            is_owned: false,
+            fields: Value::Object(Default::default()),
+        }
+    }
+
+    fn test_group(line_key: &str, is_base_line: bool, spells: Vec<OwnedSpellInLine>) -> SpellLineGroup {
+        SpellLineGroup {
+            spec_key: "Summoning".to_string(),
+            line_key: line_key.to_string(),
+            line_name: line_key.to_string(),
+            is_base_line,
+            spells,
+        }
+    }
+
+    #[test]
+    fn merge_versioned_spell_lines_passes_through_a_group_with_no_extra_variant_unchanged() {
+        let groups = vec![test_group("Darkness", true, vec![test_spell(1, 5), test_spell(2, 10)])];
+        let merged = merge_versioned_spell_lines(groups.clone());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].line_key, "Darkness");
+        assert_eq!(merged[0].spells.len(), 2);
+    }
+
+    #[test]
+    fn merge_versioned_spell_lines_bumps_a_colliding_extra_spell_down_to_the_nearest_free_level() {
+        // The exact real, confirmed-live case: Spiritmaster's own "Summoning" (stock, real level
+        // 50 spell "Otherworldly Destruction") and "Summoning (Live)" (extra line, raw DB level
+        // 50 spell "Gates of Valhalla" - only placed in a separate row to avoid colliding with
+        // the stock spell's own LineXSpell.Level=50 in the data). On the real client these merge
+        // into one line: the stock spell keeps level 50, the extra spell gets bumped to the
+        // nearest free level below it (49, since nothing else is taken).
+        let groups = vec![
+            test_group("Summoning", true, vec![test_spell(100, 50)]),
+            test_group("Summoning (Live)", true, vec![test_spell(200, 50)]),
+        ];
+        let merged = merge_versioned_spell_lines(groups);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].line_key, "Summoning", "the stock line's own identity wins");
+        let levels: std::collections::HashMap<i64, i64> =
+            merged[0].spells.iter().map(|s| (s.spell_id, s.level)).collect();
+        assert_eq!(levels[&100], 50, "the stock spell keeps its own real level");
+        assert_eq!(
+            levels[&200], 49,
+            "the colliding extra-line spell steps down to the nearest free level below it"
+        );
+    }
+
+    #[test]
+    fn merge_versioned_spell_lines_steps_up_when_stepping_down_is_fully_blocked() {
+        // Every level from 1 up to the spell's own raw level is already taken, so it must step
+        // up past its own level instead (AssignClientSlots's own second branch).
+        let stock_spells: Vec<OwnedSpellInLine> = (1..=3).map(|lvl| test_spell(lvl, lvl)).collect();
+        let groups = vec![
+            test_group("Darkness", true, stock_spells),
+            test_group("Darkness (Live)", true, vec![test_spell(99, 3)]),
+        ];
+        let merged = merge_versioned_spell_lines(groups);
+        let levels: std::collections::HashMap<i64, i64> =
+            merged[0].spells.iter().map(|s| (s.spell_id, s.level)).collect();
+        assert_eq!(levels[&99], 4, "levels 1-3 are all taken, so it steps up past them instead");
+    }
+
+    #[test]
+    fn merge_versioned_spell_lines_falls_back_to_the_first_member_when_no_stock_line_exists() {
+        // A group can legitimately have only versioned members with no literal stock-named row
+        // at all - ClientSpellLines's own fallback clones the first member and renames it to the
+        // base key, rather than refusing to merge at all.
+        let groups = vec![
+            test_group("Darkness (1.130)", true, vec![test_spell(1, 10)]),
+            test_group("Darkness (Live)", true, vec![test_spell(2, 20)]),
+        ];
+        let merged = merge_versioned_spell_lines(groups);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].line_key, "Darkness");
+        assert_eq!(merged[0].line_name, "Darkness");
+        assert_eq!(merged[0].spells.len(), 2);
+    }
+
+    #[test]
+    fn merge_versioned_spell_lines_leaves_an_unrelated_group_alone() {
+        let groups = vec![
+            test_group("Summoning", true, vec![test_spell(1, 50)]),
+            test_group("Summoning (Live)", true, vec![test_spell(2, 50)]),
+            test_group("Suppression", false, vec![test_spell(3, 20)]),
+        ];
+        let merged = merge_versioned_spell_lines(groups);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged.iter().any(|g| g.line_key == "Suppression" && g.spells.len() == 1));
     }
 
     #[test]
