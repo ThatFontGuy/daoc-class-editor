@@ -386,13 +386,23 @@
         ])
       );
     }
+    panel.appendChild(
+      el("p", { class: "hint" }, ["Click a level number to train straight to it. Hover one to see what it grants."])
+    );
 
     const cap = specCap();
-    const grid = el("div", { class: "spec-grid" });
+    const rows = el("div", { class: "spec-rows" });
     for (const spec of cls.specs.slice().sort((a, b) => a.name.localeCompare(b.name))) {
-      grid.appendChild(renderSpecCard(cls, spec, cap));
+      rows.appendChild(renderSpecRow(cls, spec, cap));
     }
-    panel.appendChild(grid);
+    panel.appendChild(
+      el("div", { class: "spec-layout" }, [
+        rows,
+        el("aside", { class: "spec-details", id: "spec-details" }, [
+          el("p", { class: "hint", text: "Hover a level number to see what it unlocks." }),
+        ]),
+      ])
+    );
     return panel;
   }
 
@@ -410,7 +420,65 @@
     });
   }
 
-  function renderSpecCard(cls, spec, cap) {
+  // Ordered, human-labeled field lists for the hover details panel - the same curated columns
+  // already exported (see export_charplanner.rs's own SPELL_FIELDS/STYLE_FIELDS), just with
+  // friendlier labels. A field whose value is empty/zero/missing is skipped entirely rather than
+  // shown as a confusing "0" or blank line - most spells/styles only use a handful of these.
+  const SPELL_DETAIL_FIELDS = [
+    ["Type", "Type"],
+    ["Description", "Description"],
+    ["Message1", "Message 1"],
+    ["Message2", "Message 2"],
+    ["Damage", "Damage"],
+    ["DamageType", "Damage Type"],
+    ["Value", "Value"],
+    ["Range", "Range"],
+    ["Radius", "Radius"],
+    ["Duration", "Duration"],
+    ["Frequency", "Frequency"],
+    ["Power", "Power Cost"],
+    ["CastTime", "Cast Time"],
+    ["RecastDelay", "Recast Delay"],
+    ["Target", "Target"],
+  ];
+  const STYLE_DETAIL_FIELDS = [
+    ["EnduranceCost", "Endurance Cost"],
+    ["BonusToHit", "Bonus To Hit"],
+    ["BonusToDefense", "Bonus To Defense"],
+    ["GrowthOffset", "Growth Offset"],
+    ["GrowthRate", "Growth Rate"],
+    ["WeaponTypeRequirement", "Weapon Type Requirement"],
+    ["AttackResultRequirement", "Attack Result Requirement"],
+    ["OpeningRequirementType", "Opening Requirement Type"],
+    ["OpeningRequirementValue", "Opening Requirement Value"],
+    ["StealthRequirement", "Stealth Requirement"],
+    ["ArmorHitLocation", "Armor Hit Location"],
+  ];
+
+  /** Fills the sticky details panel with everything known about one level's unlock(s) - called
+   * on hover, not through the normal render() cycle (a full re-render on every mouse movement
+   * would be wasteful and would also fight with the hover itself). More than one unlock can
+   * share the same level (rare, but real - e.g. two spells in the same progression); each gets
+   * its own heading. */
+  function showSpecDetails(group) {
+    const panel = $("#spec-details");
+    if (!panel) return;
+    panel.innerHTML = "";
+    for (const u of group) {
+      panel.appendChild(el("h3", { text: `${u.name} (Lv ${u.level})` }));
+      const dl = el("dl");
+      const fields = u.kind === "spell" ? SPELL_DETAIL_FIELDS : STYLE_DETAIL_FIELDS;
+      for (const [key, label] of fields) {
+        const value = u.data[key];
+        if (value === undefined || value === null || value === "" || value === 0) continue;
+        dl.appendChild(el("dt", { text: label }));
+        dl.appendChild(el("dd", { text: String(value) }));
+      }
+      panel.appendChild(dl);
+    }
+  }
+
+  function renderSpecRow(cls, spec, cap) {
     const current = Math.min(cap, state.specLevels[spec.key_name] || 0);
     state.specLevels[spec.key_name] = current;
     const autotrains = isAutotrainable(cls, spec);
@@ -418,59 +486,57 @@
       state.specLevels[spec.key_name] = v;
       render();
     };
-    const card = el("div", { class: "spec-card" });
-    card.appendChild(
-      el("div", { class: "spec-card-header" }, [
-        el("h3", {}, [spec.name, autotrains ? el("span", { class: "badge", text: "autotrains" }) : null]),
+
+    const row = el("div", { class: "spec-row" });
+    const cost = effectiveSpecCost(current, autotrains, state.level);
+    const fullCost = specTrainingCost(current);
+    const savedText = autotrains && fullCost !== cost ? ` (${fullCost - cost} free via autotrain)` : "";
+    row.appendChild(
+      el("div", { class: "spec-row-top" }, [
+        el("span", { class: "spec-row-name" }, [spec.name, autotrains ? el("span", { class: "badge", text: "autotrains" }) : null]),
         el("div", { class: "stepper" }, [
           stepButton("-", current, cap, setLevel),
           el("span", { class: "value", text: String(current) }),
           stepButton("+", current, cap, setLevel),
         ]),
+        el("span", { class: "spec-row-cost", text: `${cost} pt${cost === 1 ? "" : "s"}${savedText}` }),
       ])
-    );
-    const cost = effectiveSpecCost(current, autotrains, state.level);
-    const fullCost = specTrainingCost(current);
-    const savedText = autotrains && fullCost !== cost ? ` (${fullCost - cost} free via autotrain)` : "";
-    card.appendChild(
-      el("div", {
-        class: "spec-cost",
-        text: `Cost so far: ${cost} point${cost === 1 ? "" : "s"}${savedText}`,
-      })
     );
 
     const unlocks = [];
     for (const style of spec.styles) {
-      unlocks.push({ level: style.level, name: style.Name, kind: "style" });
+      unlocks.push({ level: style.level, name: style.Name, kind: "style", data: style });
     }
     for (const line of spec.spell_lines) {
       for (const spell of line.spells) {
-        unlocks.push({ level: spell.level, name: spell.Name, kind: "spell", line: line.line_name });
+        unlocks.push({ level: spell.level, name: spell.Name, kind: "spell", data: spell });
       }
     }
     unlocks.sort((a, b) => a.level - b.level);
 
-    const list = el("div", { class: "unlock-list" });
+    // Group unlocks sharing the same level into one pip - a real spec line can legitimately have
+    // more than one unlock at the exact same level (e.g. two spells in a progression).
+    const byLevel = new Map();
     for (const u of unlocks) {
-      // Clicking a spell/style's own name trains the spec straight to the level it needs - not
-      // just +1 - per the owner's own explicit request: clicking "Executioner" (level 10) trains
-      // to 10 outright, and clicking a lower one afterwards (e.g. "Deflect", level 5) retrains
-      // back down to exactly 5, recalculating cost either way - the single most direct way to
-      // say "I want this" without manually counting levels on the stepper.
-      list.appendChild(
-        el(
-          "div",
-          {
-            class: `unlock-row${u.level > current ? " locked" : ""}`,
-            style: "cursor:pointer",
-            onclick: () => setLevel(Math.min(cap, u.level)),
-          },
-          [el("span", { class: "unlock-level", text: `Lv ${u.level}` }), el("span", { text: u.name })]
-        )
+      if (!byLevel.has(u.level)) byLevel.set(u.level, []);
+      byLevel.get(u.level).push(u);
+    }
+
+    const pips = el("div", { class: "level-pips" });
+    for (const [level, group] of [...byLevel.entries()].sort((a, b) => a[0] - b[0])) {
+      pips.appendChild(
+        el("button", {
+          class: `level-pip${level <= current ? " unlocked" : ""}`,
+          text: String(level),
+          title: group.map((u) => u.name).join(" / "),
+          onmouseenter: () => showSpecDetails(group),
+          onfocus: () => showSpecDetails(group),
+          onclick: () => setLevel(Math.min(cap, level)),
+        })
       );
     }
-    card.appendChild(list);
-    return card;
+    row.appendChild(pips);
+    return row;
   }
 
   function renderRealmAbilityPanel(cls) {
