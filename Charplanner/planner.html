@@ -19,6 +19,11 @@
   <div id="app">Loading class data...</div>
 </main>
 <footer class="site-footer" id="generated-footer"></footer>
-<script src="planner.js?v=1794013534" defer></script>
+<!-- A plain global-assigning script, not fetch()'d JSON - works whether this page is opened by
+     just double-clicking it (file://, no local server - fetch() of another local file is
+     refused there by every major browser) or uploaded to a real webserver. See
+     export_charplanner.rs's own charplanner_data_path doc comment for the full why. -->
+<script src="data/classes.js"></script>
+<script src="planner.js?v=1794015845" defer></script>
 </body>
 </html>

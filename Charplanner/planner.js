@@ -691,22 +691,23 @@
     footer.textContent = `Class data generated ${d.toLocaleString()}. Dark Age of Camelot is a trademark of its respective owners.`;
   }
 
-  fetch("data/classes.json")
-    .then((r) => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.json();
-    })
-    .then((data) => {
-      DATA = data;
-      loadFromUrl();
-      if (state.classId == null) {
-        const first = classesForRealm(state.realm)[0];
-        state.classId = first ? first.id : null;
-      }
-      render();
-      renderGeneratedFooter();
-    })
-    .catch((err) => {
-      $("#app").innerHTML = `<div class="panel"><p class="hint">Could not load class data (${err.message}). Make sure data/classes.json was generated and uploaded alongside this page.</p></div>`;
-    });
+  // window.CHARPLANNER_DATA comes from data/classes.js, a plain <script> tag loaded in
+  // planner.html *before* this file - not fetch()'d JSON, so this works identically whether this
+  // page is opened by just double-clicking it or uploaded to a real webserver (see
+  // export_charplanner.rs's own charplanner_data_path doc comment for the full why).
+  if (window.CHARPLANNER_DATA) {
+    DATA = window.CHARPLANNER_DATA;
+    loadFromUrl();
+    if (state.classId == null) {
+      const first = classesForRealm(state.realm)[0];
+      state.classId = first ? first.id : null;
+    }
+    render();
+    renderGeneratedFooter();
+  } else {
+    $("#app").innerHTML =
+      '<div class="panel"><p class="hint">Could not load class data - data/classes.js is missing ' +
+      "or failed to load. Make sure you ran the export tool and uploaded the whole Charplanner " +
+      "folder, including data/classes.js, alongside this page.</p></div>";
+  }
 })();

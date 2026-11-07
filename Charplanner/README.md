@@ -13,11 +13,14 @@ from the server's own source - not guessed or approximated.
 - `planner.html` / `planner.js` - the actual Character Planner.
 - `get-started.html` - install instructions (copy of the Othlyn download page's own content).
 - `assets/charplanner.css` - shared styling across all three pages.
-- `data/classes.json` - **generated, not committed to git** - the actual class data export. You
-  must regenerate this yourself before the site will show anything real (see below).
+- `data/classes.js` - **generated, not committed to git** - the actual class data export (a plain
+  `<script>`-loaded JS file assigning `window.CHARPLANNER_DATA`, deliberately not JSON fetched via
+  `fetch()` - see the next section for why). You must regenerate this yourself before the site
+  will show anything real (see below).
 
 Nothing in this folder needs a build step. It's plain HTML/CSS/JS, meant to be copy-pasted
-straight onto a webserver as-is.
+straight onto a webserver as-is - or just double-clicked locally to preview, no local server
+needed either.
 
 ## Regenerating the data
 
@@ -32,18 +35,25 @@ app (Server connection panel) - nothing else to configure. It's entirely read-on
 writes anything to the live server, so there's no write-safety gate to satisfy first, and no need
 to stop the server beforehand.
 
-It writes `data/classes.json` and automatically re-stamps `planner.html`'s own script tag with a
-fresh cache-busting version number, so returning players' browsers won't keep showing a stale
-cached copy of `planner.js` after you re-upload.
+It writes `data/classes.js` (as `window.CHARPLANNER_DATA = {...};`, not raw JSON - a real,
+reported problem found live: opening `planner.html` by just double-clicking it loads it over the
+`file://` protocol, and every major browser refuses `fetch()`/XHR of another local file from there
+entirely, so `fetch("data/classes.json")` could never have worked for that case at all. A plain
+`<script src="data/classes.js">` tag has no such restriction) and automatically re-stamps
+`planner.html`'s own script tag with a fresh cache-busting version number, so returning players'
+browsers won't keep showing a stale cached copy of `planner.js` after you re-upload.
+
+Occasionally one class is skipped with an SSH hiccup (seen live under rapid repeated runs) - check
+the tool's own final line ("Wrote 52 classes..." vs "...(1 skipped: X)") and just re-run if so.
 
 Re-run this any time you change a class's specs/spells/styles in the Class Editor app and want the
 planner to reflect it.
 
 ## Deploying
 
-Upload this whole folder (including the freshly regenerated `data/classes.json`) to your
-webserver, preserving the folder structure. That's it - no server-side code, no database
-connection from the public-facing site at all.
+Upload this whole folder (including the freshly regenerated `data/classes.js`) to your webserver,
+preserving the folder structure. That's it - no server-side code, no database connection from the
+public-facing site at all.
 
 `get-started.html`'s own download button expects the actual launcher zip to live right alongside
 it in this same folder - place it there and update the button's `href` (and the "Includes no Dark
