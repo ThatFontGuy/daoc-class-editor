@@ -208,9 +208,7 @@ fn export_one_class(
         // ("Shields" has both styles and an incidental spell line) for why has_styles implies
         // this spec is never also shown as a spell line set.
         if s.has_spell_lines && !s.has_styles {
-            let lines = specs::merge_versioned_spell_lines(specs::list_spell_lines_for_spec(
-                cfg, class_id, &s.key_name,
-            )?);
+            let lines = specs::list_spell_lines_for_spec(cfg, class_id, &s.key_name)?;
             for line in &lines {
                 let spells_json: Vec<Value> = line
                     .spells
