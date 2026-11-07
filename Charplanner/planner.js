@@ -577,6 +577,59 @@
     return pips;
   }
 
+  /** One `SpellLine` (e.g. Healer's shared baseline "Mending") commonly holds several genuinely
+   * distinct progressions mixed together - real, confirmed live: Mending alone has "Minor Heal",
+   * "Heal", "Heal (group)" and "Resurrect" all on one line. Flattening them into a single pip row
+   * (what this used to do) mixed unrelated spells that only happen to share a level into one pip
+   * - hovering level 40 showed both "Remigration from Valhalla" (Resurrect) and "Cure Senses"
+   * (an unrelated Heal-line spell) at once, with no indication they're different progressions at
+   * all. Splits spells into progressions using the exact same key the real server itself groups
+   * by for trainer-window display (LiveSpellHybridSpecialization.GetLinesSpellsForLiving,
+   * gameutils/Specializations/LiveSpellHybridSpecialization.cs): Spell.Group (the DB's own
+   * SpellGroup column) when it's set, falling back to a (Type, Target, IsAoE, IsInstantCast,
+   * HasSubSpell) shape tuple when it's 0 - IsAoE/IsInstantCast/HasSubSpell are themselves just
+   * Radius>0/CastTime<=0/SubSpellID>0 (Spell.cs's own exact definitions). Each progression is
+   * labeled with its own lowest-level spell's name (e.g. "Minor Mending" for Mending's own
+   * SpellGroup 130) - derived from the real data actually on the line, not a hardcoded guess at
+   * what Eden or any other planner happens to call it.
+   */
+  function groupSpellUnlocksIntoProgressions(spellUnlocks) {
+    const progressionKey = (u) => {
+      const d = u.data;
+      const spellGroup = Number(d.SpellGroup) || 0;
+      if (spellGroup > 0) return `g:${spellGroup}`;
+      const isAoE = Number(d.Radius) > 0;
+      const isInstant = Number(d.CastTime) <= 0;
+      const hasSubSpell = Number(d.SubSpellID) > 0;
+      return `t:${d.Type}|${d.Target}|${isAoE}|${isInstant}|${hasSubSpell}`;
+    };
+    const byKey = new Map();
+    for (const u of spellUnlocks) {
+      const key = progressionKey(u);
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(u);
+    }
+    const progressions = [];
+    for (const unlocks of byKey.values()) {
+      unlocks.sort((a, b) => a.level - b.level);
+      progressions.push({ label: unlocks[0].name, unlocks });
+    }
+    progressions.sort((a, b) => a.unlocks[0].level - b.unlocks[0].level);
+    return progressions;
+  }
+
+  /** One progression's own row within a spec - its lowest-level spell's name on the left (the
+   * same "name the whole line after its first rank" convention a real style chain already uses),
+   * its own pips to the right. `isUnlocked`/`onPipClick` are passed straight through to
+   * renderPips, so this looks identical whether it's a trainable progression (gated by spec
+   * investment) or a base-line one (gated by character level, no click handler). */
+  function renderSubline(prog, isUnlocked, specStyles, onPipClick) {
+    return el("div", { class: "spec-subline" }, [
+      el("span", { class: "spec-subline-name", text: prog.label }),
+      renderPips(prog.unlocks, isUnlocked, specStyles, onPipClick),
+    ]);
+  }
+
   /** The "Direct Damage"/"Stun" half of Cleric's own Smite, real and confirmed live: spells
    * granted to every class with this spec regardless of points spent (IsBaseLine=1 server-side -
    * see specs.rs's own `resolve_spec_lines_for_class` doc comment), scaling purely with
@@ -584,7 +637,8 @@
    * Smite's actual spec-gated lines (Damage Add, Mesmerise, etc.), with no way to tell a player
    * "you already have this" from "you need to spend points to get this". Rendered as its own
    * small block, gated by `state.level` alone - there's nothing to train here, so no stepper and
-   * clicking a pip does nothing. */
+   * clicking a pip does nothing. Each real progression on it (see
+   * groupSpellUnlocksIntoProgressions) gets its own row underneath, not one merged pip list. */
   function renderBaseLineBlock(spec, baseLines) {
     const unlocks = [];
     for (const line of baseLines) {
@@ -593,7 +647,7 @@
       }
     }
     if (!unlocks.length) return null;
-    unlocks.sort((a, b) => a.level - b.level);
+    const progressions = groupSpellUnlocksIntoProgressions(unlocks);
 
     const block = el("div", { class: "spec-row spec-row-baseline" });
     block.appendChild(
@@ -604,7 +658,9 @@
         ]),
       ])
     );
-    block.appendChild(renderPips(unlocks, (level) => level <= state.level, spec.styles, null));
+    for (const prog of progressions) {
+      block.appendChild(renderSubline(prog, (level) => level <= state.level, spec.styles, null));
+    }
     return block;
   }
 
@@ -639,20 +695,32 @@
       ])
     );
 
-    const unlocks = [];
-    for (const style of spec.styles) {
-      unlocks.push({ level: style.level, name: style.Name, kind: "style", data: style });
-    }
-    for (const line of gatedLines) {
-      for (const spell of line.spells) {
-        unlocks.push({ level: spell.level, name: spell.Name, kind: "spell", data: spell });
+    // Styles never co-exist with spell lines on one spec (export_charplanner.rs's own
+    // has_styles-takes-priority convention), so a combat spec's own styles stay one combined pip
+    // row exactly as before - the multi-progression split below only ever applies to spells.
+    if (spec.styles.length) {
+      const styleUnlocks = spec.styles.map((style) => ({
+        level: style.level,
+        name: style.Name,
+        kind: "style",
+        data: style,
+      }));
+      row.appendChild(
+        renderPips(styleUnlocks, (level) => level <= current, spec.styles, (level) => setLevel(Math.min(cap, level)))
+      );
+    } else {
+      const spellUnlocks = [];
+      for (const line of gatedLines) {
+        for (const spell of line.spells) {
+          spellUnlocks.push({ level: spell.level, name: spell.Name, kind: "spell", data: spell });
+        }
+      }
+      for (const prog of groupSpellUnlocksIntoProgressions(spellUnlocks)) {
+        row.appendChild(
+          renderSubline(prog, (level) => level <= current, spec.styles, (level) => setLevel(Math.min(cap, level)))
+        );
       }
     }
-    unlocks.sort((a, b) => a.level - b.level);
-
-    row.appendChild(
-      renderPips(unlocks, (level) => level <= current, spec.styles, (level) => setLevel(Math.min(cap, level)))
-    );
 
     const baseBlock = renderBaseLineBlock(spec, baseLines);
     if (!baseBlock) return row;

@@ -283,6 +283,23 @@ button.primary {
   margin-left: auto;
 }
 
+/* One real progression within a spec (e.g. Mending's own "Minor Heal"/"Heal"/"Heal (group)"/
+   "Resurrect") - the classic DAoC charplanner layout again, one level down: the progression's
+   own name on the left, its pips flowing to the right, same as a spec's own top-level row. */
+.spec-subline {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-top: 0.4rem;
+}
+
+.spec-subline-name {
+  font-size: 0.85rem;
+  color: var(--muted);
+  min-width: 140px;
+}
+
 .stepper {
   display: flex;
   align-items: center;

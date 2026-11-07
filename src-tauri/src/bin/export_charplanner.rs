@@ -44,6 +44,17 @@ const SPELL_FIELDS: &[&str] = &[
     "CastTime",
     "RecastDelay",
     "Target",
+    // Not shown directly in the hover details panel - these are purely for planner.js's own
+    // progression grouping (see its groupSpellUnlocksIntoProgressions), which needs to tell
+    // "Minor Heal"/"Heal"/"Heal (group)"/"Resurrect" apart even though a single SpellLine (e.g.
+    // Healer's shared baseline "Mending") holds all of them mixed together - confirmed live via
+    // the server's own grouping key (LiveSpellHybridSpecialization.GetLinesSpellsForLiving):
+    // Spell.Group (the DB's SpellGroup column) when nonzero, else a (Type, Target, IsAoE,
+    // IsInstantCast, HasSubSpell) tuple - IsAoE/IsInstantCast/HasSubSpell are themselves just
+    // Radius>0/CastTime<=0/SubSpellID>0 (Spell.cs's own exact definitions), already derivable
+    // from fields already exported above except SubSpellID.
+    "SpellGroup",
+    "SubSpellID",
 ];
 
 const STYLE_FIELDS: &[&str] = &[
