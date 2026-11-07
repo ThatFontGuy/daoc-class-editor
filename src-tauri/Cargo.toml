@@ -4,6 +4,11 @@ version = "0.1.0"
 description = "Clone existing Dark Age of Camelot classes into new custom classes and deploy them to a running Offline DAoC server."
 authors = ["ThatFontGuy"]
 edition = "2024"
+# Required once a second binary target existed (src/bin/export_charplanner.rs) - a real build
+# break found live: `tauri build` failed outright ("failed to find main binary") without this,
+# since it can no longer infer which binary is "the app" on its own with two to choose from.
+# Points at this package's own main entry point (src/main.rs), never export_charplanner.
+default-run = "daoc-class-editor"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

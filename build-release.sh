@@ -11,4 +11,6 @@ npm run tauri build
 echo ""
 echo "Build complete. Look for the app/installer under:"
 echo "  src-tauri/target/release/bundle/"
-find src-tauri/target/release/bundle -maxdepth 2 \( -name "*.app" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.msi" -o -name "*.exe" \) 2>/dev/null
+find src-tauri/target/release/bundle/macos -maxdepth 1 -name "*.app" 2>/dev/null
+find src-tauri/target/release/bundle/dmg -maxdepth 1 -name "*.dmg" 2>/dev/null
+find src-tauri/target/release/bundle -maxdepth 2 \( -name "*.AppImage" -o -name "*.deb" -o -name "*.msi" -o -name "*.exe" \) 2>/dev/null
