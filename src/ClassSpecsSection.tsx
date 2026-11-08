@@ -222,10 +222,43 @@ function CombatSpecEditor({
     }
   }
 
+  /** Appends one more style to this spec, one level above whatever this class's own highest
+   * style currently is (see `add_style_to_spec` on the Rust side for exactly how it's seeded) -
+   * the "Edit" button alone only ever let an existing style be tuned, with no way at all to grow
+   * a spec past however many styles it started out with. Opens the new style for editing right
+   * away, same as a brand-new spec's own seeded placeholder already does. */
+  async function addStyle() {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus("Adding a new style..."));
+    try {
+      const added = await invoke<StyleInfo>("add_style_to_spec", {
+        cfg: sshConfig,
+        classId,
+        specKey,
+      });
+      setStatus(okStatus("Added - edit it below to make it do what you actually want."));
+      busyRef.current = false; // see the matching comment in save() above
+      await load();
+      startEditing(added);
+    } catch (e) {
+      setStatus(errorStatus(`Could not add a new style: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
   return (
     <div>
       {busy && <p className="hint">⏳ Working - please wait...</p>}
       <StatusMessage status={status} />
+      <p>
+        <button onClick={addStyle} disabled={busy}>
+          + Add style
+        </button>
+      </p>
       {styles && styles.length > 0 && (
         <table className="spec-table">
           <thead>
@@ -512,6 +545,36 @@ function SpellSpecEditor({
     }
   }
 
+  /** Appends one more spell to `group`'s own line, one level above whatever this class's own
+   * highest spell on it currently is (see `add_spell_to_line` on the Rust side for exactly how
+   * it's seeded) - the "Edit" button alone only ever let an existing spell be tuned, with no way
+   * at all to build a multi-rank progression (e.g. "Brisk Movement" -> "Greater Brisk Movement")
+   * past whatever one spell a line started out with. Opens the new spell for editing right away,
+   * same as a brand-new spell line's own seeded placeholder already does. */
+  async function addSpell(group: SpellLineGroup) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus("Adding a new spell..."));
+    try {
+      const added = await invoke<OwnedSpellInLine>("add_spell_to_line", {
+        cfg: sshConfig,
+        classId,
+        specKey: group.spec_key,
+        lineKey: group.line_key,
+      });
+      setStatus(okStatus("Added - edit it below to make it do what you actually want."));
+      busyRef.current = false; // see the matching comment in save() above
+      await load();
+      startEditing(added);
+    } catch (e) {
+      setStatus(errorStatus(`Could not add a new spell: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
   const totalSpells = groups?.reduce((sum, g) => sum + g.spells.length, 0) ?? 0;
 
   /** "Type" gets a dropdown of every real eSpellType value instead of a free-text field - it's
@@ -591,6 +654,11 @@ function SpellSpecEditor({
                     )}
                   </h4>
                 )}
+                <p>
+                  <button onClick={() => addSpell(group)} disabled={busy}>
+                    + Add spell
+                  </button>
+                </p>
                 <table className="spec-table">
                   <thead>
                     <tr>

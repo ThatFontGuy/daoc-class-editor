@@ -562,6 +562,79 @@ pub fn create_new_combat_spec(
     })
 }
 
+/// Adds one more combat style to an existing combat spec `spec_key` already grants - the "Add
+/// style" counterpart to `CombatSpecEditor`'s per-style field/level editors, which (like
+/// `SpellSpecEditor`'s own, see `add_spell_to_line`'s doc comment for the full reported gap) had
+/// no way at all to grow a spec past whatever styles it already had.
+///
+/// Ensures this class actually owns (or, for a `NEVER_CLONE_SPECS` spec, has been granted its own
+/// locked copies of) this spec's styles first, exactly like `ensure_style_owned` does before any
+/// edit - see its own doc comment for why a shared/stock/universal spec can't just be appended to
+/// directly. The new style is cloned (via `clone_style_with_fresh_id`, the same primitive
+/// `create_new_combat_spec` and `clone_spec` both already use) from whichever of this class's own
+/// styles under this spec currently sits at the *highest* `SpecLevelRequirement` - a new style is
+/// overwhelmingly more likely to want broadly similar fields (WeaponTypeRequirement,
+/// AttackResultRequirement, EnduranceCost shape) to the one before it than to some unrelated
+/// style - falling back to whatever style exists under this spec at all (regardless of owner) if
+/// this class doesn't have one of its own yet to copy from.
+///
+/// `level` defaults to one above this class's own current highest `SpecLevelRequirement` under
+/// this spec if not given explicitly.
+pub fn add_style_to_spec(
+    cfg: &SshConfig,
+    class_id: i64,
+    spec_key: &str,
+    level: Option<i64>,
+) -> Result<StyleInfo, String> {
+    let owning_key = if let Some(real_name) = resolve_uncloneable_spec(spec_key, class_id) {
+        grant_styles_for_uncloneable_spec(cfg, real_name, class_id)?;
+        real_name.to_string()
+    } else {
+        ensure_class_owns_spec(cfg, class_id, spec_key)?
+    };
+    let owning_key_q = sql_quote(&owning_key);
+
+    let own_rows = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT StyleID, SpecLevelRequirement FROM Style WHERE SpecKeyName = '{owning_key_q}' \
+             AND ClassId = {class_id} ORDER BY SpecLevelRequirement DESC LIMIT 1;"
+        ),
+    )?;
+    let (template_style_id, new_level) = if let Some(top) = own_rows.first() {
+        (int_field(top, "StyleID"), level.unwrap_or(int_field(top, "SpecLevelRequirement") + 1))
+    } else {
+        let any_rows = run_remote_sql_json(
+            cfg,
+            &format!(
+                "SELECT StyleID FROM Style WHERE SpecKeyName = '{owning_key_q}' \
+                 ORDER BY SpecLevelRequirement DESC LIMIT 1;"
+            ),
+        )?;
+        let id = any_rows.first().map(|r| int_field(r, "StyleID")).ok_or_else(|| {
+            format!("no existing style found under '{owning_key}' to seed a new one from")
+        })?;
+        (id, level.unwrap_or(1))
+    };
+
+    let new_style_id =
+        clone_style_with_fresh_id(cfg, template_style_id, &owning_key_q, &class_id.to_string())?;
+    run_remote_sql(
+        cfg,
+        &format!("UPDATE Style SET Name = 'New Style', SpecLevelRequirement = {new_level} WHERE StyleID = {new_style_id};"),
+    )?;
+
+    let rows = run_remote_sql_json(cfg, &format!("SELECT * FROM Style WHERE StyleID = {new_style_id};"))?;
+    let fields = rows.into_iter().next().ok_or_else(|| {
+        format!("could not re-read newly cloned style {new_style_id} - it may no longer exist")
+    })?;
+    Ok(StyleInfo {
+        style_id: new_style_id,
+        is_owned: true,
+        fields,
+    })
+}
+
 /// Creates a brand-new `Specialization` plus one `SpellLine` under it (not cloned from anything)
 /// for `class_id`, with one placeholder `Spell` already on that line so it's immediately visible
 /// in the "Spells" summary and immediately editable via the existing spell field editor - the
@@ -624,6 +697,90 @@ pub fn create_new_spell_spec(
         is_owned: true,
         has_styles: false,
         has_spell_lines: true,
+    })
+}
+
+/// Adds one more spell to an existing spell line `line_key` under `spec_key` - the "Add spell"
+/// counterpart to `SpellSpecEditor`'s per-spell field/level editors, which, until now, had no way
+/// at all to grow a spell line past whatever spells `create_new_spell_spec` (or an earlier clone)
+/// already seeded it with: a real, reported gap - building out a multi-rank progression (e.g. a
+/// "Brisk Movement" / "Greater Brisk Movement" / ... SpeedEnhancement line) meant editing the
+/// line's one existing spell over and over, with nowhere to actually add a second, third, ...
+/// rank at all.
+///
+/// Ensures the owning spec (and therefore this line) is independently owned by `class_id` first,
+/// exactly like `ensure_line_owned` does before any edit to an existing spell - see its own doc
+/// comment for why a shared/stock line can't just be appended to directly, and for the
+/// `"{new_spec_key}_{old_line_key}"` naming its own clone of this line always ends up with.
+///
+/// The new spell is cloned (via `SpellCloner`, the same primitive every other spell clone in this
+/// tool already uses) from whichever spell on this line currently sits at the *highest* `Level` -
+/// a new rank in a progression is overwhelmingly more likely to want broadly similar fields
+/// (Type, Target, flavor-text shape) to the rank right before it than to some unrelated spell,
+/// leaving exactly the fields that actually matter for a new rank (Value/Damage/Duration/Level)
+/// to tune from there. Its Name is reset to "New Spell" (same placeholder
+/// `create_new_spell_spec` already uses), the one field deliberately *not* carried over from the
+/// template - otherwise two different ranks of the same progression would default to showing an
+/// identical name in the spellbook until manually renamed. Falls back to the same "very first
+/// real `Spell` row" template `create_new_spell_spec` uses if the line is (unexpectedly)
+/// completely empty.
+///
+/// `level` defaults to one above the line's own current highest level if not given explicitly.
+pub fn add_spell_to_line(
+    cfg: &SshConfig,
+    class_id: i64,
+    spec_key: &str,
+    line_key: &str,
+    level: Option<i64>,
+) -> Result<OwnedSpellInLine, String> {
+    let owned_spec_key = ensure_class_owns_spec(cfg, class_id, spec_key)?;
+    let owned_line_key = if owned_spec_key == spec_key {
+        line_key.to_string()
+    } else {
+        format!("{owned_spec_key}_{line_key}")
+    };
+    let owned_line_key_q = sql_quote(&owned_line_key);
+
+    let existing = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT SpellID, Level FROM LineXSpell WHERE LineName = '{owned_line_key_q}' \
+             ORDER BY Level DESC LIMIT 1;"
+        ),
+    )?;
+    let (template_spell_id, new_level) = if let Some(top) = existing.first() {
+        (int_field(top, "SpellID"), level.unwrap_or(int_field(top, "Level") + 1))
+    } else {
+        let template_rows =
+            run_remote_sql_json(cfg, "SELECT SpellID FROM Spell ORDER BY SpellID LIMIT 1;")?;
+        let template_spell_id = template_rows.first().map(|r| int_field(r, "SpellID")).ok_or_else(|| {
+            "could not find any existing spell to seed this new spell from".to_string()
+        })?;
+        (template_spell_id, level.unwrap_or(1))
+    };
+
+    let mut cloner = SpellCloner::new(cfg, class_id)?;
+    let new_spell_id = cloner.clone_for_class(cfg, template_spell_id)?;
+    let new_line_xspell_id = Uuid::new_v4().to_string();
+    run_remote_sql(
+        cfg,
+        &format!(
+            "UPDATE Spell SET Name = 'New Spell' WHERE SpellID = {new_spell_id};\n\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
+             VALUES ('{owned_line_key_q}', {new_spell_id}, {new_level}, '{new_line_xspell_id}');"
+        ),
+    )?;
+
+    let rows = run_remote_sql_json(cfg, &format!("SELECT * FROM Spell WHERE SpellID = {new_spell_id};"))?;
+    let fields = rows.into_iter().next().ok_or_else(|| {
+        format!("could not re-read newly cloned spell {new_spell_id} - it may no longer exist")
+    })?;
+    Ok(OwnedSpellInLine {
+        line_xspell_id: new_line_xspell_id,
+        level: new_level,
+        spell_id: new_spell_id,
+        is_owned: true,
+        fields,
     })
 }
 
@@ -3399,6 +3556,60 @@ mod tests {
     }
 
     #[test]
+    fn add_style_to_spec_extends_an_already_owned_combat_spec_at_the_next_level() {
+        let dir = setup_test_db("add-style-owned");
+        let cfg = test_cfg(&dir);
+
+        // create_new_combat_spec seeds exactly one style at SpecLevelRequirement = 1, already
+        // owned by class 2 - the simplest case: nothing left to clone, just append.
+        create_new_combat_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+
+        let added = add_style_to_spec(&cfg, 2, "earthshatter_2", None).unwrap();
+        assert!(added.is_owned);
+        assert_eq!(str_field(&added.fields, "Name"), "New Style");
+        assert_eq!(int_field(&added.fields, "ClassId"), 2);
+        assert_eq!(int_field(&added.fields, "SpecLevelRequirement"), 2, "one above the seeded style's own level 1");
+
+        let style_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT StyleID FROM Style WHERE SpecKeyName = 'earthshatter_2';",
+        )
+        .unwrap();
+        assert_eq!(style_rows.len(), 2, "the original placeholder plus the newly added one");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_style_to_spec_clones_a_still_shared_specs_styles_first() {
+        let dir = setup_test_db("add-style-shared");
+        let cfg = test_cfg(&dir);
+
+        // Class 1 has "slash" assigned under its plain, shared KeyName (never cloned through
+        // this tool) - adding a style here must clone the whole spec (and its existing styles)
+        // under class 1's own key first, exactly like editing an existing style already does.
+        let added = add_style_to_spec(&cfg, 1, "slash", Some(20)).unwrap();
+        assert!(added.is_owned);
+        assert_eq!(int_field(&added.fields, "ClassId"), 1);
+        assert_eq!(int_field(&added.fields, "SpecLevelRequirement"), 20, "explicit level overrides the default");
+
+        let cloned_styles = run_remote_sql_json(
+            &cfg,
+            "SELECT Name, ClassId FROM Style WHERE SpecKeyName = 'slash_1' ORDER BY Name;",
+        )
+        .unwrap();
+        // Pulverize (originally ClassId=1) + Backlash (originally ClassId=0) carried over from
+        // the clone, plus the brand-new "New Style" just added - 3 rows total.
+        assert_eq!(cloned_styles.len(), 3, "{cloned_styles:?}");
+
+        // The original "slash" spec must be completely untouched.
+        let original_styles = run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE SpecKeyName = 'slash';").unwrap();
+        assert_eq!(original_styles.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn create_new_spell_spec_seeds_an_immediately_editable_placeholder_spell() {
         let dir = setup_test_db("create-spell-spec");
         let cfg = test_cfg(&dir);
@@ -3443,6 +3654,72 @@ mod tests {
         .unwrap();
         assert_eq!(int_field(&ownership_rows[0], "SourceSpellID"), 9001);
         assert_eq!(int_field(&ownership_rows[0], "OwningClassId"), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_spell_to_line_extends_an_already_owned_line_at_the_next_level() {
+        let dir = setup_test_db("add-spell-owned");
+        let cfg = test_cfg(&dir);
+
+        // create_new_spell_spec seeds exactly one spell at Level = 1, already owned by class 2 -
+        // the simplest case: nothing left to clone, just append.
+        create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+
+        let added = add_spell_to_line(&cfg, 2, "earthshatter_2", "earthshatter_2_line", None).unwrap();
+        assert!(added.is_owned);
+        assert_eq!(added.level, 2, "one above the seeded spell's own level 1");
+        assert_eq!(str_field(&added.fields, "Name"), "New Spell");
+
+        let spell_rows = run_remote_sql_json(
+            &cfg,
+            "SELECT LineXSpell_ID FROM LineXSpell WHERE LineName = 'earthshatter_2_line';",
+        )
+        .unwrap();
+        assert_eq!(spell_rows.len(), 2, "the original placeholder plus the newly added one");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_spell_to_line_clones_a_still_shared_lines_spec_first() {
+        let dir = setup_test_db("add-spell-shared");
+        let cfg = test_cfg(&dir);
+
+        // Class 1 has "smite" assigned under its plain, shared KeyName (never cloned through
+        // this tool) - adding a spell to its "smite_base" line must clone the whole spec (and
+        // its existing spell line/spells) under class 1's own key first, exactly like editing an
+        // existing spell already does.
+        let added = add_spell_to_line(&cfg, 1, "smite", "smite_base", Some(25)).unwrap();
+        assert!(added.is_owned);
+        assert_eq!(added.level, 25, "explicit level overrides the default");
+
+        let cloned_spells = run_remote_sql_json(
+            &cfg,
+            "SELECT Level FROM LineXSpell WHERE LineName = 'smite_1_smite_base' ORDER BY Level;",
+        )
+        .unwrap();
+        // The original Smite (level 1) + Greater Smite (level 10), carried over from the clone,
+        // plus the brand-new spell just added at level 25 - 3 rows total.
+        assert_eq!(cloned_spells.len(), 3, "{cloned_spells:?}");
+        assert_eq!(int_field(&cloned_spells[2], "Level"), 25);
+
+        // The original "smite_base" line must be completely untouched.
+        let original_spells =
+            run_remote_sql_json(&cfg, "SELECT LineXSpell_ID FROM LineXSpell WHERE LineName = 'smite_base';").unwrap();
+        assert_eq!(original_spells.len(), 2);
+
+        // The new spell is cloned from this class's own copy of "Greater Smite" (the line's own
+        // highest-level spell after cloning, not the unrelated global template) - a fully
+        // independent new SpellID, tracked the same way every other spell clone in this tool is.
+        assert_ne!(added.spell_id, 9002);
+        let ownership_rows = run_remote_sql_json(
+            &cfg,
+            &format!("SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {};", added.spell_id),
+        )
+        .unwrap();
+        assert_eq!(ownership_rows.len(), 1, "the new spell must be tracked as this class's own clone");
 
         std::fs::remove_dir_all(&dir).ok();
     }
