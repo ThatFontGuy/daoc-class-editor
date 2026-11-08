@@ -95,7 +95,7 @@ pub(crate) fn columns_excluding_pk(cfg: &SshConfig, table: &str) -> Result<Vec<S
 /// matches what's already been reverse-engineered elsewhere in this project. Returns `None` if
 /// the table's primary key is already a plain `INTEGER PRIMARY KEY` (e.g. `Style.StyleID`),
 /// which needs no explicit value at insert time at all.
-fn explicit_guid_pk_column(cfg: &SshConfig, table: &str) -> Result<Option<String>, String> {
+pub(crate) fn explicit_guid_pk_column(cfg: &SshConfig, table: &str) -> Result<Option<String>, String> {
     let rows = run_remote_sql_json(cfg, &format!("PRAGMA table_info({table});"))?;
     for row in &rows {
         if int_field(row, "pk") != 0 {

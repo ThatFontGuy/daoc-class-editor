@@ -424,7 +424,30 @@ fn format_age(seconds: i64) -> String {
 /// be a mistake. Never bypassed by a different code path - this is the owner's own stated
 /// intent for this whole scheme: stop the server, back up, make changes, test, revert if
 /// something broke.
+///
+/// The one deliberate exception: a local design session's own disposable scratch copy (see
+/// `design_session.rs`'s own module doc comment) is never a real server at all - a real genuine
+/// scheme of this tool's safety checks is to be careful of a *live* server. `start_design_session`
+/// always leaves `start_script_name` blank for one (there's nothing to start/stop in a bare
+/// snapshot directory), the one signal that unambiguously distinguishes it from every real
+/// server config (local or remote), which always needs a real script name for the Server
+/// connection tab's own Start/Stop buttons to do anything useful at all. A real, found bug:
+/// without this exception, every command gated by this check (field edits, Add spell/style, spec
+/// creation, `apply_class_specs`) unconditionally still called `is_server_running`/
+/// `backup_status` even when handed a session's own config - which, for a bare scratch directory
+/// with no real management script and no sibling backup file at all, doesn't cleanly return
+/// "not running"/"no backup" as might be hoped, but instead fails outright (confirmed: attempting
+/// to execute `remote_server_dir` itself, since `start_script_name` joins onto it as the empty
+/// string, raised a raw OS "Permission denied" trying to run a directory as a program) - silently
+/// breaking every write a local design session was ever supposed to make possible in the first
+/// place, including the Clone Wizard's own already-shipped one. A session's own snapshot is
+/// always safe to write to directly regardless: it's a private, single-writer scratch copy
+/// nothing else on the whole machine even knows exists, with no live server that could ever hold
+/// it open at all.
 pub fn ensure_safe_to_write(cfg: &SshConfig) -> Result<(), String> {
+    if is_local(cfg) && cfg.start_script_name.trim().is_empty() {
+        return Ok(());
+    }
     if is_server_running(cfg)? {
         return Err(
             "the server is still running - stop it first (Server connection tab), then make \
@@ -704,6 +727,40 @@ mod tests {
 
         backup_database(&c).unwrap();
         assert!(ensure_safe_to_write(&c).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_safe_to_write_always_allows_a_local_design_sessions_own_scratch_copy() {
+        // A real, found bug: without this exception, every command gated by this check
+        // (field edits, Add spell/style, spec creation, apply_class_specs) still unconditionally
+        // called is_server_running/backup_status even for a design session's own bare scratch
+        // directory (no real management script, no sibling backup file at all) - which doesn't
+        // cleanly report "not running"/"no backup" the way might be hoped, but instead fails
+        // outright (a raw OS error attempting to execute the directory itself as a program,
+        // since start_script_name joins onto it as the empty string) - silently breaking every
+        // write a local design session was ever supposed to make possible, including the Clone
+        // Wizard's own already-shipped one.
+        let dir = std::env::temp_dir().join("daoc-class-editor-session-safety-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let session_cfg = SshConfig {
+            host: String::new(),
+            user: String::new(),
+            port: 22,
+            identity_file: String::new(),
+            remote_server_dir: dir.to_string_lossy().to_string(),
+            start_script_name: String::new(),
+        };
+        assert!(ensure_safe_to_write(&session_cfg).is_ok());
+
+        // A real local server config, by contrast (a non-empty start_script_name - every real
+        // config needs one for its own Start/Stop buttons to do anything at all), must still go
+        // through the real checks exactly as before - this exception is strictly for a design
+        // session's own distinctive blank-script shape, not local configs in general.
+        let real_local_cfg = cfg("", dir.to_str().unwrap());
+        assert!(ensure_safe_to_write(&real_local_cfg).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }

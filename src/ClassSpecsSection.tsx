@@ -8,6 +8,7 @@ import {
   SpellTypeFieldStat,
   SshConfig,
   StyleInfo,
+  emptySshConfig,
 } from "./types";
 import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
 
@@ -93,11 +94,22 @@ function splitPrimaryFields(keys: string[], primary: string[]): { primaryKeys: s
  * this tool's own clones or a real stock class's spec that was never cloned through this tool at
  * all (e.g. Friar's own real "Staff"). */
 function CombatSpecEditor({
-  sshConfig,
+  currentCfg,
+  ensureCfg,
   classId,
   specKey,
 }: {
-  sshConfig: SshConfig;
+  /** The config to read with right now - the active local design session if one already exists
+   * for this class, otherwise the live server - without ever starting a new session on its own
+   * (see `ensureCfg`'s own doc comment for why that distinction matters). */
+  currentCfg: () => SshConfig;
+  /** The config to write with - lazily starts this class's own local design session on its very
+   * first call if none exists yet (see `ClassSpecsSection`'s own doc comment for the full
+   * rationale), otherwise just returns the same one every other call this session already has.
+   * Deliberately separate from `currentCfg` so merely viewing a spec (expanding "Edit" with no
+   * actual change made) never silently starts a session nobody asked for - only an actual write
+   * does. */
+  ensureCfg: () => Promise<SshConfig>;
   classId: number;
   specKey: string;
 }) {
@@ -122,7 +134,7 @@ function CombatSpecEditor({
     setLevelDrafts({});
     try {
       const rows = await invoke<StyleInfo[]>("list_styles_for_spec", {
-        cfg: sshConfig,
+        cfg: currentCfg(),
         classId,
         specKey,
       });
@@ -166,8 +178,9 @@ function CombatSpecEditor({
     setBusy(true);
     setStatus(okStatus(s.is_owned ? "Saving..." : "Cloning/granting this style for this class, then saving..."));
     try {
+      const cfg = await ensureCfg();
       const result = await invoke<{ style_id: number; message: string }>("save_style_fields", {
-        cfg: sshConfig,
+        cfg,
         classId,
         specKey,
         styleId: s.style_id,
@@ -204,8 +217,9 @@ function CombatSpecEditor({
     setBusy(true);
     setStatus(okStatus("Saving level..."));
     try {
+      const cfg = await ensureCfg();
       const result = await invoke<string>("update_style_level", {
-        cfg: sshConfig,
+        cfg,
         classId,
         specKey,
         styleId: s.style_id,
@@ -233,8 +247,9 @@ function CombatSpecEditor({
     setBusy(true);
     setStatus(okStatus("Adding a new style..."));
     try {
+      const cfg = await ensureCfg();
       const added = await invoke<StyleInfo>("add_style_to_spec", {
-        cfg: sshConfig,
+        cfg,
         classId,
         specKey,
       });
@@ -360,11 +375,13 @@ function CombatSpecEditor({
  * mirrors `CombatSpecEditor` but for spells (cast spells, grouped by spell line in level order).
  * Save clones a spell independently for this class on the spot, if it isn't one already. */
 function SpellSpecEditor({
-  sshConfig,
+  currentCfg,
+  ensureCfg,
   classId,
   specKey,
 }: {
-  sshConfig: SshConfig;
+  currentCfg: () => SshConfig;
+  ensureCfg: () => Promise<SshConfig>;
   classId: number;
   specKey: string;
 }) {
@@ -401,7 +418,7 @@ function SpellSpecEditor({
     setLevelDrafts({});
     try {
       const rows = await invoke<SpellLineGroup[]>("list_spell_lines_for_spec", {
-        cfg: sshConfig,
+        cfg: currentCfg(),
         classId,
         specKey,
       });
@@ -431,7 +448,7 @@ function SpellSpecEditor({
     void (async () => {
       try {
         setTypeStats(await invoke<Record<string, SpellTypeFieldStat>>("spell_type_field_stats", {
-          cfg: sshConfig,
+          cfg: currentCfg(),
           spellType: initial.Type ?? "",
         }));
       } catch {
@@ -455,7 +472,7 @@ function SpellSpecEditor({
     setDraft((prev) => ({ ...prev, Type: newType }));
     try {
       const stats = await invoke<Record<string, SpellTypeFieldStat>>("spell_type_field_stats", {
-        cfg: sshConfig,
+        cfg: currentCfg(),
         spellType: newType,
       });
       setTypeStats(stats);
@@ -492,8 +509,9 @@ function SpellSpecEditor({
     setBusy(true);
     setStatus(okStatus(item.is_owned ? "Saving..." : "Cloning this spell for this class, then saving..."));
     try {
+      const cfg = await ensureCfg();
       const result = await invoke<{ spell_id: number; message: string }>("save_line_spell_fields", {
-        cfg: sshConfig,
+        cfg,
         classId,
         lineXspellId: item.line_xspell_id,
         fields,
@@ -528,8 +546,9 @@ function SpellSpecEditor({
     setBusy(true);
     setStatus(okStatus("Saving level..."));
     try {
+      const cfg = await ensureCfg();
       const result = await invoke<string>("update_line_spell_level", {
-        cfg: sshConfig,
+        cfg,
         classId,
         lineXspellId: item.line_xspell_id,
         newLevel,
@@ -557,8 +576,9 @@ function SpellSpecEditor({
     setBusy(true);
     setStatus(okStatus("Adding a new spell..."));
     try {
+      const cfg = await ensureCfg();
       const added = await invoke<OwnedSpellInLine>("add_spell_to_line", {
-        cfg: sshConfig,
+        cfg,
         classId,
         specKey: group.spec_key,
         lineKey: group.line_key,
@@ -846,7 +866,22 @@ function NewSpecForm({
  * Shows two plain summary lists (names, level, and whether each spec is already independent or
  * still shared) - combat specs first, then spells - so the user sees just what's there before
  * picking what to actually expand and edit, instead of every spec's full data dumped on screen
- * at once. A spec with both combat styles and spell lines (rare) shows up in both lists. */
+ * at once. A spec with both combat styles and spell lines (rare) shows up in both lists.
+ *
+ * Owns this class's own local design session (see `design_session.rs`'s own module doc comment
+ * for the full rationale, and `ClonePanel.tsx` for the original version of this same pattern):
+ * the very first actual edit anywhere below this component - a field save, a level change, Add
+ * spell/style, or creating a brand-new spec - lazily starts a disposable local snapshot and every
+ * read/write from then on (for *this* class only) goes through it instead of the live server, so
+ * designing never needs the live server stopped at all. "Migrate to live" (gated by the usual
+ * `ensure_safe_to_write` check, same as every other real live write) reconciles everything
+ * designed back onto live in one step once the server actually is stopped - see
+ * `class_migration.rs`'s own module doc comment for exactly how. Switching to a different class
+ * (`ClassBrowserPanel` remounts this component with a fresh `key` per class) discards any
+ * still-open session for the class being left, via this component's own unmount cleanup -
+ * there's deliberately no "resume this class's session later" persistence, unlike the Clone
+ * Wizard's own project-scoped one, since a half-finished class design is expected to be either
+ * migrated or abandoned within one sitting, not picked back up after restarting the app. */
 export default function ClassSpecsSection({
   sshConfig,
   classId,
@@ -860,6 +895,50 @@ export default function ClassSpecsSection({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const busyRef = useRef(false);
 
+  const [sessionDir, setSessionDir] = useState("");
+  const sessionDirRef = useRef("");
+  const [migrateStatus, setMigrateStatus] = useState<StatusState>(emptyStatus);
+  const [migrating, setMigrating] = useState(false);
+
+  function sessionCfg(dir: string): SshConfig {
+    return { ...emptySshConfig, remote_server_dir: dir };
+  }
+  /** Read with right now, without ever starting a new session on its own - see
+   * `CombatSpecEditor`'s own `currentCfg` prop doc comment for why that distinction matters. */
+  function currentCfg(): SshConfig {
+    return sessionDirRef.current ? sessionCfg(sessionDirRef.current) : sshConfig;
+  }
+  async function ensureCfg(): Promise<SshConfig> {
+    if (sessionDirRef.current) return sessionCfg(sessionDirRef.current);
+    const session = await invoke<SshConfig>("start_design_session", { cfg: sshConfig });
+    sessionDirRef.current = session.remote_server_dir;
+    setSessionDir(session.remote_server_dir);
+    return session;
+  }
+  async function discardDesignSession() {
+    const dir = sessionDirRef.current;
+    if (!dir) return;
+    sessionDirRef.current = "";
+    setSessionDir("");
+    try {
+      await invoke("discard_design_session", { sessionCfg: sessionCfg(dir) });
+    } catch {
+      // Best-effort cleanup only - an orphaned session directory left on disk is harmless (it's
+      // never reused once sessionDirRef is cleared), not worth surfacing as an error over.
+    }
+  }
+  // Discards this class's own session if the user navigates to a different class (or away from
+  // this panel entirely) with one still open and never explicitly migrated or discarded it -
+  // ClassBrowserPanel gives this component a fresh `key` per class, so switching classes
+  // unmounts this exact instance, firing this cleanup, rather than silently leaking the session
+  // or (worse) having a later, unrelated class's edits accidentally still land in it.
+  useEffect(() => {
+    return () => {
+      void discardDesignSession();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -872,7 +951,7 @@ export default function ClassSpecsSection({
     setStatus(okStatus("Loading this class's specs..."));
     try {
       const rows = await invoke<ClassSpecSummary[]>("list_class_spec_summaries", {
-        cfg: sshConfig,
+        cfg: currentCfg(),
         classId,
       });
       setSummaries(rows);
@@ -902,8 +981,9 @@ export default function ClassSpecsSection({
     setBusy(true);
     setStatus(okStatus(`Creating "${name}"...`));
     try {
+      const cfg = await ensureCfg();
       const summary = await invoke<ClassSpecSummary>(command, {
-        cfg: sshConfig,
+        cfg,
         classId,
         name,
         levelAcquired,
@@ -927,10 +1007,68 @@ export default function ClassSpecsSection({
   const combatSpecs = (summaries ?? []).filter((s) => s.has_styles);
   const spellSpecs = (summaries ?? []).filter((s) => s.has_spell_lines && !s.has_styles);
 
+  /** Reconciles everything designed in this class's own local session back onto the real live
+   * server (`class_migration::migrate_class_design_to_live`) - gated by the usual
+   * `ensure_safe_to_write` check (server stopped + a sufficiently fresh backup) at the Tauri
+   * command boundary, same as any other live write. Discards the now fully-migrated session
+   * afterward and reloads from live, so the summary list immediately reflects the real live
+   * state rather than the (now-stale) local one. */
+  async function migrateToLive() {
+    const dir = sessionDirRef.current;
+    if (!dir) return;
+    setMigrating(true);
+    setMigrateStatus(okStatus("Migrating this class's design to live..."));
+    try {
+      const result = await invoke<string>("migrate_class_design_to_live", {
+        sessionCfg: sessionCfg(dir),
+        liveCfg: sshConfig,
+        classId,
+      });
+      sessionDirRef.current = "";
+      setSessionDir("");
+      await invoke("discard_design_session", { sessionCfg: sessionCfg(dir) }).catch(() => {});
+      setMigrateStatus(okStatus(result));
+      await load();
+    } catch (e) {
+      setMigrateStatus(errorStatus(`Migrate failed: ${e}`));
+    } finally {
+      setMigrating(false);
+    }
+  }
+
   return (
     <div className="panel">
       {busy && <p className="hint">⏳ Working - please wait...</p>}
       <StatusMessage status={status} />
+
+      {sessionDir && (
+        <div className="panel" style={{ background: "var(--panel-alt, #2a2a2a)", marginBottom: "1rem" }}>
+          <p>
+            <strong>🧪 Designing locally</strong> - every edit below is going to a disposable local
+            copy, not the live server. Nothing here is visible to players until you migrate it.
+          </p>
+          <StatusMessage status={migrateStatus} />
+          <button onClick={migrateToLive} disabled={migrating}>
+            Migrate to live
+          </button>{" "}
+          <button
+            onClick={async () => {
+              await discardDesignSession();
+              setMigrateStatus(emptyStatus);
+              await load();
+            }}
+            disabled={migrating}
+          >
+            Discard design
+          </button>
+          <p className="hint">
+            <strong>Migrate to live</strong> requires the server stopped and a fresh backup (the
+            same write-safety check every other live change already goes through) - everything
+            you've designed is reconciled onto the real database in one step, then this local
+            session is cleaned up automatically.
+          </p>
+        </div>
+      )}
 
       <div className="new-spec-actions">
         <h3>Create from scratch</h3>
@@ -969,7 +1107,7 @@ export default function ClassSpecsSection({
                   onToggle={() => toggle(s.key_name)}
                   busy={busy}
                 >
-                  <CombatSpecEditor sshConfig={sshConfig} classId={classId} specKey={s.key_name} />
+                  <CombatSpecEditor currentCfg={currentCfg} ensureCfg={ensureCfg} classId={classId} specKey={s.key_name} />
                 </SpecSummaryRow>
               ))}
             </tbody>
@@ -1003,7 +1141,7 @@ export default function ClassSpecsSection({
                   onToggle={() => toggle(s.key_name)}
                   busy={busy}
                 >
-                  <SpellSpecEditor sshConfig={sshConfig} classId={classId} specKey={s.key_name} />
+                  <SpellSpecEditor currentCfg={currentCfg} ensureCfg={ensureCfg} classId={classId} specKey={s.key_name} />
                 </SpecSummaryRow>
               ))}
             </tbody>

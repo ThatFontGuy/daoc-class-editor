@@ -1,4 +1,5 @@
 pub mod classdata;
+mod class_migration;
 mod codegen;
 pub mod deploy;
 pub mod deployed;
@@ -220,6 +221,17 @@ fn start_design_session(cfg: SshConfig) -> Result<SshConfig, String> {
 #[tauri::command]
 fn discard_design_session(session_cfg: SshConfig) -> Result<(), String> {
     design_session::discard_design_session(&session_cfg)
+}
+
+/// Migrates one class's locally-designed specs/spell-lines/spells/styles from `session_cfg`'s
+/// own local design-session database onto the real live server, in one step - see
+/// `class_migration`'s own module doc comment for exactly how. Gated by `ensure_safe_to_write`
+/// the same as every other call that can actually change the live database - this is the one
+/// moment in the whole local-design-session flow that actually does.
+#[tauri::command]
+fn migrate_class_design_to_live(session_cfg: SshConfig, live_cfg: SshConfig, class_id: i64) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&live_cfg)?;
+    class_migration::migrate_class_design_to_live(&session_cfg, &live_cfg, class_id)
 }
 
 #[tauri::command]
@@ -494,6 +506,7 @@ pub fn run() {
             apply_class_specs,
             start_design_session,
             discard_design_session,
+            migrate_class_design_to_live,
             clone_realm_abilities,
             migrate_class_to_owned_spells,
             list_owned_spells,
