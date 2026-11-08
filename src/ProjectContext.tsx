@@ -115,6 +115,17 @@ export interface ProjectState {
    * for a normal fresh clone. Locks identity fields (name/ident/ID/filename) in the UI, and
    * redirects the spec-lines step to read/write this class's own specs instead of a parent's. */
   editingDeployedClassId: number | null;
+  /** The local design session's own working-copy directory (see `design_session.rs`'s own module
+   * doc comment) - empty until the spec-assignment step first needs one. Everything about
+   * designing a class's specs/spell lines (steps 2-3: browsing and assigning them) reads and
+   * writes this disposable local copy instead of the live server, so none of it ever needs the
+   * live server stopped - only the final "Deploy" step (step 6) re-applies the finished result to
+   * the real live database, through the exact same write-safety gate as any other live write.
+   * Persisted in the project file so resuming a saved, in-progress design reuses the same
+   * session rather than silently starting a fresh one (and re-reading the source class's specs
+   * as they are *now*, not as they were when design first started, is only ever a problem at the
+   * final live-apply step - which already always re-reads live at that point regardless). */
+  designSessionDir: string;
   trainer: TrainerState;
 }
 
@@ -130,6 +141,7 @@ export const emptyProjectState: ProjectState = {
   generatedCode: "",
   filename: "",
   editingDeployedClassId: null,
+  designSessionDir: "",
   trainer: emptyTrainerState,
 };
 

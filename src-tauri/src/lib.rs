@@ -2,6 +2,7 @@ pub mod classdata;
 mod codegen;
 pub mod deploy;
 pub mod deployed;
+pub mod design_session;
 pub mod realm_abilities;
 pub mod realm_ability_costs;
 pub mod spell_ownership;
@@ -196,6 +197,21 @@ fn apply_class_specs(
 ) -> Result<String, String> {
     deploy::ensure_safe_to_write(&cfg)?;
     specs::apply_class_specs(&cfg, new_class_id, &assignments, &previous_keys)
+}
+
+/// Starts a new local design session (see `design_session`'s own module doc comment for the
+/// full rationale) - never gated by `ensure_safe_to_write`, since taking a snapshot is always
+/// safe regardless of whether the live server is running.
+#[tauri::command]
+fn start_design_session(cfg: SshConfig) -> Result<SshConfig, String> {
+    design_session::start_design_session(&cfg)
+}
+
+/// Deletes a design session's own local working copy - called once its changes are deployed
+/// live, or if the user discards the design. Never touches the live server at all.
+#[tauri::command]
+fn discard_design_session(session_cfg: SshConfig) -> Result<(), String> {
+    design_session::discard_design_session(&session_cfg)
 }
 
 #[tauri::command]
@@ -444,6 +460,8 @@ pub fn run() {
             list_spec_spell_lines,
             list_line_spells,
             apply_class_specs,
+            start_design_session,
+            discard_design_session,
             clone_realm_abilities,
             migrate_class_to_owned_spells,
             list_owned_spells,

@@ -82,7 +82,7 @@ pub(crate) fn ssh_base_args(cfg: &SshConfig) -> Vec<String> {
     args
 }
 
-fn ssh_base_scp_args(cfg: &SshConfig) -> Vec<String> {
+pub(crate) fn ssh_base_scp_args(cfg: &SshConfig) -> Vec<String> {
     let mut args = vec!["-P".to_string(), cfg.port.to_string()];
     if !cfg.identity_file.is_empty() {
         args.push("-i".to_string());

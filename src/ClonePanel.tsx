@@ -54,6 +54,36 @@ export default function ClonePanel() {
   const [sourceSpecs, setSourceSpecs] = useState<ClassSpecRow[] | null>(null);
   const [specLog, setSpecLog] = useState("");
 
+  // The local design session's own config (see ProjectContext.tsx's own designSessionDir doc
+  // comment) - a design-in-progress reads and writes this disposable local copy instead of the
+  // live server, so none of it ever needs the live server stopped. Started lazily, the first
+  // time anything about step 2/3 (spec assignment) actually needs one.
+  function sessionCfg(dir: string): SshConfig {
+    return { ...emptySshConfig, remote_server_dir: dir };
+  }
+  const designSessionRef = useRef(project.designSessionDir);
+  designSessionRef.current = project.designSessionDir;
+  async function ensureDesignSession(): Promise<SshConfig> {
+    if (designSessionRef.current) return sessionCfg(designSessionRef.current);
+    const session = await invoke<SshConfig>("start_design_session", { cfg: sshConfig });
+    designSessionRef.current = session.remote_server_dir;
+    setProject((p) => ({ ...p, designSessionDir: session.remote_server_dir }));
+    return session;
+  }
+  async function discardDesignSession() {
+    const dir = designSessionRef.current;
+    if (!dir) return;
+    designSessionRef.current = "";
+    setProject((p) => ({ ...p, designSessionDir: "" }));
+    try {
+      await invoke("discard_design_session", { sessionCfg: sessionCfg(dir) });
+    } catch {
+      // Best-effort cleanup only - an orphaned session directory left on disk is harmless (it's
+      // never reused once designSessionDir is cleared), not worth surfacing as an error to the
+      // user over.
+    }
+  }
+
   async function refreshClasses(cfg: SshConfig) {
     setClassesLoading(true);
     try {
@@ -160,6 +190,9 @@ export default function ClonePanel() {
     // could make its own correct values vanish just by clicking its (previously unhighlighted)
     // picker button.
     if (isEditing && id === project.newIdent) return;
+    // A fresh pick starts an unrelated design - the previous source's own local session copy (if
+    // any) no longer applies to it.
+    void discardDesignSession();
     setProject((p) => ({
       ...p,
       sourceClassIdent: id,
@@ -243,9 +276,10 @@ export default function ClonePanel() {
     if (!source || specsReadFromId === undefined) return;
     setSpecLog("loading...");
     try {
+      const cfg = await ensureDesignSession();
       const [all, mine] = await Promise.all([
-        invoke<SpecializationRow[]>("list_specializations", { cfg: sshConfig }),
-        invoke<ClassSpecRow[]>("list_class_specs", { cfg: sshConfig, classId: specsReadFromId }),
+        invoke<SpecializationRow[]>("list_specializations", { cfg }),
+        invoke<ClassSpecRow[]>("list_class_specs", { cfg, classId: specsReadFromId }),
       ]);
       setAllSpecs(all);
       setSourceSpecs(mine);
@@ -316,7 +350,7 @@ export default function ClonePanel() {
     if (!a.spellLineSelection) {
       try {
         const lines = await invoke<SpecSpellLineRow[]>("list_spec_spell_lines", {
-          cfg: sshConfig,
+          cfg: await ensureDesignSession(),
           specKey: a.source_key,
         });
         updateSpecAssignment(i, {
@@ -367,7 +401,7 @@ export default function ClonePanel() {
     if (line && line.spells.length === 0) {
       try {
         const spells = await invoke<LineSpellRow[]>("list_line_spells", {
-          cfg: sshConfig,
+          cfg: await ensureDesignSession(),
           lineKey,
         });
         setProject((p) => ({
@@ -495,26 +529,33 @@ export default function ClonePanel() {
       .sort((a, b) => a[0].level - b[0].level);
   }
 
+  function buildSpecAssignmentPayload(): SpecAssignmentPayload[] {
+    return project.specAssignments.map((a) => ({
+      source_key: a.source_key,
+      new_key: deriveSpecKey(a.new_name),
+      new_name: a.new_name,
+      level_acquired: a.level_acquired,
+      // Undefined (never customized) sends an empty list - apply_class_specs treats that as
+      // "clone every line and every spell in full", the original, still-default behavior.
+      spell_line_selection: (a.spellLineSelection ?? []).map((l) => ({
+        source_line_key: l.source_line_key,
+        included: l.included,
+        excluded_spell_ids: l.spells.filter((s) => !s.included).map((s) => s.spell_id),
+      })),
+    }));
+  }
+
+  // Writes to the local design session's own disposable copy - every iteration while actually
+  // designing the class (steps 2-3) goes through here, never the live server, so none of it ever
+  // needs the live server stopped. See ProjectContext.tsx's own designSessionDir doc comment.
   async function applySpecsToServer() {
     if (specsReadFromId === undefined) return;
     setBusy(true);
     setSpecLog("applying...");
     try {
-      const payload: SpecAssignmentPayload[] = project.specAssignments.map((a) => ({
-        source_key: a.source_key,
-        new_key: deriveSpecKey(a.new_name),
-        new_name: a.new_name,
-        level_acquired: a.level_acquired,
-        // Undefined (never customized) sends an empty list - apply_class_specs treats that as
-        // "clone every line and every spell in full", the original, still-default behavior.
-        spell_line_selection: (a.spellLineSelection ?? []).map((l) => ({
-          source_line_key: l.source_line_key,
-          included: l.included,
-          excluded_spell_ids: l.spells.filter((s) => !s.included).map((s) => s.spell_id),
-        })),
-      }));
+      const payload = buildSpecAssignmentPayload();
       const result = await invoke<string>("apply_class_specs", {
-        cfg: sshConfig,
+        cfg: await ensureDesignSession(),
         newClassId: specsWriteToId,
         assignments: payload,
         previousKeys: project.originalAssignedSpecKeys,
@@ -536,6 +577,24 @@ export default function ClonePanel() {
     } finally {
       setBusy(false);
     }
+  }
+
+  // The one moment any of this actually reaches the live server - re-applies the exact same,
+  // already-finalized spec assignments against the real `sshConfig` instead of the design
+  // session's own disposable copy. Fully re-resolves everything fresh against live's current
+  // state (new SpellLine/Style/Specialization rows, new IDs, re-reading the source class's own
+  // specs as they are *right now*) - nothing about the local design session carries over except
+  // the *choices* the user made (which specs, which lines/spells, what to name them), exactly
+  // like generating code from scratch would. Called from step 6 (Deploy), after the usual
+  // `ensure_safe_to_write` gate (stop server + fresh backup) the Tauri command already enforces.
+  async function applySpecsToLiveServer(): Promise<string> {
+    if (specsWriteToId === undefined) throw new Error("no class ID to apply specs to");
+    return invoke<string>("apply_class_specs", {
+      cfg: sshConfig,
+      newClassId: specsWriteToId,
+      assignments: buildSpecAssignmentPayload(),
+      previousKeys: project.originalAssignedSpecKeys,
+    });
   }
 
   return (
@@ -677,6 +736,13 @@ export default function ClonePanel() {
           </label>
 
           <h2>3. Spec lines</h2>
+          <p className="hint">
+            Everything below designs against a disposable local copy, not the live server - the
+            live server never has to be stopped for any of this, however long it takes to get
+            right. Nothing reaches the live database until step 6 (Deploy), which re-applies the
+            finished result fresh at that point, through the exact same stop-server-first
+            safeguard as any other live write.
+          </p>
           <p className="hint">
             {isEditing ? (
               <>Showing {specsOwnerName}'s own currently-assigned specs - add more below.</>
@@ -879,8 +945,27 @@ export default function ClonePanel() {
                   onClick={applySpecsToServer}
                   disabled={busy || project.specAssignments.length === 0}
                 >
-                  Apply spec assignments to server
+                  Apply spec assignments (to local design copy)
                 </button>
+                {project.designSessionDir && (
+                  <button
+                    disabled={busy}
+                    onClick={() =>
+                      runAction("Discard local design", async () => {
+                        await discardDesignSession();
+                        setSourceSpecs(null);
+                        setProject((p) => ({
+                          ...p,
+                          specAssignments: [],
+                          originalAssignedSpecKeys: isEditing ? p.originalAssignedSpecKeys : [],
+                        }));
+                        return "discarded - reload specs to start over";
+                      })
+                    }
+                  >
+                    Discard local design
+                  </button>
+                )}
               </div>
               {specLog && <pre className="status">{specLog}</pre>}
             </>
@@ -1109,6 +1194,14 @@ export default function ClonePanel() {
                     runAction(
                       `Deploy ${project.filename}`,
                       async () => {
+                        // Everything about this class's specs/spell lines/styles was designed
+                        // against a disposable local copy (see ProjectContext.tsx's own
+                        // designSessionDir doc comment) - this is the one moment any of it
+                        // actually reaches the live server, re-applying the exact same finished
+                        // assignments fresh against live's own current state.
+                        const specsResult = project.specAssignments.length
+                          ? await applySpecsToLiveServer()
+                          : "";
                         const deployResult = await invoke<string>("deploy_class", {
                           cfg: sshConfig,
                           filename: project.filename,
@@ -1125,7 +1218,10 @@ export default function ClonePanel() {
                           sourceClassId: source.id,
                           newClassId: project.newId,
                         });
-                        return raResult ? `${deployResult}\n${raResult}` : deployResult;
+                        // The design session's own local copy has done its job - nothing further
+                        // in this project ever needs it again once the real deploy succeeds.
+                        await discardDesignSession();
+                        return [specsResult, deployResult, raResult].filter(Boolean).join("\n");
                       },
                       () => refreshClasses(sshConfig),
                     )

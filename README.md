@@ -152,11 +152,12 @@ deployment path was confirmed against a real running server after an early mix-u
   existing trainer's full stats/model/position (search by name, e.g. "Shadowblade Trainer", pick
   a location, done) - no hand-written C# or manual `Mob` row needed.
 - **Write safety, enforced, not just documented** - every single command that can change your live
-  server (deploying a class, editing specs/spells/styles, running SQL, spawning a trainer NPC, ...)
-  refuses outright unless **both** of these are true: the server is actually stopped (read straight
-  from `daoc-server.sh status`, not just a caution in this README), and a backup was taken within
-  the last 30 minutes. **Server connection**'s own "Write safety" section shows both at a glance
-  and has the two buttons that make this practical:
+  server (deploying a class, running SQL, spawning a trainer NPC, editing an already-deployed
+  class's specs/spells/styles directly in the Classes tab, ...) refuses outright unless **both**
+  of these are true: the server is actually stopped (read straight from `daoc-server.sh status`,
+  not just a caution in this README), and a backup was taken within the last 30 minutes. **Server
+  connection**'s own "Write safety" section shows both at a glance and has the two buttons that
+  make this practical:
   - **Backup Database** replaces this tool's own single managed snapshot of the live database
     (via sqlite3's own `.backup`, safe even mid-WAL) - it isn't a history, every click overwrites
     the one before it; keep your own longer-term backups separately if you want those.
@@ -168,6 +169,15 @@ deployment path was confirmed against a real running server after an early mix-u
   server back up and test them, **Revert Database** if something broke. Since the backup's own
   age is read fresh from the file every time (no separate tracking state to go stale on its own),
   this stays accurate even across restarting this tool itself.
+
+  **Designing a new (or re-editing an existing) class's specs is the one deliberate exception,
+  by design** - the Clone Wizard's own spec-assignment step (step 3) never needs the live server
+  stopped at all, however long it takes to get right: it works against a disposable local copy of
+  the database, snapshotted the moment you first need one (sqlite3's own `.backup`, exactly as
+  safe to run against a live, actively-written-to database as the managed backup above - it's
+  only ever *writing back* to the live file that's unsafe while the server holds it open). Only
+  step 6 (Deploy) ever actually reaches the live server, re-applying the finished result fresh at
+  that point - through the exact same stop-server-first safeguard as everything else.
 
 **Not automated yet** (planned next, see the phased plan in project history/issues, or ask):
 - Starter equipment and a starting location aren't generated yet for a smooth first-level
