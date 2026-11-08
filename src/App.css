@@ -361,6 +361,17 @@ button.danger {
   color: var(--text);
 }
 
+/* A failed save must never look identical to a successful one - a real, reported problem found
+   live: a save silently rejected by the write-safety gate (server still running) looked exactly
+   like any other status line, and was missed entirely, leaving the owner believing their changes
+   had been saved when the database was completely untouched. */
+.status-error {
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+  color: var(--danger);
+  font-weight: 600;
+}
+
 .progress-indicator {
   display: flex;
   align-items: center;

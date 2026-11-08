@@ -9,6 +9,7 @@ import {
   SshConfig,
   StyleInfo,
 } from "./types";
+import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
@@ -104,7 +105,7 @@ function CombatSpecEditor({
   const [editingStyleId, setEditingStyleId] = useState<number | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [levelDrafts, setLevelDrafts] = useState<Record<number, string>>({});
-  const [status, setStatus] = useState("");
+  const [status, setStatus] = useState<StatusState>(emptyStatus);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
 
@@ -126,9 +127,9 @@ function CombatSpecEditor({
         specKey,
       });
       setStyles(rows);
-      setStatus(rows.length === 0 ? "No combat styles found for this spec." : "");
+      setStatus(rows.length === 0 ? okStatus("No combat styles found for this spec.") : emptyStatus);
     } catch (e) {
-      setStatus(`Could not load styles: ${e}`);
+      setStatus(errorStatus(`Could not load styles: ${e}`));
       setStyles(null);
     } finally {
       busyRef.current = false;
@@ -157,13 +158,13 @@ function CombatSpecEditor({
       fields[key] = wasNumber && value.trim() !== "" && !Number.isNaN(Number(value)) ? Number(value) : value;
     }
     if (Object.keys(fields).length === 0) {
-      setStatus("Nothing changed.");
+      setStatus(okStatus("Nothing changed."));
       setEditingStyleId(null);
       return;
     }
     busyRef.current = true;
     setBusy(true);
-    setStatus(s.is_owned ? "Saving..." : "Cloning/granting this style for this class, then saving...");
+    setStatus(okStatus(s.is_owned ? "Saving..." : "Cloning/granting this style for this class, then saving..."));
     try {
       const result = await invoke<{ style_id: number; message: string }>("save_style_fields", {
         cfg: sshConfig,
@@ -172,11 +173,11 @@ function CombatSpecEditor({
         styleId: s.style_id,
         fields,
       });
-      setStatus(result.message);
+      setStatus(okStatus(result.message));
       setEditingStyleId(null);
       await load();
     } catch (e) {
-      setStatus(`Save failed: ${e}`);
+      setStatus(errorStatus(`Save failed: ${e}`));
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -189,12 +190,12 @@ function CombatSpecEditor({
     const draftValue = levelDrafts[s.style_id] ?? currentLevel;
     const newLevel = Number(draftValue);
     if (draftValue.trim() === "" || Number.isNaN(newLevel)) {
-      setStatus("Level must be a number.");
+      setStatus(errorStatus("Level must be a number."));
       return;
     }
     busyRef.current = true;
     setBusy(true);
-    setStatus("Saving level...");
+    setStatus(okStatus("Saving level..."));
     try {
       const result = await invoke<string>("update_style_level", {
         cfg: sshConfig,
@@ -203,10 +204,10 @@ function CombatSpecEditor({
         styleId: s.style_id,
         newLevel,
       });
-      setStatus(result);
+      setStatus(okStatus(result));
       await load();
     } catch (e) {
-      setStatus(`Save failed: ${e}`);
+      setStatus(errorStatus(`Save failed: ${e}`));
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -216,7 +217,7 @@ function CombatSpecEditor({
   return (
     <div>
       {busy && <p className="hint">⏳ Working - please wait...</p>}
-      {status && <pre className="status">{status}</pre>}
+      <StatusMessage status={status} />
       {styles && styles.length > 0 && (
         <table className="spec-table">
           <thead>
@@ -330,7 +331,7 @@ function SpellSpecEditor({
   const [editingSpellId, setEditingSpellId] = useState<number | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [levelDrafts, setLevelDrafts] = useState<Record<string, string>>({});
-  const [status, setStatus] = useState("");
+  const [status, setStatus] = useState<StatusState>(emptyStatus);
   const [busy, setBusy] = useState(false);
   const [spellTypes, setSpellTypes] = useState<string[]>([]);
   // What's typical for whatever Type the spell currently being edited has - refreshed every time
@@ -365,9 +366,9 @@ function SpellSpecEditor({
       });
       setGroups(rows);
       const totalSpells = rows.reduce((sum, g) => sum + g.spells.length, 0);
-      setStatus(totalSpells === 0 ? "No spells found on this spec's own spell line(s)." : "");
+      setStatus(totalSpells === 0 ? okStatus("No spells found on this spec's own spell line(s).") : emptyStatus);
     } catch (e) {
-      setStatus(`Could not load spell lines: ${e}`);
+      setStatus(errorStatus(`Could not load spell lines: ${e}`));
       setGroups(null);
     } finally {
       busyRef.current = false;
@@ -442,13 +443,13 @@ function SpellSpecEditor({
       fields[key] = wasNumber && value.trim() !== "" && !Number.isNaN(Number(value)) ? Number(value) : value;
     }
     if (Object.keys(fields).length === 0) {
-      setStatus("Nothing changed.");
+      setStatus(okStatus("Nothing changed."));
       setEditingSpellId(null);
       return;
     }
     busyRef.current = true;
     setBusy(true);
-    setStatus(item.is_owned ? "Saving..." : "Cloning this spell for this class, then saving...");
+    setStatus(okStatus(item.is_owned ? "Saving..." : "Cloning this spell for this class, then saving..."));
     try {
       const result = await invoke<{ spell_id: number; message: string }>("save_line_spell_fields", {
         cfg: sshConfig,
@@ -456,11 +457,11 @@ function SpellSpecEditor({
         lineXspellId: item.line_xspell_id,
         fields,
       });
-      setStatus(result.message);
+      setStatus(okStatus(result.message));
       setEditingSpellId(null);
       await load();
     } catch (e) {
-      setStatus(`Save failed: ${e}`);
+      setStatus(errorStatus(`Save failed: ${e}`));
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -472,12 +473,12 @@ function SpellSpecEditor({
     const draftValue = levelDrafts[item.line_xspell_id];
     const newLevel = Number(draftValue);
     if (draftValue === undefined || draftValue.trim() === "" || Number.isNaN(newLevel)) {
-      setStatus("Level must be a number.");
+      setStatus(errorStatus("Level must be a number."));
       return;
     }
     busyRef.current = true;
     setBusy(true);
-    setStatus("Saving level...");
+    setStatus(okStatus("Saving level..."));
     try {
       const result = await invoke<string>("update_line_spell_level", {
         cfg: sshConfig,
@@ -485,10 +486,10 @@ function SpellSpecEditor({
         lineXspellId: item.line_xspell_id,
         newLevel,
       });
-      setStatus(result);
+      setStatus(okStatus(result));
       await load();
     } catch (e) {
-      setStatus(`Save failed: ${e}`);
+      setStatus(errorStatus(`Save failed: ${e}`));
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -542,7 +543,7 @@ function SpellSpecEditor({
   return (
     <div>
       {busy && <p className="hint">⏳ Working - please wait...</p>}
-      {status && <pre className="status">{status}</pre>}
+      <StatusMessage status={status} />
       {groups &&
         totalSpells > 0 &&
         groups
@@ -770,7 +771,7 @@ export default function ClassSpecsSection({
   classId: number;
 }) {
   const [summaries, setSummaries] = useState<ClassSpecSummary[] | null>(null);
-  const [status, setStatus] = useState("");
+  const [status, setStatus] = useState<StatusState>(emptyStatus);
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const busyRef = useRef(false);
@@ -784,16 +785,16 @@ export default function ClassSpecsSection({
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
-    setStatus("Loading this class's specs...");
+    setStatus(okStatus("Loading this class's specs..."));
     try {
       const rows = await invoke<ClassSpecSummary[]>("list_class_spec_summaries", {
         cfg: sshConfig,
         classId,
       });
       setSummaries(rows);
-      setStatus(rows.length === 0 ? "This class has no specs assigned." : "");
+      setStatus(rows.length === 0 ? okStatus("This class has no specs assigned.") : emptyStatus);
     } catch (e) {
-      setStatus(`Could not load specs: ${e}`);
+      setStatus(errorStatus(`Could not load specs: ${e}`));
       setSummaries(null);
     } finally {
       busyRef.current = false;
@@ -815,7 +816,7 @@ export default function ClassSpecsSection({
    * go find what you just made" step. */
   async function createSpec(command: "create_new_combat_spec" | "create_new_spell_spec", name: string, levelAcquired: number) {
     setBusy(true);
-    setStatus(`Creating "${name}"...`);
+    setStatus(okStatus(`Creating "${name}"...`));
     try {
       const summary = await invoke<ClassSpecSummary>(command, {
         cfg: sshConfig,
@@ -825,9 +826,9 @@ export default function ClassSpecsSection({
       });
       await load();
       setExpanded((prev) => new Set(prev).add(summary.key_name));
-      setStatus(`Created "${summary.name}" - edit its placeholder below to make it do what you actually want.`);
+      setStatus(okStatus(`Created "${summary.name}" - edit its placeholder below to make it do what you actually want.`));
     } catch (e) {
-      setStatus(`Could not create "${name}": ${e}`);
+      setStatus(errorStatus(`Could not create "${name}": ${e}`));
     } finally {
       setBusy(false);
     }
@@ -845,7 +846,7 @@ export default function ClassSpecsSection({
   return (
     <div className="panel">
       {busy && <p className="hint">⏳ Working - please wait...</p>}
-      {status && <pre className="status">{status}</pre>}
+      <StatusMessage status={status} />
 
       <div className="new-spec-actions">
         <h3>Create from scratch</h3>

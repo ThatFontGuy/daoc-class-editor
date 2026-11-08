@@ -21,6 +21,7 @@ import {
   SpellSelectionUI,
   useProject,
 } from "./ProjectContext";
+import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
 import TrainerPanel from "./TrainerPanel";
 
 export default function ClonePanel() {
@@ -52,7 +53,7 @@ export default function ClonePanel() {
 
   const [allSpecs, setAllSpecs] = useState<SpecializationRow[]>([]);
   const [sourceSpecs, setSourceSpecs] = useState<ClassSpecRow[] | null>(null);
-  const [specLog, setSpecLog] = useState("");
+  const [specLog, setSpecLog] = useState<StatusState>(emptyStatus);
 
   // The local design session's own config (see ProjectContext.tsx's own designSessionDir doc
   // comment) - a design-in-progress reads and writes this disposable local copy instead of the
@@ -274,7 +275,7 @@ export default function ClonePanel() {
 
   async function loadSourceSpecs() {
     if (!source || specsReadFromId === undefined) return;
-    setSpecLog("loading...");
+    setSpecLog(okStatus("loading..."));
     try {
       const cfg = await ensureDesignSession();
       const [all, mine] = await Promise.all([
@@ -304,9 +305,9 @@ export default function ClonePanel() {
           originalAssignedSpecKeys: isEditing ? mine.map((m) => m.spec_key_name) : [],
         }));
       }
-      setSpecLog(`found ${mine.length} spec(s) on ${specsOwnerName}`);
+      setSpecLog(okStatus(`found ${mine.length} spec(s) on ${specsOwnerName}`));
     } catch (e) {
-      setSpecLog(`error: ${e}`);
+      setSpecLog(errorStatus(`error: ${e}`));
     }
   }
 
@@ -362,7 +363,7 @@ export default function ClonePanel() {
           })),
         });
       } catch (e) {
-        setSpecLog(`error loading spell lines: ${e}`);
+        setSpecLog(errorStatus(`error loading spell lines: ${e}`));
         return;
       }
     }
@@ -420,7 +421,7 @@ export default function ClonePanel() {
           ),
         }));
       } catch (e) {
-        setSpecLog(`error loading spells: ${e}`);
+        setSpecLog(errorStatus(`error loading spells: ${e}`));
         return;
       }
     }
@@ -551,7 +552,7 @@ export default function ClonePanel() {
   async function applySpecsToServer() {
     if (specsReadFromId === undefined) return;
     setBusy(true);
-    setSpecLog("applying...");
+    setSpecLog(okStatus("applying..."));
     try {
       const payload = buildSpecAssignmentPayload();
       const result = await invoke<string>("apply_class_specs", {
@@ -560,7 +561,7 @@ export default function ClonePanel() {
         assignments: payload,
         previousKeys: project.originalAssignedSpecKeys,
       });
-      setSpecLog(result || "done");
+      setSpecLog(okStatus(result || "done"));
       setProject((p) => ({
         ...p,
         specAssignments: p.specAssignments.map((a) => ({ ...a, applied: true })),
@@ -573,7 +574,7 @@ export default function ClonePanel() {
           : p.originalAssignedSpecKeys,
       }));
     } catch (e) {
-      setSpecLog(`error: ${e}`);
+      setSpecLog(errorStatus(`error: ${e}`));
     } finally {
       setBusy(false);
     }
@@ -967,7 +968,7 @@ export default function ClonePanel() {
                   </button>
                 )}
               </div>
-              {specLog && <pre className="status">{specLog}</pre>}
+              <StatusMessage status={specLog} />
             </>
           )}
 
