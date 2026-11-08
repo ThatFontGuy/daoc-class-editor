@@ -627,6 +627,136 @@ pub fn create_new_spell_spec(
     })
 }
 
+/// Fields worth suggesting type-appropriate defaults for - everything in
+/// `ClassSpecsSection.tsx`'s own `EDITABLE_SPELL_FIELD_HINTS` except Name/Type/Description/
+/// Message1/Message2, which are spell-specific flavor text with no meaningful "typical value" to
+/// suggest at all. A real, reported problem this exists to fix: a brand-new spell is seeded by
+/// cloning an unrelated template spell (`create_new_spell_spec`'s own lowest-SpellID template,
+/// chosen purely for being safe to clone, not for being a sensible starting point) - its Value,
+/// Duration, Range, etc. showed up verbatim as whatever that unrelated template spell happened
+/// to have, with nothing suggesting what's actually typical once the user picks a real Type.
+const SPELL_TYPE_STAT_FIELDS: &[&str] = &[
+    "Damage",
+    "DamageType",
+    "Value",
+    "Range",
+    "Radius",
+    "Duration",
+    "Frequency",
+    "Power",
+    "CastTime",
+    "RecastDelay",
+    "Icon",
+    "ClientEffect",
+    "Target",
+];
+
+/// Fields where a low value represents a weaker/earlier-rank version of the same effect (a speed
+/// buff's own Value, a DoT's own Damage, how long a buff's own Duration lasts, ...). The owner's
+/// own explicit preference: a brand-new spell should default to the *lowest* real value in use
+/// for its Type - "let the user ramp them up as they add to it" themselves - not an average or
+/// most-common value that might already be a mid-to-late-rank number. Every other stat field
+/// (DamageType/Icon/ClientEffect/Target) is categorical, not a magnitude - "low" has no real
+/// meaning there, so the most *common* real value is suggested instead.
+const RAMP_FIELDS: &[&str] = &[
+    "Damage",
+    "Value",
+    "Range",
+    "Radius",
+    "Duration",
+    "Frequency",
+    "Power",
+    "CastTime",
+    "RecastDelay",
+];
+
+/// One field's own type-appropriate suggestion: `default` is what a brand-new spell of this Type
+/// should start with (see `RAMP_FIELDS`'s own doc comment for which rule picks it); `options` is
+/// every distinct real value already in use by some spell of this Type, in the same order
+/// (ascending for a ramp field, most-common-first otherwise) - meant for a `<datalist>` alongside
+/// a plain text input, so picking one of these is a one-click shortcut to staying consistent with
+/// the rest of the game, while direct entry still works for a deliberately novel value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpellTypeFieldStat {
+    pub default: String,
+    pub options: Vec<String>,
+}
+
+/// Every stat-worthy field's own typical-value suggestions for `spell_type` - queries every real
+/// spell already using this Type, live, rather than hand-maintaining a lookup table that would
+/// drift out of sync with the server's own actual content the moment anyone adds a new spell. A
+/// field absent entirely from the result (not just an empty `options` list) means no spell of
+/// this Type has ever set it to anything at all - nothing to suggest either way.
+pub fn spell_type_field_stats(
+    cfg: &SshConfig,
+    spell_type: &str,
+) -> Result<std::collections::HashMap<String, SpellTypeFieldStat>, String> {
+    let type_q = sql_quote(spell_type);
+    let cols = SPELL_TYPE_STAT_FIELDS.join(", ");
+    let rows = run_remote_sql_json(cfg, &format!("SELECT {cols} FROM Spell WHERE Type = '{type_q}';"))?;
+
+    let mut stats = std::collections::HashMap::new();
+    for &field in SPELL_TYPE_STAT_FIELDS {
+        // Every real value this field actually has across every spell of this Type - null (the
+        // column genuinely unset) is the only thing skipped; zero is a real, meaningful value in
+        // its own right for several of these fields (e.g. CastTime=0 is "instant cast", a common
+        // and significant case, not a placeholder to ignore).
+        let raw: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get(field))
+            .filter(|v| !v.is_null())
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                // sqlite3's own JSON output can render an integer-valued column as a float
+                // (e.g. "115.0") - rendered here as a human would expect to see it in a text
+                // field ("115"), not with a misleading trailing ".0" that was never actually
+                // typed anywhere.
+                Value::Number(n) => match n.as_i64() {
+                    Some(i) => i.to_string(),
+                    None => match n.as_f64() {
+                        Some(f) if f.fract() == 0.0 => (f as i64).to_string(),
+                        _ => n.to_string(),
+                    },
+                },
+                other => other.to_string(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        if raw.is_empty() {
+            continue;
+        }
+
+        if RAMP_FIELDS.contains(&field) {
+            let mut numeric: Vec<(f64, String)> =
+                raw.iter().filter_map(|s| s.parse::<f64>().ok().map(|n| (n, s.clone()))).collect();
+            numeric.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            numeric.dedup_by(|a, b| a.0 == b.0);
+            if let Some((_, default)) = numeric.first().cloned() {
+                stats.insert(
+                    field.to_string(),
+                    SpellTypeFieldStat { default, options: numeric.into_iter().map(|(_, s)| s).collect() },
+                );
+            }
+        } else {
+            let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for v in &raw {
+                *counts.entry(v.clone()).or_insert(0) += 1;
+            }
+            let mut ordered: Vec<(String, usize)> = counts.into_iter().collect();
+            // Most frequent first; ties broken by the value itself purely for deterministic
+            // output (tests, and a stable dropdown order run to run).
+            ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            if let Some((default, _)) = ordered.first().cloned() {
+                stats.insert(
+                    field.to_string(),
+                    SpellTypeFieldStat { default, options: ordered.into_iter().map(|(s, _)| s).collect() },
+                );
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// Every SpellLine attached to `spec_key` - the source list for the Edit flow's "customize which
 /// lines to include" picker (see `SpellLineSelection`'s own doc comment for why this exists).
 pub fn list_spec_spell_lines(
@@ -3313,6 +3443,98 @@ mod tests {
         .unwrap();
         assert_eq!(int_field(&ownership_rows[0], "SourceSpellID"), 9001);
         assert_eq!(int_field(&ownership_rows[0], "OwningClassId"), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fresh temp DB with just a stat-field-rich `Spell` table - `spell_type_field_stats` only
+    /// ever reads from `Spell`, so this is lighter-weight than `setup_test_db`'s own full schema.
+    fn setup_spell_stats_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("daoc-class-editor-spell-stats-test-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let db = dir.join("data/opendaoc.sqlite3.db");
+        let sql = "
+            CREATE TABLE Spell (SpellID INTEGER, Name TEXT, Type TEXT, Damage REAL, DamageType INTEGER,
+                Value REAL, Range INTEGER, Radius INTEGER, Duration INTEGER, Frequency INTEGER,
+                Power INTEGER, CastTime INTEGER, RecastDelay INTEGER, Icon INTEGER, ClientEffect INTEGER,
+                Target TEXT);
+            INSERT INTO Spell VALUES (1, 'Minor Haste', 'SpeedEnhancement', NULL, NULL, 115, 1500, 0, 600, 0, 0, 2, 0, 400, 400, 'Self');
+            INSERT INTO Spell VALUES (2, 'Haste', 'SpeedEnhancement', NULL, NULL, 125, 1500, 0, 600, 0, 0, 2, 0, 400, 400, 'Self');
+            INSERT INTO Spell VALUES (3, 'Greater Haste', 'SpeedEnhancement', NULL, NULL, 135, 1500, 0, 600, 0, 0, 2, 0, 400, 400, 'Self');
+            INSERT INTO Spell VALUES (4, 'Group Haste', 'SpeedEnhancement', NULL, NULL, 125, 1500, 0, 600, 0, 0, 3, 0, 410, 410, 'Group');
+            INSERT INTO Spell VALUES (5, 'Ancient Spell', 'DirectDamage', 50, 1, NULL, 1500, 0, 0, 0, 0, 2, 0, 100, 100, 'Enemy');
+        ";
+        let status = Command::new("sqlite3")
+            .arg(&db)
+            .arg(sql)
+            .status()
+            .expect("sqlite3 must be on PATH for this test");
+        assert!(status.success());
+        dir
+    }
+
+    #[test]
+    fn spell_type_field_stats_suggests_the_lowest_real_value_for_a_ramp_field() {
+        let dir = setup_spell_stats_db("ramp-field-lowest");
+        let cfg = test_cfg(&dir);
+
+        let stats = spell_type_field_stats(&cfg, "SpeedEnhancement").unwrap();
+        let value_stat = &stats["Value"];
+        assert_eq!(value_stat.default, "115", "{value_stat:?}");
+        assert_eq!(value_stat.options, vec!["115", "125", "135"], "ascending and deduped");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spell_type_field_stats_suggests_the_most_common_real_value_for_a_categorical_field() {
+        let dir = setup_spell_stats_db("categorical-field-mode");
+        let cfg = test_cfg(&dir);
+
+        let stats = spell_type_field_stats(&cfg, "SpeedEnhancement").unwrap();
+        let target_stat = &stats["Target"];
+        assert_eq!(target_stat.default, "Self", "3 of 4 SpeedEnhancement spells target Self");
+        assert_eq!(target_stat.options, vec!["Self", "Group"], "most common first");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spell_type_field_stats_treats_zero_as_a_real_meaningful_value_not_a_placeholder() {
+        let dir = setup_spell_stats_db("zero-is-meaningful");
+        let cfg = test_cfg(&dir);
+
+        let stats = spell_type_field_stats(&cfg, "SpeedEnhancement").unwrap();
+        // Every SpeedEnhancement fixture spell has Radius=0 (single-target, not an AoE) - that's
+        // the real, typical value to suggest, not something to silently discard.
+        assert_eq!(stats["Radius"].default, "0");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spell_type_field_stats_omits_a_field_no_spell_of_this_type_ever_set() {
+        let dir = setup_spell_stats_db("omits-unset-field");
+        let cfg = test_cfg(&dir);
+
+        // The only DirectDamage fixture spell has Value=NULL (damage spells don't use Value the
+        // way a buff does) - Damage is the real stat-worthy field there, Value has nothing to
+        // suggest at all and must be omitted entirely, not default to some misleading "0".
+        let stats = spell_type_field_stats(&cfg, "DirectDamage").unwrap();
+        assert_eq!(stats["Damage"].default, "50");
+        assert!(!stats.contains_key("Value"), "{stats:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spell_type_field_stats_is_empty_for_a_type_with_no_real_spells_at_all() {
+        let dir = setup_spell_stats_db("unknown-type");
+        let cfg = test_cfg(&dir);
+
+        let stats = spell_type_field_stats(&cfg, "SomeTypeNobodyUsesYet").unwrap();
+        assert!(stats.is_empty(), "{stats:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -189,6 +189,14 @@ fn list_line_spells(cfg: SshConfig, line_key: String) -> Result<Vec<LineSpellRow
 }
 
 #[tauri::command]
+fn spell_type_field_stats(
+    cfg: SshConfig,
+    spell_type: String,
+) -> Result<std::collections::HashMap<String, specs::SpellTypeFieldStat>, String> {
+    specs::spell_type_field_stats(&cfg, &spell_type)
+}
+
+#[tauri::command]
 fn apply_class_specs(
     cfg: SshConfig,
     new_class_id: i64,
@@ -459,6 +467,7 @@ pub fn run() {
             list_class_specs,
             list_spec_spell_lines,
             list_line_spells,
+            spell_type_field_stats,
             apply_class_specs,
             start_design_session,
             discard_design_session,

@@ -1,6 +1,14 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ClassSpecSummary, KnownOptions, OwnedSpellInLine, SpellLineGroup, SshConfig, StyleInfo } from "./types";
+import {
+  ClassSpecSummary,
+  KnownOptions,
+  OwnedSpellInLine,
+  SpellLineGroup,
+  SpellTypeFieldStat,
+  SshConfig,
+  StyleInfo,
+} from "./types";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
@@ -325,6 +333,11 @@ function SpellSpecEditor({
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
   const [spellTypes, setSpellTypes] = useState<string[]>([]);
+  // What's typical for whatever Type the spell currently being edited has - refreshed every time
+  // Type changes, so the rest of the form can suggest (and, the first time Type is actually
+  // picked after this field was first offered, auto-fill) values consistent with the rest of the
+  // game instead of whatever a brand-new spell happened to be seeded from.
+  const [typeStats, setTypeStats] = useState<Record<string, SpellTypeFieldStat>>({});
   const busyRef = useRef(false);
 
   useEffect(() => {
@@ -369,6 +382,52 @@ function SpellSpecEditor({
       initial[key] = value === null || value === undefined ? "" : String(value);
     }
     setDraft(initial);
+    // Populated fresh for whatever Type this spell already has, purely so its own stat-worthy
+    // fields have a <datalist> of established values to pick from right away - unlike
+    // onTypeChange below, opening the editor never overwrites anything already on the spell.
+    setTypeStats({});
+    void (async () => {
+      try {
+        setTypeStats(await invoke<Record<string, SpellTypeFieldStat>>("spell_type_field_stats", {
+          cfg: sshConfig,
+          spellType: initial.Type ?? "",
+        }));
+      } catch {
+        setTypeStats({});
+      }
+    })();
+  }
+
+  /** Re-picking a spell's own Type (including re-selecting the Type it already has, e.g. right
+   * after it's seeded from an unrelated template spell - see specs.rs's own
+   * `create_new_spell_spec` doc comment) re-seeds every stat-worthy field (Damage, Value, Range,
+   * Duration, ...) with the *lowest* real value in use for it on a real spell of that Type - the
+   * owner's own explicit preference: "default to the lower end values... and let the user ramp
+   * them up as they add to it", not an average or most-common value that might already be a
+   * mid-to-late-rank number. The three flavor-text fields (Description/Message1/Message2) are
+   * cleared instead of suggested anything - they're spell-specific prose with no "typical value"
+   * at all, and otherwise read as leftover text for whatever unrelated spell they were copied
+   * from (the exact problem reported live). Name is never touched - this never has an opinion
+   * about it either way. */
+  async function onTypeChange(newType: string) {
+    setDraft((prev) => ({ ...prev, Type: newType }));
+    try {
+      const stats = await invoke<Record<string, SpellTypeFieldStat>>("spell_type_field_stats", {
+        cfg: sshConfig,
+        spellType: newType,
+      });
+      setTypeStats(stats);
+      setDraft((prev) => {
+        const next = { ...prev };
+        for (const [field, stat] of Object.entries(stats)) next[field] = stat.default;
+        next.Description = "";
+        next.Message1 = "";
+        next.Message2 = "";
+        return next;
+      });
+    } catch {
+      setTypeStats({});
+    }
   }
 
   async function save(item: OwnedSpellInLine) {
@@ -446,10 +505,7 @@ function SpellSpecEditor({
     if (key === "Type") {
       const current = draft[key] ?? "";
       return (
-        <select
-          value={current}
-          onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-        >
+        <select value={current} onChange={(e) => void onTypeChange(e.target.value)}>
           {current !== "" && !spellTypes.includes(current) && <option value={current}>{current} (unrecognized)</option>}
           {spellTypes.map((t) => (
             <option key={t} value={t}>
@@ -459,11 +515,27 @@ function SpellSpecEditor({
         </select>
       );
     }
+    // A stat-worthy field (see specs.rs's own SPELL_TYPE_STAT_FIELDS) gets a <datalist> of every
+    // real value already in use by some spell of the currently-selected Type - a one-click way to
+    // stay consistent with the rest of the game (e.g. a speed buff's own Value), while direct
+    // entry into the same input still works for a deliberately novel value.
+    const stat = typeStats[key];
+    const listId = stat ? `spell-field-options-${key}` : undefined;
     return (
-      <input
-        value={draft[key] ?? ""}
-        onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-      />
+      <>
+        <input
+          value={draft[key] ?? ""}
+          list={listId}
+          onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+        />
+        {stat && (
+          <datalist id={listId}>
+            {stat.options.map((o) => (
+              <option key={o} value={o} />
+            ))}
+          </datalist>
+        )}
+      </>
     );
   }
 

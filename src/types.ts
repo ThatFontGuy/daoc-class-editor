@@ -154,6 +154,13 @@ export interface SpellLineGroup {
   spells: OwnedSpellInLine[];
 }
 
+// Mirrors specs.rs's SpellTypeFieldStat - one field's own type-appropriate suggestion when a
+// spell's Type is (re)picked in the quick-edit form.
+export interface SpellTypeFieldStat {
+  default: string;
+  options: string[];
+}
+
 // Mirrors specs.rs's ClassSpecSummary - the "Classes" tab's own two summary lists (combat specs
 // vs. spells), before the user picks which one to actually expand and edit.
 export interface ClassSpecSummary {
