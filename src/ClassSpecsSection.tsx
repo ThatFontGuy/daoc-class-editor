@@ -175,6 +175,13 @@ function CombatSpecEditor({
       });
       setStatus(okStatus(result.message));
       setEditingStyleId(null);
+      // load() guards itself with the same busyRef to stop overlapping fetches from repeated
+      // clicks - but that guard still reads true here (set above, not yet reset), so without
+      // this reset load() would see itself as "already busy" and return immediately without
+      // re-fetching anything at all. A real, reported bug this caused live: a successful save
+      // silently left the UI showing stale pre-save data indefinitely, with no actual way to
+      // tell (short of reopening the whole app) that the save had worked at all.
+      busyRef.current = false;
       await load();
     } catch (e) {
       setStatus(errorStatus(`Save failed: ${e}`));
@@ -205,6 +212,7 @@ function CombatSpecEditor({
         newLevel,
       });
       setStatus(okStatus(result));
+      busyRef.current = false; // see the matching comment in save() above
       await load();
     } catch (e) {
       setStatus(errorStatus(`Save failed: ${e}`));
@@ -459,6 +467,13 @@ function SpellSpecEditor({
       });
       setStatus(okStatus(result.message));
       setEditingSpellId(null);
+      // load() guards itself with the same busyRef to stop overlapping fetches from repeated
+      // clicks - but that guard still reads true here (set above, not yet reset), so without
+      // this reset load() would see itself as "already busy" and return immediately without
+      // re-fetching anything at all. A real, reported bug this caused live: a successful save
+      // silently left the UI showing stale pre-save data indefinitely, with no actual way to
+      // tell (short of reopening the whole app) that the save had worked at all.
+      busyRef.current = false;
       await load();
     } catch (e) {
       setStatus(errorStatus(`Save failed: ${e}`));
@@ -487,6 +502,7 @@ function SpellSpecEditor({
         newLevel,
       });
       setStatus(okStatus(result));
+      busyRef.current = false; // see the matching comment in save() above
       await load();
     } catch (e) {
       setStatus(errorStatus(`Save failed: ${e}`));
