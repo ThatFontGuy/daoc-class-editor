@@ -93,7 +93,14 @@ export default function ClassBrowserPanel({ onNavigateToClone }: { onNavigateToC
       );
       return;
     }
-    setProject(buildEditingProjectState(selected, parent));
+    // Preserves classDesignSessions across this switch - buildEditingProjectState otherwise
+    // resets the whole project state wholesale (it spreads emptyProjectState as its own base),
+    // which would silently lose track of any Classes-tab design session still active for *any*
+    // class the moment "Edit class file" is clicked for this one - the actual directory on disk
+    // would still exist, but nothing would know to look for it again (see
+    // ProjectContext.tsx's own classDesignSessions doc comment for the related, already-reported
+    // bug this same class of mistake caused live).
+    setProject((p) => ({ ...buildEditingProjectState(selected, parent), classDesignSessions: p.classDesignSessions }));
     onNavigateToClone();
   }
 

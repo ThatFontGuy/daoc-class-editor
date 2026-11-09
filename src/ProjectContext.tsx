@@ -126,6 +126,20 @@ export interface ProjectState {
    * as they are *now*, not as they were when design first started, is only ever a problem at the
    * final live-apply step - which already always re-reads live at that point regardless). */
   designSessionDir: string;
+  /** This class's own local design session working-copy directory in the Classes tab, keyed by
+   * class ID (see `design_session.rs`'s own module doc comment for the full rationale) - the
+   * Classes tab's version of `designSessionDir` above, lifted up here rather than kept as
+   * `ClassSpecsSection`'s own local component state specifically so it survives switching away to
+   * check something else (the Server connection tab's own Write safety status, say, before
+   * clicking Migrate to live - completely ordinary, expected mid-design behavior) and back, or
+   * switching to look at a different class and back, without silently discarding whatever's been
+   * designed so far. A real, reported bug this fixes: an earlier version discarded a class's own
+   * session the moment its own editor component unmounted at all, on the assumption that only
+   * ever meant "switched to a different class" - but switching tabs entirely (e.g. to the Server
+   * connection tab to check on/trigger a backup before migrating) unmounts the whole Classes tab
+   * too, silently destroying real, already-saved work (nine real, newly designed spells, in the
+   * reported case) the very first time a user did exactly that ordinary thing. */
+  classDesignSessions: Record<number, string>;
   trainer: TrainerState;
 }
 
@@ -142,6 +156,7 @@ export const emptyProjectState: ProjectState = {
   filename: "",
   editingDeployedClassId: null,
   designSessionDir: "",
+  classDesignSessions: {},
   trainer: emptyTrainerState,
 };
 

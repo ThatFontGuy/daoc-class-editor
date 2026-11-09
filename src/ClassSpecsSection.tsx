@@ -11,6 +11,7 @@ import {
   emptySshConfig,
 } from "./types";
 import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
+import { useProject } from "./ProjectContext";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
@@ -947,8 +948,21 @@ export default function ClassSpecsSection({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const busyRef = useRef(false);
 
-  const [sessionDir, setSessionDir] = useState("");
-  const sessionDirRef = useRef("");
+  // This class's own local design session, read/written through the always-mounted project
+  // context (ProjectContext.tsx's own classDesignSessions doc comment has the full rationale) -
+  // *not* kept as this component's own local state. A real, reported bug this fixes: this
+  // component (and the whole rest of the Classes tab around it) unmounts completely the moment
+  // the user switches to a *different top-level tab* (App.tsx only conditionally renders it at
+  // all), which is exactly what checking the Server connection tab's own Write safety status, or
+  // clicking Backup Database, before migrating a finished design requires doing - local-only
+  // state here would have been wiped by that totally ordinary action alone, with no way at all to
+  // get back to it. Reading the project's own current value directly (not into a `useState`) so
+  // switching classes or tabs and back always reflects whatever is actually still active right
+  // now, never a stale snapshot from whenever this component instance first mounted.
+  const [project, setProject] = useProject();
+  const sessionDir = project.classDesignSessions[classId] ?? "";
+  const sessionDirRef = useRef(sessionDir);
+  sessionDirRef.current = sessionDir;
   const [migrateStatus, setMigrateStatus] = useState<StatusState>(emptyStatus);
   const [migrating, setMigrating] = useState(false);
 
@@ -974,32 +988,35 @@ export default function ClassSpecsSection({
     if (sessionDirRef.current) return sessionCfg(sessionDirRef.current);
     const session = await invoke<SshConfig>("start_design_session", { cfg: sshConfig });
     sessionDirRef.current = session.remote_server_dir;
-    setSessionDir(session.remote_server_dir);
+    setProject((p) => ({
+      ...p,
+      classDesignSessions: { ...p.classDesignSessions, [classId]: session.remote_server_dir },
+    }));
     return session;
   }
+  /** Explicit only - never called automatically on unmount (see this component's own session
+   * fields' doc comment for exactly why that was a real, reported bug: an earlier version of
+   * this discarded a session the instant its own editor component unmounted at all, which
+   * includes every totally ordinary reason that can happen, not just "switched to a different
+   * class"). Called only from the "Discard design" button itself, and from migrateToLive once
+   * everything in it has actually been migrated. */
   async function discardDesignSession() {
     const dir = sessionDirRef.current;
     if (!dir) return;
     sessionDirRef.current = "";
-    setSessionDir("");
+    setProject((p) => {
+      const next = { ...p.classDesignSessions };
+      delete next[classId];
+      return { ...p, classDesignSessions: next };
+    });
     try {
       await invoke("discard_design_session", { sessionCfg: sessionCfg(dir) });
     } catch {
       // Best-effort cleanup only - an orphaned session directory left on disk is harmless (it's
-      // never reused once sessionDirRef is cleared), not worth surfacing as an error over.
+      // never reused once classDesignSessions no longer references it), not worth surfacing as
+      // an error over.
     }
   }
-  // Discards this class's own session if the user navigates to a different class (or away from
-  // this panel entirely) with one still open and never explicitly migrated or discarded it -
-  // ClassBrowserPanel gives this component a fresh `key` per class, so switching classes
-  // unmounts this exact instance, firing this cleanup, rather than silently leaking the session
-  // or (worse) having a later, unrelated class's edits accidentally still land in it.
-  useEffect(() => {
-    return () => {
-      void discardDesignSession();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   useEffect(() => {
     load();
@@ -1086,9 +1103,7 @@ export default function ClassSpecsSection({
         liveCfg: sshConfig,
         classId,
       });
-      sessionDirRef.current = "";
-      setSessionDir("");
-      await invoke("discard_design_session", { sessionCfg: sessionCfg(dir) }).catch(() => {});
+      await discardDesignSession();
       setMigrateStatus(okStatus(result));
       await load();
     } catch (e) {
