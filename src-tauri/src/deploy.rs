@@ -115,7 +115,16 @@ pub(crate) fn ssh_base_scp_args(cfg: &SshConfig) -> Vec<String> {
 }
 
 pub(crate) fn run_command(mut cmd: Command) -> Result<String, String> {
-    let output = cmd.output().map_err(|e| format!("failed to run: {e}"))?;
+    // Includes the exact program path/name this `Command` was actually built with (not just the
+    // bare OS error) - a real, found gap debugging live: "failed to run: No such file or
+    // directory (os error 2)" alone gives no way at all to tell *which* of several possible
+    // external programs (sqlite3/ssh/scp, each spawned from several different call sites) this
+    // even came from, let alone whether it was really an unresolvable bare name or something
+    // else entirely producing the identical OS error (e.g. `current_dir` itself not existing).
+    let program = cmd.get_program().to_string_lossy().to_string();
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run '{program}': {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if output.status.success() {
