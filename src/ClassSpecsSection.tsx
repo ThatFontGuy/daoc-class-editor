@@ -28,6 +28,17 @@ import { useProject } from "./ProjectContext";
 // actually apply the spell's effect - everything else here (Value, Duration, Range, ...) is just
 // a parameter fed into whatever handler Type selects. ClientEffect/Icon, by contrast, are purely
 // cosmetic - they only pick what the client shows, never anything about what the spell does.
+//
+// "Pulse" (not editable here until a real, reported gap: Frequency alone, with no way to set
+// Pulse itself, left no way at all to actually turn a spell into a maintained/channeled one at
+// all - confirmed live against SpeedEnhancementSpellHandler.cs's own source: Frequency is never
+// even read unless Pulse != 0, so a one-shot spell's own Duration already fully controls how
+// long it lasts in seconds on its own, with nothing else needed) flips a spell between a plain
+// one-shot effect (Pulse = 0, Duration alone = how many seconds it lasts once cast) and a
+// maintained/channeled one (Pulse != 0, re-applying - and re-charging PulsePower - every
+// Frequency tenths-of-a-second for as long as it's kept running, e.g. a Minstrel song: dropping
+// immediately on interrupt/movement/combat). PulsePower is the power cost charged per pulse -
+// meaningless for a one-shot spell, since Pulse = 0 means it never pulses at all.
 const EDITABLE_SPELL_FIELD_HINTS = [
   "Name",
   "Type",
@@ -40,7 +51,9 @@ const EDITABLE_SPELL_FIELD_HINTS = [
   "Range",
   "Radius",
   "Duration",
+  "Pulse",
   "Frequency",
+  "PulsePower",
   "Power",
   "CastTime",
   "RecastDelay",

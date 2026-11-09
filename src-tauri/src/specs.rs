@@ -799,7 +799,9 @@ const SPELL_TYPE_STAT_FIELDS: &[&str] = &[
     "Range",
     "Radius",
     "Duration",
+    "Pulse",
     "Frequency",
+    "PulsePower",
     "Power",
     "CastTime",
     "RecastDelay",
@@ -813,8 +815,11 @@ const SPELL_TYPE_STAT_FIELDS: &[&str] = &[
 /// own explicit preference: a brand-new spell should default to the *lowest* real value in use
 /// for its Type - "let the user ramp them up as they add to it" themselves - not an average or
 /// most-common value that might already be a mid-to-late-rank number. Every other stat field
-/// (DamageType/Icon/ClientEffect/Target) is categorical, not a magnitude - "low" has no real
-/// meaning there, so the most *common* real value is suggested instead.
+/// (DamageType/Pulse/Icon/ClientEffect/Target) is categorical, not a magnitude - "low" has no
+/// real meaning there, so the most *common* real value is suggested instead. `PulsePower`
+/// behaves like `Power` itself (a cost that scales up with rank) wherever it's actually used at
+/// all - meaningless on a spell with `Pulse = 0` (never pulses, so nothing to charge per pulse),
+/// but still worth ramping like `Power` on one that does.
 const RAMP_FIELDS: &[&str] = &[
     "Damage",
     "Value",
@@ -822,6 +827,7 @@ const RAMP_FIELDS: &[&str] = &[
     "Radius",
     "Duration",
     "Frequency",
+    "PulsePower",
     "Power",
     "CastTime",
     "RecastDelay",
@@ -849,11 +855,31 @@ pub fn spell_type_field_stats(
     spell_type: &str,
 ) -> Result<std::collections::HashMap<String, SpellTypeFieldStat>, String> {
     let type_q = sql_quote(spell_type);
-    let cols = SPELL_TYPE_STAT_FIELDS.join(", ");
+    // Only queries whichever of SPELL_TYPE_STAT_FIELDS actually exist as real columns on this
+    // server fork's own Spell table, rather than assuming every one of them always does - a
+    // real, found gap: adding a field here that any fork's schema happens to be missing (Pulse/
+    // PulsePower, confirmed live) broke this whole feature outright with a raw SQL error
+    // ("no such column"), for every Type, not just the one a spell with that gap belonged to.
+    // Resolved once per call (not hardcoded) the same "rediscover the real schema, don't assume
+    // it" way `columns_excluding_pk` already does for cloning.
+    let real_columns: std::collections::HashSet<String> =
+        run_remote_sql_json(cfg, "PRAGMA table_info(Spell);")?
+            .iter()
+            .map(|r| str_field(r, "name"))
+            .collect();
+    let fields: Vec<&str> = SPELL_TYPE_STAT_FIELDS
+        .iter()
+        .copied()
+        .filter(|f| real_columns.contains(*f))
+        .collect();
+    if fields.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let cols = fields.join(", ");
     let rows = run_remote_sql_json(cfg, &format!("SELECT {cols} FROM Spell WHERE Type = '{type_q}';"))?;
 
     let mut stats = std::collections::HashMap::new();
-    for &field in SPELL_TYPE_STAT_FIELDS {
+    for &field in &fields {
         // Every real value this field actually has across every spell of this Type - null (the
         // column genuinely unset) is the only thing skipped; zero is a real, meaningful value in
         // its own right for several of these fields (e.g. CastTime=0 is "instant cast", a common
@@ -3812,6 +3838,26 @@ mod tests {
 
         let stats = spell_type_field_stats(&cfg, "SomeTypeNobodyUsesYet").unwrap();
         assert!(stats.is_empty(), "{stats:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spell_type_field_stats_still_works_when_this_forks_spell_table_is_missing_a_listed_column() {
+        // A real, found bug: this used to build one SQL query listing every SPELL_TYPE_STAT_FIELDS
+        // column unconditionally - a server fork's own Spell table missing even one of them (this
+        // project's own fixture schema was itself missing Pulse/PulsePower the moment those were
+        // added to the list) broke this whole feature outright with a raw "no such column" SQL
+        // error, for every Type, not just the one actually missing something. Must instead just
+        // quietly suggest nothing for whichever listed field(s) this fork's own schema doesn't
+        // have at all, while still correctly suggesting everything it does.
+        let dir = setup_spell_stats_db("missing-column");
+        let cfg = test_cfg(&dir);
+
+        let stats = spell_type_field_stats(&cfg, "SpeedEnhancement").unwrap();
+        assert!(!stats.contains_key("Pulse"), "{stats:?}");
+        assert!(!stats.contains_key("PulsePower"), "{stats:?}");
+        assert_eq!(stats["Value"].default, "115", "every other real column must still work fine");
 
         std::fs::remove_dir_all(&dir).ok();
     }
