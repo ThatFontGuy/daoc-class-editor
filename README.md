@@ -208,6 +208,13 @@ deployment path was confirmed against a real running server after an early mix-u
      server's folder as a local path - no SSH at all, direct filesystem/process access.
    - **If the server runs elsewhere**, fill in Host/user/port/identity file too - this reuses
      your existing SSH keys/agent, nothing is sent anywhere except directly to your own server.
+     **Before using the app, manually `ssh user@host` from a real terminal at least once and
+     confirm it connects with no prompts at all** - every connection the app itself makes disables
+     interactive prompting entirely (so it can run unattended), which means it can't accept an
+     unrecognized host key *or* a password on your behalf the way a real terminal session can. A
+     successful manual connection first is what actually sets both of those up (adds the host to
+     your own `known_hosts`, confirms your key-based auth already works) - after that, the app
+     really does just work from then on, no further setup needed.
    - Either way, also set the start/stop script's filename (`daoc-server.sh` by default, but may
      be renamed).
 4. In **Classes**: pick any class, by realm, to see its details and its own spells. Click
