@@ -953,7 +953,17 @@ export default function ClassSpecsSection({
   const [migrating, setMigrating] = useState(false);
 
   function sessionCfg(dir: string): SshConfig {
-    return { ...emptySshConfig, remote_server_dir: dir };
+    // start_script_name must stay blank - this is the exact signal ensure_safe_to_write's own
+    // design-session exception (see deploy.rs's own doc comment) relies on to recognize a
+    // disposable local scratch copy and skip the real server-running/backup checks entirely
+    // (there is nothing to start/stop in a bare snapshot directory). Spreading emptySshConfig
+    // instead of hardcoding this was a real, reported bug: emptySshConfig's own start_script_name
+    // defaults to "daoc-server.sh" (a sensible default for a *blank form*, not a design session),
+    // so every call here after the very first (which got the real session object straight back
+    // from start_design_session) silently reconstructed the wrong config - triggering the real
+    // ensure_safe_to_write checks against a directory with no such script in it at all, and
+    // failing outright with a raw "No such file or directory".
+    return { ...emptySshConfig, remote_server_dir: dir, start_script_name: "" };
   }
   /** Read with right now, without ever starting a new session on its own - see
    * `CombatSpecEditor`'s own `currentCfg` prop doc comment for why that distinction matters. */

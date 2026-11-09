@@ -38,9 +38,27 @@ use uuid::Uuid;
 /// Every design session's own local working copy lives under here, one subdirectory per
 /// session (named by a fresh UUID) - never the user's own config/data, so wiping this whole tree
 /// is always safe if something is ever left behind by a session that was never cleanly ended.
-fn sessions_root() -> PathBuf {
+pub(crate) fn sessions_root() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(std::env::temp_dir);
     base.join("daoc-class-editor").join("design-sessions")
+}
+
+/// True if `dir` is itself under `sessions_root()` - a second, path-based signal
+/// `ensure_safe_to_write`'s own design-session exception checks alongside a blank
+/// `start_script_name`, independent of whatever fields a caller's own reconstructed `SshConfig`
+/// happens to carry. A real, found bug this guards against recurring: a frontend helper that
+/// rebuilds a session's own config from a dir string (rather than reusing the exact object
+/// `start_design_session` itself returned) can accidentally reintroduce a real `start_script_name`
+/// - this check stays correct even then, since it's based on the one thing a session's own
+/// directory can never *not* be true of: living under this module's own disposable scratch root.
+pub(crate) fn is_design_session_dir(dir: &Path) -> bool {
+    match dir.canonicalize() {
+        Ok(canonical) => canonical.starts_with(sessions_root()),
+        // A session whose directory no longer exists at all (already discarded, or never
+        // actually created) is never "a real server" either way - treat it the same as if it
+        // were still there rather than erring on canonicalize's own failure.
+        Err(_) => dir.starts_with(sessions_root()),
+    }
 }
 
 /// Starts a brand-new local design session - see this module's own doc comment for the full

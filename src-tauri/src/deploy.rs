@@ -495,25 +495,36 @@ fn format_age(seconds: i64) -> String {
 ///
 /// The one deliberate exception: a local design session's own disposable scratch copy (see
 /// `design_session.rs`'s own module doc comment) is never a real server at all - a real genuine
-/// scheme of this tool's safety checks is to be careful of a *live* server. `start_design_session`
-/// always leaves `start_script_name` blank for one (there's nothing to start/stop in a bare
-/// snapshot directory), the one signal that unambiguously distinguishes it from every real
-/// server config (local or remote), which always needs a real script name for the Server
-/// connection tab's own Start/Stop buttons to do anything useful at all. A real, found bug:
-/// without this exception, every command gated by this check (field edits, Add spell/style, spec
-/// creation, `apply_class_specs`) unconditionally still called `is_server_running`/
-/// `backup_status` even when handed a session's own config - which, for a bare scratch directory
-/// with no real management script and no sibling backup file at all, doesn't cleanly return
-/// "not running"/"no backup" as might be hoped, but instead fails outright (confirmed: attempting
-/// to execute `remote_server_dir` itself, since `start_script_name` joins onto it as the empty
-/// string, raised a raw OS "Permission denied" trying to run a directory as a program) - silently
-/// breaking every write a local design session was ever supposed to make possible in the first
-/// place, including the Clone Wizard's own already-shipped one. A session's own snapshot is
-/// always safe to write to directly regardless: it's a private, single-writer scratch copy
-/// nothing else on the whole machine even knows exists, with no live server that could ever hold
-/// it open at all.
+/// scheme of this tool's safety checks is to be careful of a *live* server. Recognized two ways,
+/// either sufficient on its own: `start_design_session` always leaves `start_script_name` blank
+/// for one (there's nothing to start/stop in a bare snapshot directory - no real server config
+/// ever needs one blank, since the Server connection tab's own Start/Stop buttons would otherwise
+/// do nothing useful at all), and/or its own directory lives under `design_session::sessions_root`
+/// - a frontend helper that reconstructs a session's own config from just its directory (rather
+/// than reusing the exact object `start_design_session` itself returned) can otherwise
+/// accidentally drop the blank `start_script_name` back to some real default - a real, reported
+/// bug this exact scenario caused live - so this check stays correct even then, independent of
+/// whatever fields a caller's own reconstructed config happens to carry.
+///
+/// A real, found bug fixed by adding this exception at all: without it, every command gated by
+/// this check (field edits, Add spell/style, spec creation, `apply_class_specs`) unconditionally
+/// still called `is_server_running`/`backup_status` even when handed a session's own config -
+/// which, for a bare scratch directory with no real management script and no sibling backup file
+/// at all, doesn't cleanly return "not running"/"no backup" as might be hoped, but instead fails
+/// outright (confirmed live, twice, in two different ways: attempting to execute
+/// `remote_server_dir` itself when `start_script_name` was truly blank raised a raw OS
+/// "Permission denied"; attempting to execute `<dir>/daoc-server.sh` when a reconstructed config
+/// wrongly un-blanked `start_script_name` raised "No such file or directory", since no such
+/// script exists in a bare snapshot directory) - silently breaking every write a local design
+/// session was ever supposed to make possible in the first place, including the Clone Wizard's
+/// own already-shipped one. A session's own snapshot is always safe to write to directly
+/// regardless: it's a private, single-writer scratch copy nothing else on the whole machine even
+/// knows exists, with no live server that could ever hold it open at all.
 pub fn ensure_safe_to_write(cfg: &SshConfig) -> Result<(), String> {
-    if is_local(cfg) && cfg.start_script_name.trim().is_empty() {
+    if is_local(cfg)
+        && (cfg.start_script_name.trim().is_empty()
+            || crate::design_session::is_design_session_dir(Path::new(&cfg.remote_server_dir)))
+    {
         return Ok(());
     }
     if is_server_running(cfg)? {
@@ -873,6 +884,34 @@ mod tests {
         let real_local_cfg = cfg("", dir.to_str().unwrap());
         assert!(ensure_safe_to_write(&real_local_cfg).is_err());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_safe_to_write_still_allows_a_session_even_if_its_own_config_was_wrongly_reconstructed_with_a_real_script_name() {
+        // Reproduces a real bug found live: a frontend helper reconstructing a session's own
+        // config from just its directory (rather than reusing the exact object
+        // start_design_session itself returned) spread a *different* default config object
+        // first, silently un-blanking start_script_name back to a real script name on every call
+        // after the first - ensure_safe_to_write's start_script_name-only check alone would have
+        // missed this entirely (it isn't blank anymore), proceeding into the real checks against
+        // a directory with no such script in it at all and failing with a raw "No such file or
+        // directory". The *directory itself* living under sessions_root() must still be enough
+        // on its own, independent of whatever start_script_name a caller's own reconstructed
+        // config happens to carry.
+        let dir = std::env::temp_dir().join("daoc-class-editor-session-safety-reconstructed-cfg-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let live_cfg = cfg("", dir.to_str().unwrap());
+        let real_session = crate::design_session::start_design_session(&live_cfg).unwrap();
+
+        let wrongly_reconstructed = SshConfig {
+            start_script_name: "daoc-server.sh".to_string(),
+            ..real_session.clone()
+        };
+        assert!(ensure_safe_to_write(&wrongly_reconstructed).is_ok());
+
+        crate::design_session::discard_design_session(&real_session).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
