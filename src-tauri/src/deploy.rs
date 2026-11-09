@@ -114,17 +114,50 @@ pub(crate) fn ssh_base_scp_args(cfg: &SshConfig) -> Vec<String> {
     args
 }
 
+/// Renders `cmd`'s own program and every argument as one readable, copy-pasteable line - used
+/// to surface exactly what `run_command` actually tried to run (including, for any of this
+/// project's own SQL-executing commands, the exact SQL text itself, always passed as a literal
+/// argument whether to `sqlite3` directly or embedded in the remote shell string handed to `ssh`)
+/// whenever something about it goes wrong, rather than leaving a bare OS/exit-code error with no
+/// way at all to tell *which* of several possible call sites, programs, or queries it actually
+/// came from. Arguments are single-quoted only when they contain whitespace (never full shell-
+/// escaped) - this is for a human reading an error message, never re-executed as a real command.
+/// Capped at a generous length so one of this project's own largest batched SQL scripts (e.g.
+/// `clone_spec`'s own whole-spec clone) doesn't balloon an error message without bound.
+fn format_command_line(cmd: &Command) -> String {
+    let mut line = cmd.get_program().to_string_lossy().to_string();
+    for arg in cmd.get_args() {
+        let arg = arg.to_string_lossy();
+        line.push(' ');
+        if arg.is_empty() || arg.contains(char::is_whitespace) {
+            line.push('\'');
+            line.push_str(&arg);
+            line.push('\'');
+        } else {
+            line.push_str(&arg);
+        }
+    }
+    const MAX_LEN: usize = 4000;
+    if line.len() > MAX_LEN {
+        line.truncate(MAX_LEN);
+        line.push_str("... (truncated)");
+    }
+    line
+}
+
 pub(crate) fn run_command(mut cmd: Command) -> Result<String, String> {
-    // Includes the exact program path/name this `Command` was actually built with (not just the
-    // bare OS error) - a real, found gap debugging live: "failed to run: No such file or
-    // directory (os error 2)" alone gives no way at all to tell *which* of several possible
-    // external programs (sqlite3/ssh/scp, each spawned from several different call sites) this
-    // even came from, let alone whether it was really an unresolvable bare name or something
-    // else entirely producing the identical OS error (e.g. `current_dir` itself not existing).
-    let program = cmd.get_program().to_string_lossy().to_string();
+    // Includes the exact command (program, every argument, and - for any of this project's own
+    // SQL-executing commands - the exact SQL text itself) this `Command` was actually built with,
+    // on *any* failure, not just the bare OS error or exit code alone - a real, found gap
+    // debugging live: "failed to run: No such file or directory (os error 2)" by itself gave no
+    // way at all to tell *which* of several possible external programs (sqlite3/ssh/scp, each
+    // spawned from several different call sites, several different SQL statements) this even
+    // came from, let alone whether it was really an unresolvable bare name or something else
+    // entirely producing the identical OS error (e.g. `current_dir` itself not existing).
+    let command_line = format_command_line(&cmd);
     let output = cmd
         .output()
-        .map_err(|e| format!("failed to run '{program}': {e}"))?;
+        .map_err(|e| format!("failed to run: {e}\ncommand: {command_line}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if output.status.success() {
@@ -134,11 +167,14 @@ pub(crate) fn run_command(mut cmd: Command) -> Result<String, String> {
             stdout
         })
     } else {
-        Err(if stderr.trim().is_empty() {
-            format!("command failed (exit {:?}): {stdout}", output.status.code())
-        } else {
-            stderr
-        })
+        Err(format!(
+            "{}\ncommand: {command_line}",
+            if stderr.trim().is_empty() {
+                format!("command failed (exit {:?}): {stdout}", output.status.code())
+            } else {
+                stderr
+            }
+        ))
     }
 }
 
@@ -587,6 +623,28 @@ mod tests {
     #[test]
     fn resolve_executable_falls_back_to_the_bare_name_for_anything_unrecognized() {
         assert_eq!(resolve_executable("some-binary-that-will-never-exist-anywhere"), "some-binary-that-will-never-exist-anywhere");
+    }
+
+    #[test]
+    fn format_command_line_renders_every_argument_quoting_only_ones_with_whitespace() {
+        let mut cmd = Command::new("sqlite3");
+        cmd.arg("-json")
+            .arg("/path/to/opendaoc.sqlite3.db")
+            .arg("SELECT * FROM Spell WHERE SpellID = 9001;");
+        let line = format_command_line(&cmd);
+        assert_eq!(
+            line,
+            "sqlite3 -json /path/to/opendaoc.sqlite3.db 'SELECT * FROM Spell WHERE SpellID = 9001;'"
+        );
+    }
+
+    #[test]
+    fn format_command_line_truncates_an_unreasonably_long_command() {
+        let mut cmd = Command::new("sqlite3");
+        cmd.arg("x".repeat(5000));
+        let line = format_command_line(&cmd);
+        assert!(line.len() < 4100, "{}", line.len());
+        assert!(line.ends_with("... (truncated)"));
     }
 
     #[test]
