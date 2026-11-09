@@ -418,11 +418,18 @@ function SpellSpecEditor({
   ensureCfg,
   classId,
   specKey,
+  onSpecRenamed,
 }: {
   currentCfg: () => SshConfig;
   ensureCfg: () => Promise<SshConfig>;
   classId: number;
   specKey: string;
+  /** Called after a spell-line rename that also renamed its owning spec (see rename_spell_line's
+   * own doc comment for when that happens) - lets the parent's own "Spells" summary list (a
+   * separate fetch, this component's own internal load() never touches it) refresh too, so a
+   * spec's own just-renamed display Name shows correctly there without having to collapse and
+   * re-expand it first. */
+  onSpecRenamed: () => void;
 }) {
   const [groups, setGroups] = useState<SpellLineGroup[] | null>(null);
   const [editingSpellId, setEditingSpellId] = useState<number | null>(null);
@@ -688,6 +695,7 @@ function SpellSpecEditor({
       setStatus(okStatus(result));
       busyRef.current = false; // see the matching comment in save() above
       await load();
+      onSpecRenamed();
     } catch (e) {
       setStatus(errorStatus(`Rename failed: ${e}`));
     } finally {
@@ -1277,7 +1285,7 @@ export default function ClassSpecsSection({
                   onToggle={() => toggle(s.key_name)}
                   busy={busy}
                 >
-                  <SpellSpecEditor currentCfg={currentCfg} ensureCfg={ensureCfg} classId={classId} specKey={s.key_name} />
+                  <SpellSpecEditor currentCfg={currentCfg} ensureCfg={ensureCfg} classId={classId} specKey={s.key_name} onSpecRenamed={load} />
                 </SpecSummaryRow>
               ))}
             </tbody>

@@ -820,6 +820,27 @@ pub fn rename_spell_line(
         cfg,
         &format!("UPDATE SpellLine SET Name = '{name_q}' WHERE KeyName = '{owned_line_key_q}';"),
     )?;
+
+    // When this spec has exactly one spell line - the common case, and the only shape
+    // create_new_spell_spec itself ever produces - its own display Name (shown in the "Spells"
+    // summary list before a spec is even expanded) and this, its one line's own Name, are meant
+    // to stay in sync: confirmed by create_new_spell_spec seeding both identically to start with.
+    // A real, reported gap this fixes: renaming only the line left the owning spec's own Name
+    // silently stuck at whatever it started as, with no way to tell from the summary list alone
+    // that anything had even been renamed at all. A spec with several lines under it (e.g.
+    // Smite's own baseline plus spec-gated lines) has no such unambiguous "same name" assumption
+    // - only the one line actually being renamed is ever touched there, never silently renaming
+    // the whole spec's own name along with just one of several lines under it.
+    let owned_spec_key_q = sql_quote(&owned_spec_key);
+    let sibling_lines =
+        run_remote_sql_json(cfg, &format!("SELECT 1 FROM SpellLine WHERE Spec = '{owned_spec_key_q}';"))?;
+    if sibling_lines.len() == 1 {
+        run_remote_sql(
+            cfg,
+            &format!("UPDATE Specialization SET Name = '{name_q}' WHERE KeyName = '{owned_spec_key_q}';"),
+        )?;
+    }
+
     Ok(format!("renamed to \"{trimmed}\""))
 }
 
@@ -3801,6 +3822,34 @@ mod tests {
 
         let rows = run_remote_sql_json(&cfg, "SELECT Name FROM SpellLine WHERE KeyName = 'earthshatter_2_line';").unwrap();
         assert_eq!(str_field(&rows[0], "Name"), "Ground Fury");
+
+        // This spec has exactly one spell line (the only shape create_new_spell_spec itself ever
+        // produces) - its own display Name (shown in the "Spells" summary list before it's even
+        // expanded) must stay in sync with the rename, not silently stuck at "Earthshatter".
+        let spec_rows = run_remote_sql_json(&cfg, "SELECT Name FROM Specialization WHERE KeyName = 'earthshatter_2';").unwrap();
+        assert_eq!(str_field(&spec_rows[0], "Name"), "Ground Fury");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_spell_line_leaves_the_owning_specs_own_name_alone_when_it_has_several_lines() {
+        let dir = setup_test_db("rename-line-multi");
+        let cfg = test_cfg(&dir);
+
+        // "smite" already has one real line (smite_base); add a second so this spec genuinely
+        // has several - renaming either one must never touch the spec's own Name, since there's
+        // no single unambiguous "same name" to sync it to anymore.
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO SpellLine VALUES ('smite_extra', 'Smite Add-on', 'smite', 0, 1);",
+        )
+        .unwrap();
+
+        rename_spell_line(&cfg, 1, "smite", "smite_base", "Holy Fury").unwrap();
+
+        let spec_rows = run_remote_sql_json(&cfg, "SELECT Name FROM Specialization WHERE KeyName = 'smite_1';").unwrap();
+        assert_eq!(str_field(&spec_rows[0], "Name"), "Smite", "unchanged - this spec has several lines, not just the one renamed");
 
         std::fs::remove_dir_all(&dir).ok();
     }
