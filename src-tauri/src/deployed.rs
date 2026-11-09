@@ -10,8 +10,8 @@
 
 use crate::classdata::ClassInfo;
 use crate::deploy::{
-    SshConfig, is_local, run_command, run_remote_sql, run_remote_sql_json, scripts_dir,
-    ssh_base_args,
+    SshConfig, is_local, resolve_executable, run_command, run_remote_sql, run_remote_sql_json,
+    scripts_dir, ssh_base_args,
 };
 use crate::spell_ownership::{delete_owned_spells, delete_style_procs_for_styles};
 use serde_json::Value;
@@ -46,7 +46,7 @@ fn read_script_files(cfg: &SshConfig) -> Result<Vec<(String, String)>, String> {
         "cd '{}/bin/scripts' 2>/dev/null && for f in *.cs; do [ -f \"$f\" ] || continue; echo '{MARKER}'\"$f\"; cat \"$f\"; done",
         shell_escape(&cfg.remote_server_dir)
     );
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(resolve_executable("ssh"));
     cmd.args(ssh_base_args(cfg))
         .arg(format!("{}@{}", cfg.user, cfg.host))
         .arg(remote_cmd);
@@ -196,7 +196,7 @@ pub fn delete_deployed_class(
         std::fs::remove_file(&script_path)
             .map_err(|e| format!("could not remove {}: {e}", script_path.display()))?;
     } else {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new(resolve_executable("ssh"));
         cmd.args(ssh_base_args(cfg))
             .arg(format!("{}@{}", cfg.user, cfg.host))
             .arg(format!(

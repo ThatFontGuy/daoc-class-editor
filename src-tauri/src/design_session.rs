@@ -28,7 +28,9 @@
 //! actually deploying still goes through `ensure_safe_to_write` exactly as before, just now only
 //! at that one final moment instead of for the whole design process.
 
-use crate::deploy::{SshConfig, is_local, run_command, run_remote_sql, ssh_base_args, ssh_base_scp_args};
+use crate::deploy::{
+    SshConfig, is_local, resolve_executable, run_command, run_remote_sql, ssh_base_args, ssh_base_scp_args,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
@@ -54,7 +56,7 @@ pub fn start_design_session(cfg: &SshConfig) -> Result<SshConfig, String> {
 
     let snapshot_result = if is_local(cfg) {
         let live_db = Path::new(&cfg.remote_server_dir).join("data/opendaoc.sqlite3.db");
-        let mut backup_cmd = Command::new("sqlite3");
+        let mut backup_cmd = Command::new(resolve_executable("sqlite3"));
         backup_cmd
             .arg(&live_db)
             .arg(format!(".backup '{}'", local_db.to_string_lossy()));
@@ -86,14 +88,14 @@ fn snapshot_remote_db(cfg: &SshConfig, local_db: &Path) -> Result<(), String> {
     let remote_tmp = format!("/tmp/daoc-class-editor-design-{}.db", Uuid::new_v4());
     let backup_result = run_remote_sql(cfg, &format!(".backup {remote_tmp}"));
     let scp_result = backup_result.and_then(|_| {
-        let mut cmd = Command::new("scp");
+        let mut cmd = Command::new(resolve_executable("scp"));
         cmd.args(ssh_base_scp_args(cfg));
         cmd.arg(format!("{}@{}:{}", cfg.user, cfg.host, remote_tmp));
         cmd.arg(local_db);
         run_command(cmd)
     });
 
-    let mut cleanup = Command::new("ssh");
+    let mut cleanup = Command::new(resolve_executable("ssh"));
     cleanup
         .args(ssh_base_args(cfg))
         .arg(format!("{}@{}", cfg.user, cfg.host))

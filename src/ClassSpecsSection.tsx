@@ -169,7 +169,18 @@ function CombatSpecEditor({
       const wasNumber = typeof originalValue === "number";
       fields[key] = wasNumber && value.trim() !== "" && !Number.isNaN(Number(value)) ? Number(value) : value;
     }
-    if (Object.keys(fields).length === 0) {
+    // See the matching comment in SpellSpecEditor's own save() - this editor's Save button
+    // covers a pending level change too while it's open, so there's no separate, easy-to-miss
+    // second Save button right next to the Level input to remember to click too.
+    const currentLevel = String(s.fields.SpecLevelRequirement ?? 0);
+    const levelDraftValue = levelDrafts[s.style_id];
+    const levelChanged = levelDraftValue !== undefined && levelDraftValue !== currentLevel;
+    const newLevel = levelChanged ? Number(levelDraftValue) : null;
+    if (levelChanged && (levelDraftValue.trim() === "" || Number.isNaN(newLevel))) {
+      setStatus(errorStatus("Level must be a number."));
+      return;
+    }
+    if (Object.keys(fields).length === 0 && !levelChanged) {
       setStatus(okStatus("Nothing changed."));
       setEditingStyleId(null);
       return;
@@ -179,14 +190,28 @@ function CombatSpecEditor({
     setStatus(okStatus(s.is_owned ? "Saving..." : "Cloning/granting this style for this class, then saving..."));
     try {
       const cfg = await ensureCfg();
-      const result = await invoke<{ style_id: number; message: string }>("save_style_fields", {
-        cfg,
-        classId,
-        specKey,
-        styleId: s.style_id,
-        fields,
-      });
-      setStatus(okStatus(result.message));
+      const messages: string[] = [];
+      if (Object.keys(fields).length > 0) {
+        const result = await invoke<{ style_id: number; message: string }>("save_style_fields", {
+          cfg,
+          classId,
+          specKey,
+          styleId: s.style_id,
+          fields,
+        });
+        messages.push(result.message);
+      }
+      if (levelChanged) {
+        const result = await invoke<string>("update_style_level", {
+          cfg,
+          classId,
+          specKey,
+          styleId: s.style_id,
+          newLevel,
+        });
+        messages.push(result);
+      }
+      setStatus(okStatus(messages.join(" ")));
       setEditingStyleId(null);
       // load() guards itself with the same busyRef to stop overlapping fetches from repeated
       // clicks - but that guard still reads true here (set above, not yet reset), so without
@@ -308,7 +333,7 @@ function CombatSpecEditor({
                         style={{ width: "4em" }}
                         disabled={busy}
                       />{" "}
-                      {levelChanged && (
+                      {levelChanged && !isEditingField && (
                         <button onClick={() => saveLevel(s)} disabled={busy}>
                           Save
                         </button>
@@ -500,7 +525,21 @@ function SpellSpecEditor({
       const wasNumber = typeof originalValue === "number";
       fields[key] = wasNumber && value.trim() !== "" && !Number.isNaN(Number(value)) ? Number(value) : value;
     }
-    if (Object.keys(fields).length === 0) {
+    // The level field editor's own Save button covers *everything* about this row at once while
+    // it's open, including a pending level change - there's no separate, easy-to-miss second
+    // Save button right next to the Level input to remember to click too (a real, reported
+    // point of confusion: a brand-new spell's row opens pre-expanded for editing, so a level
+    // change and a field change are now often made in the very same sitting). The Level column's
+    // own standalone Save button (see renderDraftField's own table below) is hidden for exactly
+    // this row for exactly this reason while this editor is open.
+    const levelDraftValue = levelDrafts[item.line_xspell_id];
+    const levelChanged = levelDraftValue !== undefined && levelDraftValue !== String(item.level);
+    const newLevel = levelChanged ? Number(levelDraftValue) : null;
+    if (levelChanged && (levelDraftValue.trim() === "" || Number.isNaN(newLevel))) {
+      setStatus(errorStatus("Level must be a number."));
+      return;
+    }
+    if (Object.keys(fields).length === 0 && !levelChanged) {
       setStatus(okStatus("Nothing changed."));
       setEditingSpellId(null);
       return;
@@ -510,13 +549,26 @@ function SpellSpecEditor({
     setStatus(okStatus(item.is_owned ? "Saving..." : "Cloning this spell for this class, then saving..."));
     try {
       const cfg = await ensureCfg();
-      const result = await invoke<{ spell_id: number; message: string }>("save_line_spell_fields", {
-        cfg,
-        classId,
-        lineXspellId: item.line_xspell_id,
-        fields,
-      });
-      setStatus(okStatus(result.message));
+      const messages: string[] = [];
+      if (Object.keys(fields).length > 0) {
+        const result = await invoke<{ spell_id: number; message: string }>("save_line_spell_fields", {
+          cfg,
+          classId,
+          lineXspellId: item.line_xspell_id,
+          fields,
+        });
+        messages.push(result.message);
+      }
+      if (levelChanged) {
+        const result = await invoke<string>("update_line_spell_level", {
+          cfg,
+          classId,
+          lineXspellId: item.line_xspell_id,
+          newLevel,
+        });
+        messages.push(result);
+      }
+      setStatus(okStatus(messages.join(" ")));
       setEditingSpellId(null);
       // load() guards itself with the same busyRef to stop overlapping fetches from repeated
       // clicks - but that guard still reads true here (set above, not yet reset), so without
@@ -706,7 +758,7 @@ function SpellSpecEditor({
                                 style={{ width: "4em" }}
                                 disabled={busy}
                               />{" "}
-                              {levelChanged && (
+                              {levelChanged && !isEditingField && (
                                 <button onClick={() => saveLevel(item)} disabled={busy}>
                                   Save
                                 </button>

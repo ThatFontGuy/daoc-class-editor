@@ -34,6 +34,29 @@ pub(crate) fn is_local(cfg: &SshConfig) -> bool {
     cfg.host.trim().is_empty()
 }
 
+/// Resolves `name` to an absolute path when one of the common locations macOS/Linux actually
+/// installs it at exists, falling back to the bare name (letting the OS's own `$PATH` search
+/// apply, exactly as before) if none of them do. A real, found bug this exists to fix: a GUI app
+/// launched via Tauri's own dev/build tooling doesn't reliably inherit the same `$PATH` an
+/// interactive terminal shell has - a well-known class of bug for Tauri/Electron apps on macOS in
+/// particular - confirmed live: `sqlite3`/`ssh`/`scp` all resolved fine from a terminal on the
+/// very same machine (and every one of this project's own `cargo test` runs, which spawn these
+/// same bare names, always have), but the actual running app couldn't spawn one of them at all,
+/// raising a raw "No such file or directory" trying to exec a bare command name that a plain
+/// shell would have resolved without issue. Checking a handful of the real locations these
+/// actually ship at directly sidesteps the whole "does this process really have the same `$PATH`
+/// a terminal does" question, rather than depending on an answer that isn't reliable across every
+/// way this app can be launched.
+pub(crate) fn resolve_executable(name: &str) -> String {
+    for dir in ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+        let candidate = Path::new(dir).join(name);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    name.to_string()
+}
+
 /// The server's *real* scripts folder - confirmed directly in the server's own source
 /// (`GameServerConfiguration`'s constructor always resolves `RootDirectory` to wherever its own
 /// executable lives, with no config override path actually wired up), `RootDirectory` is always
@@ -138,7 +161,7 @@ pub fn test_connection(cfg: &SshConfig) -> Result<String, String> {
         }
         return Ok(format!("local folder OK: {}", dir.display()));
     }
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(resolve_executable("ssh"));
     cmd.args(ssh_base_args(cfg))
         .arg(format!("{}@{}", cfg.user, cfg.host))
         .arg("echo connected && pwd");
@@ -167,7 +190,7 @@ pub fn deploy_class_file(cfg: &SshConfig, filename: &str, content: &str) -> Resu
     // Make sure the remote scripts folder exists first (the server also auto-creates it on
     // startup, but a stopped server that has never run with EnableCompilation won't have it yet).
     let mkdir_result = {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new(resolve_executable("ssh"));
         cmd.args(ssh_base_args(cfg))
             .arg(format!("{}@{}", cfg.user, cfg.host))
             .arg(format!(
@@ -181,7 +204,7 @@ pub fn deploy_class_file(cfg: &SshConfig, filename: &str, content: &str) -> Resu
         return Err(format!("could not prepare remote scripts folder: {e}"));
     }
 
-    let mut cmd = Command::new("scp");
+    let mut cmd = Command::new(resolve_executable("scp"));
     cmd.args(ssh_base_scp_args(cfg));
     cmd.arg(&tmp);
     cmd.arg(format!(
@@ -219,7 +242,7 @@ fn run_sql_impl(cfg: &SshConfig, sql: &str, json: bool) -> Result<String, String
     let db_path = Path::new(&cfg.remote_server_dir).join("data/opendaoc.sqlite3.db");
     if is_local(cfg) {
         // Passed as separate argv entries, not a shell string, so no escaping is needed at all.
-        let mut cmd = Command::new("sqlite3");
+        let mut cmd = Command::new(resolve_executable("sqlite3"));
         if json {
             cmd.arg("-json");
         }
@@ -232,7 +255,7 @@ fn run_sql_impl(cfg: &SshConfig, sql: &str, json: bool) -> Result<String, String
         shell_escape(&db_path.to_string_lossy()),
         shell_escape(sql)
     );
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(resolve_executable("ssh"));
     cmd.args(ssh_base_args(cfg))
         .arg(format!("{}@{}", cfg.user, cfg.host))
         .arg(remote_cmd);
@@ -290,7 +313,7 @@ pub fn remote_server_control(cfg: &SshConfig, action: &str) -> Result<String, St
             shell_escape(&cfg.remote_server_dir),
             shell_escape(&cfg.start_script_name),
         );
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new(resolve_executable("ssh"));
         cmd.args(ssh_base_args(cfg))
             .arg(format!("{}@{}", cfg.user, cfg.host))
             .arg(remote_cmd);
@@ -306,7 +329,7 @@ pub fn remote_server_control(cfg: &SshConfig, action: &str) -> Result<String, St
         shell_escape(&cfg.start_script_name),
         action
     );
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(resolve_executable("ssh"));
     cmd.args(ssh_base_args(cfg))
         .arg(format!("{}@{}", cfg.user, cfg.host))
         .arg(remote_cmd);
@@ -377,7 +400,7 @@ pub fn backup_status(cfg: &SshConfig) -> Result<BackupStatus, String> {
             "mtime=$(stat -c %Y '{path}' 2>/dev/null || stat -f %m '{path}' 2>/dev/null) && echo $(($(date +%s) - mtime))",
             path = shell_escape(&path.to_string_lossy())
         );
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new(resolve_executable("ssh"));
         cmd.args(ssh_base_args(cfg))
             .arg(format!("{}@{}", cfg.user, cfg.host))
             .arg(remote_cmd);
@@ -534,6 +557,27 @@ mod tests {
         assert!(is_local(&cfg("", "/anything")));
         assert!(is_local(&cfg("   ", "/anything")));
         assert!(!is_local(&cfg("192.168.1.69", "/anything")));
+    }
+
+    #[test]
+    fn resolve_executable_finds_a_real_system_binary_at_an_absolute_path() {
+        // sqlite3 is a standard-issue system binary at one of these exact locations on every
+        // Unix-like platform this project ships for (macOS, Linux) - this must resolve to a
+        // real, existing absolute path there, not just echo the bare name back unexamined.
+        // Windows's own sqlite3 (if present at all) isn't guaranteed to live under any of these
+        // same directories, so this is only meaningful to assert on a Unix host.
+        if cfg!(unix) {
+            let resolved = resolve_executable("sqlite3");
+            assert!(
+                resolved.starts_with('/') && Path::new(&resolved).is_file(),
+                "expected a real absolute path, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_executable_falls_back_to_the_bare_name_for_anything_unrecognized() {
+        assert_eq!(resolve_executable("some-binary-that-will-never-exist-anywhere"), "some-binary-that-will-never-exist-anywhere");
     }
 
     #[test]
