@@ -333,6 +333,12 @@ fn add_spell_to_line(
 }
 
 #[tauri::command]
+fn rename_spell_line(cfg: SshConfig, class_id: i64, spec_key: String, line_key: String, new_name: String) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::rename_spell_line(&cfg, class_id, &spec_key, &line_key, &new_name)
+}
+
+#[tauri::command]
 fn update_line_spell_level(
     cfg: SshConfig,
     class_id: i64,
@@ -517,6 +523,7 @@ pub fn run() {
             create_new_spell_spec,
             add_style_to_spec,
             add_spell_to_line,
+            rename_spell_line,
             update_line_spell_level,
             update_style_level,
             update_owned_spell_fields,

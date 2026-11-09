@@ -428,6 +428,9 @@ function SpellSpecEditor({
   const [editingSpellId, setEditingSpellId] = useState<number | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [levelDrafts, setLevelDrafts] = useState<Record<string, string>>({});
+  // Keyed by line_key - the spell line's own display Name, edited independently of any spell
+  // within it. See renameLine's own doc comment for the real gap this fixes.
+  const [lineNameDrafts, setLineNameDrafts] = useState<Record<string, string>>({});
   const [status, setStatus] = useState<StatusState>(emptyStatus);
   const [busy, setBusy] = useState(false);
   const [spellTypes, setSpellTypes] = useState<string[]>([]);
@@ -455,6 +458,7 @@ function SpellSpecEditor({
     setBusy(true);
     setEditingSpellId(null);
     setLevelDrafts({});
+    setLineNameDrafts({});
     try {
       const rows = await invoke<SpellLineGroup[]>("list_spell_lines_for_spec", {
         cfg: currentCfg(),
@@ -661,6 +665,37 @@ function SpellSpecEditor({
     }
   }
 
+  /** Renames a spell line's own display Name - a real, reported gap: there was no way at all to
+   * rename a line once created (short of recreating the whole thing from scratch), most visible
+   * for the common case of a spec with only one spell line, where the line's own name wasn't
+   * shown anywhere in this editor at all, only its owning spec's. */
+  async function renameLine(group: SpellLineGroup) {
+    if (busyRef.current) return;
+    const draftValue = lineNameDrafts[group.line_key];
+    if (draftValue === undefined || draftValue.trim() === group.line_name.trim()) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus("Renaming..."));
+    try {
+      const cfg = await ensureCfg();
+      const result = await invoke<string>("rename_spell_line", {
+        cfg,
+        classId,
+        specKey: group.spec_key,
+        lineKey: group.line_key,
+        newName: draftValue,
+      });
+      setStatus(okStatus(result));
+      busyRef.current = false; // see the matching comment in save() above
+      await load();
+    } catch (e) {
+      setStatus(errorStatus(`Rename failed: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
   const totalSpells = groups?.reduce((sum, g) => sum + g.spells.length, 0) ?? 0;
 
   /** "Type" gets a dropdown of every real eSpellType value instead of a free-text field - it's
@@ -722,9 +757,9 @@ function SpellSpecEditor({
             );
             return (
               <div key={group.line_key}>
-                {groups.length > 1 && (
-                  <h4>
-                    {group.line_name}
+                <label className="field" style={{ maxWidth: "20em" }}>
+                  <span>
+                    Line name
                     {group.is_base_line && (
                       <span
                         title="Granted to every class with this spec regardless of spec points spent - scales with character level, not spec level."
@@ -738,8 +773,19 @@ function SpellSpecEditor({
                         (base line - no spec investment needed)
                       </span>
                     )}
-                  </h4>
-                )}
+                  </span>
+                  <input
+                    value={lineNameDrafts[group.line_key] ?? group.line_name}
+                    onChange={(e) => setLineNameDrafts((prev) => ({ ...prev, [group.line_key]: e.target.value }))}
+                    disabled={busy}
+                  />
+                </label>
+                {lineNameDrafts[group.line_key] !== undefined &&
+                  lineNameDrafts[group.line_key].trim() !== group.line_name.trim() && (
+                    <button onClick={() => renameLine(group)} disabled={busy}>
+                      Save
+                    </button>
+                  )}
                 <p>
                   <button onClick={() => addSpell(group)} disabled={busy}>
                     + Add spell

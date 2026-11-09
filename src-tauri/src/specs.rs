@@ -784,6 +784,46 @@ pub fn add_spell_to_line(
     })
 }
 
+/// Renames `line_key`'s own display Name (`SpellLine.Name` - what shows wherever a spell line's
+/// own name appears: this editor's own line header, and the Character Planner) - never its
+/// `KeyName`, the real, stable identity its own `LineXSpell` rows and `SpellLine.Spec` reference,
+/// which must never change. A real, reported gap this fixes: there was no way at all to rename a
+/// spell line once created (short of recreating the whole thing from scratch under a new name) -
+/// confirmed live with Nosferatu's own "Movement" line, the common one-line-per-spec case, where
+/// the line's own name wasn't even shown anywhere in the editor at all, only its owning spec's.
+///
+/// Ensures the owning spec (and therefore this line) is independently owned by `class_id` first,
+/// exactly like `add_spell_to_line` does before adding to it - see `ensure_class_owns_spec`'s own
+/// doc comment for why a shared/stock line can't just be renamed directly, and for why this
+/// refuses outright (the same way any other edit to one already does) for a `NEVER_CLONE_SPECS`
+/// spec's own line, which can never be renamed at all.
+pub fn rename_spell_line(
+    cfg: &SshConfig,
+    class_id: i64,
+    spec_key: &str,
+    line_key: &str,
+    new_name: &str,
+) -> Result<String, String> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err("a spell line needs a name".to_string());
+    }
+    let owned_spec_key = ensure_class_owns_spec(cfg, class_id, spec_key)?;
+    let owned_line_key = if owned_spec_key == spec_key {
+        line_key.to_string()
+    } else {
+        format!("{owned_spec_key}_{line_key}")
+    };
+    let owned_line_key_q = sql_quote(&owned_line_key);
+    let name_q = sql_quote(trimmed);
+    run_remote_sql(
+        cfg,
+        &format!("UPDATE SpellLine SET Name = '{name_q}' WHERE KeyName = '{owned_line_key_q}';"),
+    )?;
+    Ok(format!("renamed to \"{trimmed}\""))
+}
+
+
 /// Fields worth suggesting type-appropriate defaults for - everything in
 /// `ClassSpecsSection.tsx`'s own `EDITABLE_SPELL_FIELD_HINTS` except Name/Type/Description/
 /// Message1/Message2, which are spell-specific flavor text with no meaningful "typical value" to
@@ -3746,6 +3786,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ownership_rows.len(), 1, "the new spell must be tracked as this class's own clone");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_spell_line_renames_an_already_owned_line() {
+        let dir = setup_test_db("rename-line-owned");
+        let cfg = test_cfg(&dir);
+
+        create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        let result = rename_spell_line(&cfg, 2, "earthshatter_2", "earthshatter_2_line", "Ground Fury").unwrap();
+        assert!(result.contains("Ground Fury"), "{result}");
+
+        let rows = run_remote_sql_json(&cfg, "SELECT Name FROM SpellLine WHERE KeyName = 'earthshatter_2_line';").unwrap();
+        assert_eq!(str_field(&rows[0], "Name"), "Ground Fury");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_spell_line_clones_a_still_shared_lines_spec_first() {
+        let dir = setup_test_db("rename-line-shared");
+        let cfg = test_cfg(&dir);
+
+        // Class 1 has "smite" assigned under its plain, shared KeyName (never cloned through
+        // this tool) - renaming its "smite_base" line must clone the whole spec first, exactly
+        // like add_spell_to_line already does, never renaming the real shared line itself.
+        rename_spell_line(&cfg, 1, "smite", "smite_base", "Holy Fury").unwrap();
+
+        let cloned = run_remote_sql_json(&cfg, "SELECT Name FROM SpellLine WHERE KeyName = 'smite_1_smite_base';").unwrap();
+        assert_eq!(str_field(&cloned[0], "Name"), "Holy Fury");
+
+        let original = run_remote_sql_json(&cfg, "SELECT Name FROM SpellLine WHERE KeyName = 'smite_base';").unwrap();
+        assert_eq!(str_field(&original[0], "Name"), "Smiting Spells", "the original shared line must be untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_spell_line_refuses_an_empty_name() {
+        let dir = setup_test_db("rename-line-empty");
+        let cfg = test_cfg(&dir);
+
+        create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        let result = rename_spell_line(&cfg, 2, "earthshatter_2", "earthshatter_2_line", "   ");
+        assert!(result.is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }
