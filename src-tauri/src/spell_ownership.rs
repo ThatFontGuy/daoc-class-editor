@@ -168,8 +168,10 @@ pub fn clone_style_with_fresh_id(
 pub struct SpellCloner {
     owning_class_id: i64,
     /// Every real `Spell` column except `SpellID` itself (needs a fresh, separately-unique
-    /// numeric value on every clone - see `clone_for_class`'s own doc comment) and whatever the
-    /// table's own real primary key is, if it's a distinct column from `SpellID` at all.
+    /// numeric value on every clone - see `clone_for_class`'s own doc comment), `TooltipId` (see
+    /// `has_tooltip_id`'s own doc comment - needs its own fresh value too, for the identical
+    /// reason, just a different mechanism), and whatever the table's own real primary key is, if
+    /// it's a distinct column from `SpellID` at all.
     columns: Vec<String>,
     /// `Spell`'s own GUID-style primary key column, if it has one distinct from `SpellID` - a
     /// real, reproduced case found live: the actual server schema's `Spell` table is primary-
@@ -183,6 +185,22 @@ pub struct SpellCloner {
     /// `UNIQUE constraint failed: Spell.SpellID` live, independent from (and still present after)
     /// the separate ID-allocation race this module's other fix already closed.
     guid_pk_column: Option<String>,
+    /// Whether the real schema's `Spell` table has a `TooltipId` column at all (some forks might
+    /// not). A real, reported live bug this exists to fix: `TooltipId` - never `Icon`,
+    /// `ClientEffect`, or `SpellGroup`, all already handled elsewhere - is the *actual* key the
+    /// real game client sends back to ask the server for a spell's own delve/mouseover info
+    /// (`SkillBase.GetSpellByTooltipID`, confirmed directly from the real server source); every
+    /// `TooltipId` the server ever loads gets indexed once at boot, keeping only the *first*
+    /// `Spell` row it finds for each value and silently ignoring every other row sharing it. This
+    /// column used to be copied byte-for-byte verbatim like any other field - never given its own
+    /// fresh value the way `SpellID` already is - so *every* spell this tool has ever cloned
+    /// inherited its own source's exact `TooltipId` unchanged, and the real game client showed
+    /// whichever spell happened to win that slot (not necessarily the one actually being hovered
+    /// at all) for every single one of them. Confirmed live: 211 of this tool's own tracked
+    /// clones, found sharing a duplicate `TooltipId` with something else in `Spell` (11 of them,
+    /// including Nosferatu's own "Speed of the Nosferatu" line, sharing the exact same value as
+    /// the universal lowest-`SpellID` template every brand-new spell/spec is seeded from).
+    has_tooltip_id: bool,
     /// The same source `SpellID` cloned twice for the same class (it appears on two different
     /// spec lines, or as both a cast spell and a style's proc) must reuse the one clone already
     /// made for this class in this call, not make a second independent copy of it.
@@ -199,10 +217,13 @@ impl SpellCloner {
         // being flagged as the table's own PK (it isn't, on the real schema, but a future or
         // different fork's schema might shape this differently - stay correct either way).
         columns.retain(|c| c != "SpellID");
+        let has_tooltip_id = columns.iter().any(|c| c == "TooltipId");
+        columns.retain(|c| c != "TooltipId");
         Ok(Self {
             owning_class_id,
             columns,
             guid_pk_column,
+            has_tooltip_id,
             memo: HashMap::new(),
         })
     }
@@ -250,10 +271,30 @@ impl SpellCloner {
             Some(col) => (format!(", {col}"), format!(", '{}'", Uuid::new_v4())),
             None => (String::new(), String::new()),
         };
+        // The lowest unused nonzero value in 1..65535 (TooltipId is an unsigned 16-bit column on
+        // the real schema) - never a bare `MAX(TooltipId)+1` the way `SpellID` itself works,
+        // since a real, confirmed-live server is already most of the way to that hard ceiling
+        // (65310 already in use out of 65535 total) with no reason every one of those gaps below
+        // the current max can't be safely reused instead. 0 is deliberately never assigned here -
+        // it means "no tooltip id at all" to the real game client (skipped from the server's own
+        // lookup index entirely), which is *worse* than a collision: a spell with `TooltipId = 0`
+        // shows no delve/mouseover info at all unless it happens to currently be an active effect
+        // on the player (the one documented fallback), not merely the wrong one.
+        let (tooltip_col, tooltip_val_expr) = if self.has_tooltip_id {
+            (
+                ", TooltipId".to_string(),
+                ", (SELECT MIN(candidate) FROM \
+                   (SELECT 1 AS candidate UNION SELECT TooltipId + 1 FROM Spell WHERE TooltipId > 0) \
+                   WHERE candidate NOT IN (SELECT TooltipId FROM Spell WHERE TooltipId > 0) AND candidate <= 65535)"
+                    .to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let script = format!(
             "BEGIN IMMEDIATE;\n\
-             INSERT INTO Spell ({col_list}, SpellID{pk_col}) \
-             SELECT {col_list}, (SELECT COALESCE(MAX(SpellID), 0) + 1 FROM Spell){pk_val_expr} \
+             INSERT INTO Spell ({col_list}, SpellID{pk_col}{tooltip_col}) \
+             SELECT {col_list}, (SELECT COALESCE(MAX(SpellID), 0) + 1 FROM Spell){pk_val_expr}{tooltip_val_expr} \
              FROM Spell WHERE SpellID = {source_spell_id};\n\
              INSERT INTO ClassEditorSpellClone (NewSpellID, SourceSpellID, OwningClassId) \
              SELECT MAX(SpellID), {source_spell_id}, {} FROM Spell;\n\
@@ -485,6 +526,40 @@ mod tests {
             first, second,
             "the same source spell cloned twice for the same class must reuse one clone"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clone_for_class_assigns_a_fresh_unique_tooltip_id_reusing_an_open_gap() {
+        // A real, reported live bug: TooltipId used to be copied byte-for-byte verbatim like any
+        // other column - the real game client's own delve/mouseover request sends exactly this
+        // value back to the server (SkillBase.GetSpellByTooltipID, confirmed from the real server
+        // source), which indexes only the *first* Spell row it finds for each value at server
+        // boot and silently ignores every other row sharing it. Every spell this tool ever cloned
+        // inherited its own source's exact TooltipId unchanged, so the real client showed
+        // whichever spell happened to win that shared slot - not necessarily the one actually
+        // being hovered - for every single one of them. Confirmed live: 211 of this tool's own
+        // tracked clones found sharing a duplicate TooltipId this way, 11 of them (an entire
+        // class's own spec) all showing one single rank's own tooltip for every rank.
+        let dir = setup_test_db("clone-tooltip-id");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "ALTER TABLE Spell ADD COLUMN TooltipId INTEGER NOT NULL DEFAULT 0;\n\
+             UPDATE Spell SET TooltipId = 1 WHERE SpellID = 9001;\n\
+             UPDATE Spell SET TooltipId = 3 WHERE SpellID = 9002;",
+        )
+        .unwrap();
+        let mut cloner = SpellCloner::new(&cfg, 64).unwrap();
+
+        let new_id = cloner.clone_for_class(&cfg, 9001).unwrap();
+
+        let rows = run_remote_sql_json(&cfg, &format!("SELECT TooltipId FROM Spell WHERE SpellID = {new_id};")).unwrap();
+        assert_eq!(int_field(&rows[0], "TooltipId"), 2, "the lowest open gap (1 and 3 already taken), never a verbatim copy of the source's own 1");
+
+        let source_untouched = run_remote_sql_json(&cfg, "SELECT TooltipId FROM Spell WHERE SpellID = 9001;").unwrap();
+        assert_eq!(int_field(&source_untouched[0], "TooltipId"), 1, "the source's own TooltipId must be completely untouched");
 
         std::fs::remove_dir_all(&dir).ok();
     }
