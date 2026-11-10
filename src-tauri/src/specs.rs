@@ -812,6 +812,26 @@ pub fn add_new_spell_series_to_line(
 /// actually matter for a new rank (Value/Damage/Duration/Level) to tune from there. Name is reset
 /// to "New Spell" the same way `add_new_spell_series_to_line` resets it.
 ///
+/// `Icon`/`ClientEffect` (if the real schema has them) are deliberately *not* left as an
+/// unchanged, verbatim clone of the source spell's own - each new rank gets both bumped by one
+/// from whatever rank it was added from instead (`ClientEffect` only if the source's own isn't
+/// already 0 - "no effect icon" - which must stay exactly 0, not become a phantom "1"). A real,
+/// reported bug this exists to fix: the game client itself caches a spell's own delve/mouseover
+/// info keyed by its `Icon`/`ClientEffect`, not freshly re-read per rank - a brand-new series
+/// built up through this button alone always cloned every rank's `Icon`/`ClientEffect` byte-for-
+/// byte identical to the rank before it (unlike a *true* clone of a real, pre-existing ability via
+/// the Clone Wizard, which already has distinct icons per rank baked into its own source data,
+/// never touched by this function at all), leaving every rank showing identical, cached mouseover
+/// text in-game despite `Value`/`Description` genuinely differing underneath - exactly the same
+/// symptom (and the same root client-side caching behavior) a previous live bug report traced to
+/// 15 pre-existing spells needing this exact fix applied by hand, directly on live. Simple
+/// sequential incrementing matches the real base game's own convention for a rank progression
+/// confirmed live (Minstrel's own "Motivational" song line: Icons 3608-3612; the real "Aggression"
+/// CombatSpeedBuff progression: Icons 861-865; "Shadow's X" EvadeBuff progression: Icons
+/// 13070-13074) - not a perfect, hand-picked piece of art for every rank, but always at least
+/// visually distinct enough to never collide with the rank(s) around it, freely overridable
+/// afterward via the field editor's own Icon/ClientEffect fields like any other.
+///
 /// Ensures the owning spec (and this specific spell) are independently owned by `class_id` first
 /// via `ensure_line_owned`, exactly like field-editing an existing spell already does - see its
 /// own doc comment for why a shared/stock line can't just be appended to directly.
@@ -842,11 +862,28 @@ pub fn add_next_spell_in_series(
 
     let mut cloner = SpellCloner::new(cfg, class_id)?;
     let new_spell_id = cloner.clone_for_class(cfg, owned_spell_id)?;
+
+    let mut sets = vec!["Name = 'New Spell'".to_string()];
+    let spell_columns = columns_excluding_pk(cfg, "Spell")?;
+    if spell_columns.iter().any(|c| c == "Icon") {
+        let rows = run_remote_sql_json(cfg, &format!("SELECT Icon FROM Spell WHERE SpellID = {new_spell_id};"))?;
+        let icon = rows.first().map(|r| int_field(r, "Icon")).unwrap_or(0);
+        sets.push(format!("Icon = {}", icon + 1));
+    }
+    if spell_columns.iter().any(|c| c == "ClientEffect") {
+        let rows = run_remote_sql_json(cfg, &format!("SELECT ClientEffect FROM Spell WHERE SpellID = {new_spell_id};"))?;
+        let client_effect = rows.first().map(|r| int_field(r, "ClientEffect")).unwrap_or(0);
+        if client_effect != 0 {
+            sets.push(format!("ClientEffect = {}", client_effect + 1));
+        }
+    }
+
     let new_line_xspell_id = Uuid::new_v4().to_string();
+    let sets_sql = sets.join(", ");
     run_remote_sql(
         cfg,
         &format!(
-            "UPDATE Spell SET Name = 'New Spell' WHERE SpellID = {new_spell_id};\n\
+            "UPDATE Spell SET {sets_sql} WHERE SpellID = {new_spell_id};\n\
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
              VALUES ('{line_key_q}', {new_spell_id}, {new_level}, '{new_line_xspell_id}');"
         ),
@@ -4006,6 +4043,44 @@ mod tests {
         assert_eq!(added.level, 2, "one above the source spell's own level 1");
         assert_eq!(str_field(&added.fields, "Name"), "New Spell");
         assert_eq!(int_field(&added.fields, "SpellGroup"), 777, "inherits the source's own SpellGroup - it's another rank of the SAME series");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_next_spell_in_series_bumps_icon_and_client_effect_so_the_client_never_caches_one_ranks_tooltip_for_another() {
+        // A real, reported bug: a brand-new series' own Icon/ClientEffect used to stay byte-for-
+        // byte identical across every rank (verbatim-cloned, never touched) - the game client
+        // caches a spell's own delve/mouseover info keyed by exactly those two fields, not
+        // freshly re-read per rank, so every rank in a brand-new series showed identical, stale
+        // mouseover text despite Value/Description genuinely differing underneath. A *true* clone
+        // of a real, pre-existing ability never hit this at all, since its own source data
+        // already has distinct icons per rank - only a series built up entirely through "+ Add
+        // Next Spell" did.
+        let dir = setup_test_db("add-next-icon-bump");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "ALTER TABLE Spell ADD COLUMN Icon INTEGER DEFAULT 0;\n\
+             ALTER TABLE Spell ADD COLUMN ClientEffect INTEGER DEFAULT 0;\n\
+             UPDATE Spell SET Icon = 100, ClientEffect = 200 WHERE SpellID = 9001;",
+        )
+        .unwrap();
+
+        create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        let seeded = run_remote_sql_json(&cfg, "SELECT LineXSpell_ID FROM LineXSpell WHERE LineName = 'earthshatter_2_line';").unwrap();
+        let seeded_line_xspell_id = str_field(&seeded[0], "LineXSpell_ID");
+
+        let added = add_next_spell_in_series(&cfg, 2, &seeded_line_xspell_id, None).unwrap();
+        assert_eq!(int_field(&added.fields, "Icon"), 101, "bumped by one from the source spell's own Icon (100)");
+        assert_eq!(int_field(&added.fields, "ClientEffect"), 201, "bumped by one from the source spell's own ClientEffect (200)");
+
+        // A spell whose own ClientEffect genuinely is 0 ("no effect icon") must stay exactly 0,
+        // never become a phantom "1" implying a buff effect that was never actually meant to show.
+        run_remote_sql(&cfg, &format!("UPDATE Spell SET ClientEffect = 0 WHERE SpellID = {};", added.spell_id)).unwrap();
+        let added_again = add_next_spell_in_series(&cfg, 2, &added.line_xspell_id, None).unwrap();
+        assert_eq!(int_field(&added_again.fields, "Icon"), 102);
+        assert_eq!(int_field(&added_again.fields, "ClientEffect"), 0, "0 means \"no effect icon\" and must never be bumped");
 
         std::fs::remove_dir_all(&dir).ok();
     }
