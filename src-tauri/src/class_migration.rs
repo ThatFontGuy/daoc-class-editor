@@ -37,11 +37,11 @@
 
 use crate::deploy::{SshConfig, run_remote_sql, run_remote_sql_json};
 use crate::spell_ownership::{
-    columns_excluding_pk, ensure_tracking_table, explicit_guid_pk_column, sql_literal, sql_quote,
+    columns_excluding_pk, delete_owned_spells, ensure_tracking_table, explicit_guid_pk_column, sql_literal, sql_quote,
     style_x_spell_guid_column,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 fn int_field(row: &Value, key: &str) -> i64 {
@@ -429,20 +429,39 @@ fn sync_style_procs(
 /// own doc comment) - updating `SpellID` (remapped through `spell_id_map`)/`Level` on an already-
 /// existing live row if either changed (a level edit, or a spell swapped in via
 /// `ensure_line_owned`'s own first-touch cloning), or inserting a brand-new one (a new spell added
-/// via `add_new_spell_series_to_line`/`add_next_spell_in_series`, or an entire line newly cloned this session) otherwise.
-fn sync_line_memberships(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64, spell_id_map: &HashMap<i64, i64>) -> Result<(usize, usize), String> {
+/// via `add_new_spell_series_to_line`/`add_next_spell_in_series`, or an entire line newly cloned
+/// this session) otherwise.
+///
+/// Also removes any live `LineXSpell` row under these same owned lines whose own `LineXSpell_ID`
+/// no longer exists in the session at all - a real, reported bug: `delete_spell_from_line` (the
+/// "Delete" button on an individual spell) only ever touched the session's own database, and
+/// every sync above is pure insert-or-update, so a spell deleted mid-session kept being granted
+/// to (and working for) already-logged-in characters forever, no matter how many times the class
+/// was re-migrated afterward. `LineXSpell_ID` is the same stable key the insert-or-update pass
+/// above already keys on, so "deleted mid-session" is simply "this class's own owned line still
+/// exists, but this specific slot's own `LineXSpell_ID` doesn't appear in it anymore" - the
+/// underlying `Spell` row it pointed to on live is removed too via `delete_owned_spells` (a
+/// no-op, left untouched, if it was never actually one of this tool's own independent clones -
+/// the exact same safety net `delete_spell_from_line` itself already relies on).
+fn sync_line_memberships(
+    session_cfg: &SshConfig,
+    live_cfg: &SshConfig,
+    class_id: i64,
+    spell_id_map: &HashMap<i64, i64>,
+) -> Result<(usize, usize, usize), String> {
     let owned_keys = owned_spec_keys(session_cfg, class_id)?;
     if owned_keys.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
     let keys_csv = owned_keys.iter().map(|k| format!("'{}'", sql_quote(k))).collect::<Vec<_>>().join(", ");
     let line_rows = run_remote_sql_json(session_cfg, &format!("SELECT KeyName FROM SpellLine WHERE Spec IN ({keys_csv});"))?;
     let line_keys: Vec<String> = line_rows.iter().map(|r| str_field(r, "KeyName")).collect();
     if line_keys.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
     let line_keys_csv = line_keys.iter().map(|k| format!("'{}'", sql_quote(k))).collect::<Vec<_>>().join(", ");
     let rows = run_remote_sql_json(session_cfg, &format!("SELECT * FROM LineXSpell WHERE LineName IN ({line_keys_csv});"))?;
+    let session_ids: HashSet<String> = rows.iter().map(|r| str_field(r, "LineXSpell_ID")).collect();
 
     let (mut created, mut updated) = (0, 0);
     for row in &rows {
@@ -473,7 +492,22 @@ fn sync_line_memberships(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id
             created += 1;
         }
     }
-    Ok((created, updated))
+
+    let live_rows = run_remote_sql_json(live_cfg, &format!("SELECT LineXSpell_ID, SpellID FROM LineXSpell WHERE LineName IN ({line_keys_csv});"))?;
+    let mut removed = 0;
+    for row in &live_rows {
+        let line_xspell_id = str_field(row, "LineXSpell_ID");
+        if session_ids.contains(&line_xspell_id) {
+            continue;
+        }
+        let id_q = sql_quote(&line_xspell_id);
+        let spell_id = int_field(row, "SpellID");
+        run_remote_sql(live_cfg, &format!("DELETE FROM LineXSpell WHERE LineXSpell_ID = '{id_q}';"))?;
+        delete_owned_spells(live_cfg, &[spell_id])?;
+        removed += 1;
+    }
+
+    Ok((created, updated, removed))
 }
 
 /// Syncs this class's own full `ClassXSpecialization` assignment list from session onto live -
@@ -529,7 +563,7 @@ pub fn migrate_class_design_to_live(session_cfg: &SshConfig, live_cfg: &SshConfi
     let (spell_id_map, spells_created, spells_updated) = sync_spells(session_cfg, live_cfg, class_id)?;
     let (style_id_map, styles_created, styles_updated) = sync_styles(session_cfg, live_cfg, class_id)?;
     let procs_created = sync_style_procs(session_cfg, live_cfg, class_id, &spell_id_map, &style_id_map)?;
-    let (lines_created, lines_updated) = sync_line_memberships(session_cfg, live_cfg, class_id, &spell_id_map)?;
+    let (lines_created, lines_updated, lines_removed) = sync_line_memberships(session_cfg, live_cfg, class_id, &spell_id_map)?;
     let assignment_synced = sync_class_spec_assignment(session_cfg, live_cfg, class_id)?;
 
     let mut summary = Vec::new();
@@ -545,8 +579,10 @@ pub fn migrate_class_design_to_live(session_cfg: &SshConfig, live_cfg: &SshConfi
     if procs_created > 0 {
         summary.push(format!("{procs_created} new style proc(s)"));
     }
-    if lines_created > 0 || lines_updated > 0 {
-        summary.push(format!("{lines_created} new spell-line entries, {lines_updated} updated"));
+    if lines_created > 0 || lines_updated > 0 || lines_removed > 0 {
+        summary.push(format!(
+            "{lines_created} new spell-line entries, {lines_updated} updated, {lines_removed} deleted"
+        ));
     }
     if assignment_synced {
         summary.push("spec assignment synced".to_string());
@@ -563,6 +599,7 @@ mod tests {
     use super::*;
     use crate::specs::{
         add_new_spell_series_to_line, add_style_to_spec, create_new_combat_spec, create_new_spell_spec,
+        delete_spell_from_line,
     };
     use std::process::Command;
 
@@ -677,6 +714,41 @@ mod tests {
         migrate_class_design_to_live(&session, &live, 2).unwrap();
         let second = migrate_class_design_to_live(&session, &live, 2).unwrap();
         assert_eq!(second, "nothing to migrate - live already matches this design session");
+
+        std::fs::remove_dir_all(&live_dir).ok();
+        std::fs::remove_dir_all(&session_dir).ok();
+    }
+
+    #[test]
+    fn migrate_removes_a_spell_deleted_from_a_line_after_an_earlier_migration() {
+        // A real, reported bug: deleting a spell mid-session (delete_spell_from_line) only ever
+        // touched the session's own database - every sync in this module was pure insert-or-
+        // update, so re-migrating afterward left the deleted spell still fully granted (and still
+        // working) for every character already on the class, no matter how many times it was
+        // re-migrated.
+        let (live_dir, session_dir) = setup_pair("delete-then-remigrate");
+        let live = test_cfg(&live_dir);
+        let session = test_cfg(&session_dir);
+
+        create_new_spell_spec(&session, 2, "Earthshatter", 5).unwrap();
+        let second_spell = add_new_spell_series_to_line(&session, 2, "earthshatter_2", "earthshatter_2_line", Some(10)).unwrap();
+        migrate_class_design_to_live(&session, &live, 2).unwrap();
+
+        let live_before = run_remote_sql_json(&live, "SELECT 1 FROM LineXSpell WHERE LineName = 'earthshatter_2_line';").unwrap();
+        assert_eq!(live_before.len(), 2, "both spells must be live after the first migration: {live_before:?}");
+
+        // Only the session's own copy is touched from here on - delete the second spell, then
+        // re-migrate, exactly like the owner's own reported "delete, then re-migrate" workflow.
+        delete_spell_from_line(&session, 2, &second_spell.line_xspell_id).unwrap();
+        let summary = migrate_class_design_to_live(&session, &live, 2).unwrap();
+        assert!(summary.contains("1 deleted"), "{summary}");
+
+        let live_after = run_remote_sql_json(&live, "SELECT Level FROM LineXSpell WHERE LineName = 'earthshatter_2_line';").unwrap();
+        assert_eq!(live_after.len(), 1, "the deleted spell's own membership row must be gone on live too: {live_after:?}");
+        assert_eq!(int_field(&live_after[0], "Level"), 1, "only the first (still-owned) spell must remain");
+
+        let live_spell_gone = run_remote_sql_json(&live, &format!("SELECT 1 FROM Spell WHERE SpellID = {};", second_spell.spell_id)).unwrap();
+        assert!(live_spell_gone.is_empty(), "the deleted spell's own underlying Spell row must be gone on live too");
 
         std::fs::remove_dir_all(&live_dir).ok();
         std::fs::remove_dir_all(&session_dir).ok();
