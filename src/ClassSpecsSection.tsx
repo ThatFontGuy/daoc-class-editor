@@ -841,6 +841,9 @@ function SpellSpecEditor({
                   <thead>
                     <tr>
                       <th>Level</th>
+                      <th title="The real signal the game client uses to treat several spells as ranks of the same ability for delve/tooltip display - see SpellGroup's own entry in the field editor below for the full explanation.">
+                        SpellGroup
+                      </th>
                       <th>SpellID</th>
                       <th>Name</th>
                       <th></th>
@@ -870,6 +873,7 @@ function SpellSpecEditor({
                                 </button>
                               )}
                             </td>
+                            <td>{String(item.fields.SpellGroup ?? "")}</td>
                             <td>{item.spell_id}</td>
                             <td>
                               {String(item.fields.Name ?? "")}
@@ -899,7 +903,7 @@ function SpellSpecEditor({
                           </tr>
                           {isEditingField && (
                             <tr>
-                              <td colSpan={4}>
+                              <td colSpan={5}>
                                 {primaryKeys.map((key) => (
                                   <label className="field" key={key}>
                                     <span>{key}</span>
