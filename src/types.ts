@@ -168,6 +168,11 @@ export interface ClassSpecSummary {
   name: string;
   level_acquired: number;
   is_owned: boolean;
+  // Whether "Delete" will actually remove anything, rather than refuse outright - true only for
+  // this class's own real spec-level clone, never merely because this class's combat styles
+  // happen to be locked to its own ClassId under a still-shared/universal spec like "Staff" (see
+  // is_owned above, which stays true in that case for a different, edit-safety reason).
+  deletable: boolean;
   has_styles: boolean;
   has_spell_lines: boolean;
 }

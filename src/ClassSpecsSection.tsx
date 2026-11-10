@@ -1004,9 +1004,13 @@ function SpecSummaryRow({
           </button>{" "}
           <button
             onClick={onDelete}
-            disabled={busy || !spec.is_owned}
+            disabled={busy || !spec.deletable}
             className="danger"
-            title={spec.is_owned ? undefined : "This is still a shared/stock spec - clone it (edit any field) before it can be deleted"}
+            title={
+              spec.deletable
+                ? undefined
+                : "This is still a shared/stock spec, not an independent clone of this class's own - only a cloned spec can be deleted"
+            }
           >
             Delete
           </button>
@@ -1248,14 +1252,17 @@ export default function ClassSpecsSection({
    * spec from the Classes tab at all, short of going through the Clone Wizard's own whole-list
    * resubmission flow instead. Always confirmed first, since there's no undo.
    *
-   * Only ever enabled for an already-owned/independent spec (`spec.is_owned`, disabled otherwise
-   * below) - the owner's own explicit preference: deleting should never be possible on a class's
-   * real, original/stock content at all, only on something that's already this class's own
-   * independent clone. A still-shared spec can still be dropped from this class via the Clone
-   * Wizard's own spec list instead. `delete_class_spec` refuses the same way server-side
-   * regardless of this check. */
+   * Only ever enabled for an already-owned/independent spec (`spec.deletable`, disabled otherwise
+   * below - deliberately *not* `spec.is_owned`, which also goes true for a still-shared, never-
+   * cloned spec like "Staff" purely because its combat styles are locked to this class's own
+   * ClassId - a real, reported bug: Friar's own real "Staff" spec showed an enabled-looking
+   * Delete button for exactly that reason) - the owner's own explicit preference: deleting should
+   * never be possible on a class's real, original/stock content at all, only on something that's
+   * already this class's own independent clone. A still-shared spec can still be dropped from
+   * this class via the Clone Wizard's own spec list instead. `delete_class_spec` refuses the same
+   * way server-side regardless of this check. */
   async function deleteSpec(spec: ClassSpecSummary) {
-    if (!spec.is_owned) return;
+    if (!spec.deletable) return;
     if (
       !confirm(
         `Delete "${spec.name}" from this class entirely?\n\n` +

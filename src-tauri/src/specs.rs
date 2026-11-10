@@ -393,7 +393,22 @@ pub struct ClassSpecSummary {
     /// `NEVER_CLONE_SPECS` - whose `Specialization`/`SpellLine` can never be renamed) one whose
     /// combat styles are already locked specifically to this class's own `ClassId`, the same way
     /// the real base game's own data already is for most classes that have always trained it.
+    ///
+    /// Deliberately *not* what gates the "Delete" button - see `deletable`'s own doc comment for
+    /// why: this flag is true for essentially every class, real/original or not, that has ever
+    /// trained a `NEVER_CLONE_SPECS` spec like "Staff" at all (the base game's own stock data
+    /// already locks style rows per class that way), which would have wrongly left Delete looking
+    /// clickable even on a completely untouched stock class.
     pub is_owned: bool,
+    /// Whether `delete_class_spec` will actually remove anything here, rather than refuse
+    /// outright - true only for this class's own real `_<class_id>`-suffixed spec-level clone
+    /// (an independent `Specialization`/`SpellLine`/`Spell`/`Style`/`SpecXAbility` set nothing
+    /// else uses), never merely because this class's styles happen to be locked to its own
+    /// `ClassId` under a still-shared/universal spec like "Staff" (see `is_owned`'s own doc
+    /// comment) - a real, reported bug: Friar's own real, entirely untouched "Staff" spec was
+    /// showing an enabled-looking Delete button purely because of that per-class style locking,
+    /// even though nothing about "Staff" itself was ever actually cloned for Friar at all.
+    pub deletable: bool,
     pub has_styles: bool,
     pub has_spell_lines: bool,
 }
@@ -443,12 +458,14 @@ pub fn list_class_spec_summaries(cfg: &SshConfig, class_id: i64) -> Result<Vec<C
         .map(|s| {
             let has_styles = style_keys.contains(&s.spec_key_name);
             let has_spell_lines = line_keys.contains(&s.spec_key_name);
-            let is_owned = s.spec_key_name.ends_with(&suffix) || own_style_keys.contains(&s.spec_key_name);
+            let deletable = s.spec_key_name.ends_with(&suffix);
+            let is_owned = deletable || own_style_keys.contains(&s.spec_key_name);
             ClassSpecSummary {
                 key_name: s.spec_key_name,
                 name: s.spec_name,
                 level_acquired: s.level_acquired,
                 is_owned,
+                deletable,
                 has_styles,
                 has_spell_lines,
             }
@@ -557,6 +574,7 @@ pub fn create_new_combat_spec(
         name: trimmed.to_string(),
         level_acquired,
         is_owned: true,
+        deletable: true,
         has_styles: true,
         has_spell_lines: false,
     })
@@ -695,6 +713,7 @@ pub fn create_new_spell_spec(
         name: trimmed.to_string(),
         level_acquired,
         is_owned: true,
+        deletable: true,
         has_styles: false,
         has_spell_lines: true,
     })
@@ -5621,10 +5640,12 @@ mod tests {
         assert!(slash.has_styles);
         assert!(!slash.has_spell_lines);
         assert!(!slash.is_owned);
+        assert!(!slash.deletable);
         let smite = summaries.iter().find(|s| s.key_name == "smite").unwrap();
         assert!(!smite.has_styles);
         assert!(smite.has_spell_lines);
         assert!(!smite.is_owned);
+        assert!(!smite.deletable);
         assert_eq!(smite.level_acquired, 5);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -5646,6 +5667,32 @@ mod tests {
         let summaries = list_class_spec_summaries(&cfg, 64).unwrap();
         let owned = summaries.iter().find(|s| s.key_name == "frostbolt_tree_64").unwrap();
         assert!(owned.is_owned);
+        assert!(owned.deletable, "a real spec-level clone must be deletable too");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_class_spec_summaries_flags_a_mechanic_locked_specs_style_locking_as_owned_but_not_deletable() {
+        // A real, reported bug: Friar's own real, entirely untouched "Staff" spec showed an
+        // enabled-looking Delete button purely because its own combat styles are (like the real
+        // base game's own stock data already does for most classes) locked to Friar's own
+        // ClassId - nothing about "Staff" itself was ever actually cloned for Friar at all, so
+        // deleting it must stay refused even though `is_owned` (an edit-safety flag, not a
+        // delete-safety one) is still correctly true.
+        let dir = setup_test_db("spec-summaries-locked-styles-not-deletable");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(&cfg, "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);").unwrap();
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Style VALUES (NULL, 64, 'Pulverize', 'slash', 5, 300, 5, 0, 1, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);",
+        )
+        .unwrap();
+
+        let summaries = list_class_spec_summaries(&cfg, 64).unwrap();
+        let slash = summaries.iter().find(|s| s.key_name == "slash").unwrap();
+        assert!(slash.is_owned, "still correctly true - editing this class's own styles needs no further cloning");
+        assert!(!slash.deletable, "the spec itself (\"slash\") is still the real, shared/stock one - nothing to delete");
 
         std::fs::remove_dir_all(&dir).ok();
     }
