@@ -713,9 +713,14 @@ function SpellSpecEditor({
   /** Deletes one spell outright - the "Delete" button, right between each individual spell's own
    * Edit and "+ Add Next Spell" buttons. A real, reported gap: there was no way at all to remove
    * a spell once added, only to keep editing its fields in place forever. Always confirmed first
-   * (same as every other destructive action in this tool), since there's no undo. */
+   * (same as every other destructive action in this tool), since there's no undo.
+   *
+   * Only ever enabled for an already-owned spell (`item.is_owned`, disabled otherwise below) -
+   * the owner's own explicit preference: deleting should never be possible on a class's real,
+   * original/stock content at all, only on something that's already this class's own independent
+   * clone. `delete_spell_from_line` refuses the same way server-side regardless of this check. */
   async function deleteSpell(item: OwnedSpellInLine) {
-    if (busyRef.current) return;
+    if (busyRef.current || !item.is_owned) return;
     const name = String(item.fields.Name ?? `spell ${item.spell_id}`);
     if (!confirm(`Delete "${name}" (level ${item.level}) entirely? This cannot be undone.`)) return;
     busyRef.current = true;
@@ -923,7 +928,12 @@ function SpellSpecEditor({
                                   <button onClick={() => startEditing(item)} disabled={busy}>
                                     Edit
                                   </button>{" "}
-                                  <button onClick={() => deleteSpell(item)} disabled={busy} className="danger">
+                                  <button
+                                    onClick={() => deleteSpell(item)}
+                                    disabled={busy || !item.is_owned}
+                                    className="danger"
+                                    title={item.is_owned ? undefined : "Edit it first to clone it for this class, then it can be deleted"}
+                                  >
                                     Delete
                                   </button>{" "}
                                   <button onClick={() => addNextSpell(item)} disabled={busy}>
@@ -992,7 +1002,12 @@ function SpecSummaryRow({
           <button onClick={onToggle} disabled={busy}>
             {expanded ? "Hide" : "Edit"}
           </button>{" "}
-          <button onClick={onDelete} disabled={busy} className="danger">
+          <button
+            onClick={onDelete}
+            disabled={busy || !spec.is_owned}
+            className="danger"
+            title={spec.is_owned ? undefined : "This is still a shared/stock spec - clone it (edit any field) before it can be deleted"}
+          >
             Delete
           </button>
         </td>
@@ -1231,17 +1246,20 @@ export default function ClassSpecsSection({
   /** Deletes a spec outright - the "Delete" button next to each spec's own Edit/Hide toggle in
    * the "Combat specs"/"Spells" summary lists. A real, reported gap: there was no way to remove a
    * spec from the Classes tab at all, short of going through the Clone Wizard's own whole-list
-   * resubmission flow instead. Always confirmed first, since there's no undo - see
-   * `delete_class_spec` on the Rust side for exactly what gets removed (its whole independent
-   * clone) versus merely unassigned (a still-shared/stock spec, whose real data other classes
-   * might still be using is always left untouched). */
+   * resubmission flow instead. Always confirmed first, since there's no undo.
+   *
+   * Only ever enabled for an already-owned/independent spec (`spec.is_owned`, disabled otherwise
+   * below) - the owner's own explicit preference: deleting should never be possible on a class's
+   * real, original/stock content at all, only on something that's already this class's own
+   * independent clone. A still-shared spec can still be dropped from this class via the Clone
+   * Wizard's own spec list instead. `delete_class_spec` refuses the same way server-side
+   * regardless of this check. */
   async function deleteSpec(spec: ClassSpecSummary) {
+    if (!spec.is_owned) return;
     if (
       !confirm(
         `Delete "${spec.name}" from this class entirely?\n\n` +
-          (spec.is_owned
-            ? "This removes its whole spec/spell line/spell/style data - it's this class's own independent copy, nothing else uses it."
-            : "This only unassigns it from this class - it's still shared/stock, so its real data (other classes may use it) is left untouched.") +
+          "This removes its whole spec/spell line/spell/style data - it's this class's own independent copy, nothing else uses it." +
           "\n\nAny existing character already using this class would have its points in this spec reset (a free respec is granted). This cannot be undone.",
       )
     )

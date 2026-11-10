@@ -906,54 +906,95 @@ pub fn rename_spell_line(
     Ok(format!("renamed to \"{trimmed}\""))
 }
 
-/// Deletes one spell from its own line entirely - the `LineXSpell` membership row, and (if this
-/// class's own independent clone, tracked via `ClassEditorSpellClone` - never a still-shared
-/// spell, which might still be in active use by some other class/spec line) the underlying
-/// `Spell` row itself too, via `delete_owned_spells`. The "Delete" button counterpart, right next
-/// to each individual spell's own Edit button in `SpellSpecEditor` - a real, reported gap: there
-/// was no way at all to remove a spell once added, only to keep editing its fields in place.
+/// Deletes one spell from its own line entirely - the `LineXSpell` membership row, and the
+/// underlying `Spell` row itself too, via `delete_owned_spells`. The "Delete" button counterpart,
+/// right next to each individual spell's own Edit button in `SpellSpecEditor` - a real, reported
+/// gap: there was no way at all to remove a spell once added, only to keep editing its fields in
+/// place.
 ///
-/// Ensures the owning spec (and this specific spell) are independently owned by `class_id` first,
-/// exactly like field-editing an existing spell already does (`ensure_line_owned`) - deleting a
-/// still-shared line's own `LineXSpell` row directly would remove it from *every* class sharing
-/// that line, not just this one.
+/// Deliberately refuses outright - no auto-cloning fallback - unless this exact spell is already
+/// an independent clone owned by `class_id` (tracked in `ClassEditorSpellClone`), inside a spec
+/// that's already independently owned by this class too (its own `_{class_id}`-suffixed key).
+/// Field-editing a still-shared spell auto-clones it on Save (`ensure_line_owned`) because nothing
+/// is lost either way - but *deleting* a still-shared spell/line is permanent and irreversible,
+/// and the owner's own explicit preference is that removing something should never be possible on
+/// a class's real, original/stock content at all, even behind an auto-clone - only on something
+/// that's already this class's own independent copy. The UI only ever shows this button enabled
+/// when `OwnedSpellInLine::is_owned` is already true, but this check exists here too so a
+/// still-shared spell can never be removed even if called directly.
 pub fn delete_spell_from_line(cfg: &SshConfig, class_id: i64, line_xspell_id: &str) -> Result<String, String> {
-    let (owned_line_xspell_id, owned_spell_id) = ensure_line_owned(cfg, class_id, line_xspell_id)?;
-    let owned_line_xspell_id_q = sql_quote(&owned_line_xspell_id);
+    let line_id_q = sql_quote(line_xspell_id);
+    let owning = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT SpellLine.Spec AS OwnerSpec, LineXSpell.SpellID AS CurrentSpellID \
+             FROM LineXSpell JOIN SpellLine ON SpellLine.KeyName = LineXSpell.LineName \
+             WHERE LineXSpell.LineXSpell_ID = '{line_id_q}';"
+        ),
+    )?;
+    let row = owning.first().ok_or_else(|| {
+        format!("no LineXSpell row found for '{line_xspell_id}' - it may have been removed")
+    })?;
+    let spec_key = str_field(row, "OwnerSpec");
+    let spell_id = int_field(row, "CurrentSpellID");
+
+    let suffix = format!("_{class_id}");
+    if !spec_key.ends_with(&suffix) {
+        return Err(format!(
+            "'{spec_key}' is still a shared/stock spec, not an independent clone owned by this \
+             class - only a spell inside this class's own cloned spec can be deleted"
+        ));
+    }
+    ensure_tracking_table(cfg)?;
+    let owned = run_remote_sql_json(
+        cfg,
+        &format!("SELECT 1 FROM ClassEditorSpellClone WHERE NewSpellID = {spell_id};"),
+    )?;
+    if owned.is_empty() {
+        return Err(
+            "this spell is still a shared/stock Spell row, not an independent clone owned by \
+             this class - only an already-cloned spell can be deleted"
+                .to_string(),
+        );
+    }
+
     run_remote_sql(
         cfg,
-        &format!("DELETE FROM LineXSpell WHERE LineXSpell_ID = '{owned_line_xspell_id_q}';"),
+        &format!("DELETE FROM LineXSpell WHERE LineXSpell_ID = '{line_id_q}';"),
     )?;
-    delete_owned_spells(cfg, &[owned_spell_id])?;
+    delete_owned_spells(cfg, &[spell_id])?;
     Ok("deleted".to_string())
 }
 
 /// Removes `spec_key` entirely from `class_id`'s own spec assignments - the "Delete spec" button
 /// counterpart to `ClassSpecsSection.tsx`'s own per-spec summary row, for deleting a spec outright
 /// without going through the Clone Wizard's own whole-list resubmission flow at all (a real,
-/// reported gap: there was no way to remove a spec from the Classes tab directly). Reuses exactly
-/// the same removal logic `apply_class_specs` already applies to a spec dropped from its own
-/// assignment list - see its own doc comment above `delete_existing_clone`'s own call site for
-/// the full reasoning: deletes this class's own independent clone entirely (Specialization/
-/// SpellLine/LineXSpell/Spell/Style/SpecXAbility) if it's one, or just unassigns (never deletes)
-/// a still-shared/stock spec's own `ClassXSpecialization` row (and this class's own locked
-/// styles, if any) otherwise - scrubs `spec_key` from every character's own saved
-/// `SerializedSpecs` first (the exact login crash `scrub_spec_from_characters`'s own doc comment
-/// describes), and grants a free full respec token to every character currently on this class
-/// afterward, for the identical reason.
+/// reported gap: there was no way to remove a spec from the Classes tab directly).
+///
+/// Deliberately refuses outright unless `spec_key` is already this class's own independent clone
+/// (its own `_{class_id}`-suffixed key) - never a still-shared/stock spec, even though unassigning
+/// one (`unassign_shared_spec_from_class`, still used by `apply_class_specs`'s own redeploy flow)
+/// would leave its real data untouched either way. The owner's own explicit preference: removing
+/// something - even just this class's own assignment to it - should never be offered as "Delete"
+/// for a class's real, original/stock content at all, only for something that's already this
+/// class's own independent copy; a still-shared spec can still be dropped from this class via the
+/// Clone Wizard's own spec list instead. Deletes this class's own independent clone entirely
+/// (Specialization/SpellLine/LineXSpell/Spell/Style/SpecXAbility) - scrubs `spec_key` from every
+/// character's own saved `SerializedSpecs` first (the exact login crash
+/// `scrub_spec_from_characters`'s own doc comment describes), and grants a free full respec token
+/// to every character currently on this class afterward, for the identical reason.
 pub fn delete_class_spec(cfg: &SshConfig, class_id: i64, spec_key: &str) -> Result<String, String> {
-    let mut log = scrub_spec_from_characters(cfg, class_id, spec_key)?;
     let suffix = format!("_{class_id}");
-    if spec_key.ends_with(&suffix) {
-        delete_existing_clone(cfg, spec_key)?;
-        log.push_str(&format!("removed '{spec_key}' from this class entirely\n"));
-    } else {
-        unassign_shared_spec_from_class(cfg, class_id, spec_key)?;
-        log.push_str(&format!(
-            "unassigned '{spec_key}' from this class only - its real Specialization/SpellLine/Style \
-             data (shared by other classes) was left untouched\n"
+    if !spec_key.ends_with(&suffix) {
+        return Err(format!(
+            "'{spec_key}' is still a shared/stock spec, not an independent clone owned by this \
+             class - only this class's own cloned spec can be deleted; drop a still-shared spec \
+             from this class via the Clone Wizard's own spec list instead"
         ));
     }
+    let mut log = scrub_spec_from_characters(cfg, class_id, spec_key)?;
+    delete_existing_clone(cfg, spec_key)?;
+    log.push_str(&format!("removed '{spec_key}' from this class entirely\n"));
     log.push_str(&grant_respec_to_characters(cfg, class_id)?);
     Ok(log)
 }
@@ -4065,22 +4106,22 @@ mod tests {
     }
 
     #[test]
-    fn delete_spell_from_line_clones_a_still_shared_lines_spec_first_then_deletes_just_this_rank() {
+    fn delete_spell_from_line_refuses_a_still_shared_spells_line() {
         let dir = setup_test_db("delete-spell-shared");
         let cfg = test_cfg(&dir);
 
         // Class 1's own "smite_base" seed spell (SpellID 9001, via LineXSpell_ID 'seed-smite-1')
-        // is still shared/un-owned - deleting it must clone the owning spec (and this specific
-        // spell) for class 1 first, exactly like field-editing an existing spell already does,
-        // never deleting the still-shared original line's own row.
-        delete_spell_from_line(&cfg, 1, "seed-smite-1").unwrap();
-
-        let cloned_remaining = run_remote_sql_json(&cfg, "SELECT Level FROM LineXSpell WHERE LineName = 'smite_1_smite_base';").unwrap();
-        assert_eq!(cloned_remaining.len(), 1, "only the other rank (level 10) should survive: {cloned_remaining:?}");
-        assert_eq!(int_field(&cloned_remaining[0], "Level"), 10);
+        // is still shared/un-owned - deleting it must be refused outright, never auto-cloning the
+        // owning spec first just to delete from the fresh clone (the owner's own explicit
+        // preference: deletion should only ever be possible on a class's own already-cloned
+        // content, never on its real, original/stock content at all, even behind an auto-clone).
+        let result = delete_spell_from_line(&cfg, 1, "seed-smite-1");
+        assert!(result.is_err(), "{result:?}");
 
         let original_untouched = run_remote_sql_json(&cfg, "SELECT 1 FROM LineXSpell WHERE LineXSpell_ID = 'seed-smite-1';").unwrap();
         assert_eq!(original_untouched.len(), 1, "the real, still-shared original row must be completely untouched");
+        let no_clone_made = run_remote_sql_json(&cfg, "SELECT 1 FROM LineXSpell WHERE LineName = 'smite_1_smite_base';").unwrap();
+        assert!(no_clone_made.is_empty(), "nothing should have been cloned at all: {no_clone_made:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4104,16 +4145,22 @@ mod tests {
     }
 
     #[test]
-    fn delete_class_spec_unassigns_a_shared_key_without_touching_its_real_data() {
+    fn delete_class_spec_refuses_a_still_shared_key() {
         let dir = setup_test_db("delete-spec-shared");
         let cfg = test_cfg(&dir);
 
-        let log = delete_class_spec(&cfg, 1, "smite").unwrap();
-        assert!(log.contains("unassigned 'smite' from this class only"), "{log}");
+        // "smite" is still shared/un-owned (no other class ever cloned it under this tool) -
+        // deleting it must be refused outright, never silently unassigning it either (the owner's
+        // own explicit preference: "Delete" should never be offered at all for a class's real,
+        // original/stock content, only for something that's already this class's own independent
+        // copy - a still-shared spec can still be dropped from this class via the Clone Wizard's
+        // own spec list instead).
+        let result = delete_class_spec(&cfg, 1, "smite");
+        assert!(result.is_err(), "{result:?}");
 
-        let assignment_gone =
+        let assignment_survives =
             run_remote_sql_json(&cfg, "SELECT 1 FROM ClassXSpecialization WHERE ClassID = 1 AND SpecKeyName = 'smite';").unwrap();
-        assert!(assignment_gone.is_empty());
+        assert_eq!(assignment_survives.len(), 1, "nothing should have been unassigned either");
 
         // The real, shared "smite" spec/line/spells must be completely untouched - some other
         // class might still be using it.
