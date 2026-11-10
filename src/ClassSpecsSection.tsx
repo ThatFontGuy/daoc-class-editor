@@ -39,6 +39,14 @@ import { useProject } from "./ProjectContext";
 // Frequency tenths-of-a-second for as long as it's kept running, e.g. a Minstrel song: dropping
 // immediately on interrupt/movement/combat). PulsePower is the power cost charged per pulse -
 // meaningless for a one-shot spell, since Pulse = 0 means it never pulses at all.
+//
+// "SpellGroup" (not editable here until a real, reported bug: "+ Add Next Spell"/"+ Add Spell
+// Line" both need it, and so does fixing one by hand after the fact - this is the real signal
+// the game client uses to treat several spells as "ranks of the same ability" for delve/tooltip
+// display, confirmed live: several genuinely unrelated abilities ending up sharing one `SpellGroup`
+// value, after a line's own existing spell was cloned as a starting template, left the client
+// showing one ability's own description for all of them, despite each one's own real mechanics -
+// which don't read `SpellGroup` at all - performing correctly throughout).
 const EDITABLE_SPELL_FIELD_HINTS = [
   "Name",
   "Type",
@@ -60,6 +68,7 @@ const EDITABLE_SPELL_FIELD_HINTS = [
   "Icon",
   "ClientEffect",
   "Target",
+  "SpellGroup",
 ];
 
 // These get their own full-width row, in this order, above the compact grid every other editable
@@ -641,20 +650,19 @@ function SpellSpecEditor({
     }
   }
 
-  /** Appends one more spell to `group`'s own line, one level above whatever this class's own
-   * highest spell on it currently is (see `add_spell_to_line` on the Rust side for exactly how
-   * it's seeded) - the "Edit" button alone only ever let an existing spell be tuned, with no way
-   * at all to build a multi-rank progression (e.g. "Brisk Movement" -> "Greater Brisk Movement")
-   * past whatever one spell a line started out with. Opens the new spell for editing right away,
-   * same as a brand-new spell line's own seeded placeholder already does. */
-  async function addSpell(group: SpellLineGroup) {
+  /** Starts a brand-new series within this line - a genuinely different ability from anything
+   * else already in it, not another rank of one that's already there (see `addNextSpell`'s own
+   * doc comment for growing an *existing* series instead). Gets its own fresh SpellGroup (see
+   * `add_new_spell_series_to_line` on the Rust side for exactly why that matters) - this is the
+   * "+ Add Spell Line" button, always visible above a line's own spell table. */
+  async function addSpellSeries(group: SpellLineGroup) {
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
-    setStatus(okStatus("Adding a new spell..."));
+    setStatus(okStatus("Adding a new spell series..."));
     try {
       const cfg = await ensureCfg();
-      const added = await invoke<OwnedSpellInLine>("add_spell_to_line", {
+      const added = await invoke<OwnedSpellInLine>("add_new_spell_series_to_line", {
         cfg,
         classId,
         specKey: group.spec_key,
@@ -665,7 +673,37 @@ function SpellSpecEditor({
       await load();
       startEditing(added);
     } catch (e) {
-      setStatus(errorStatus(`Could not add a new spell: ${e}`));
+      setStatus(errorStatus(`Could not add a new spell series: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  /** Adds the next rank to the *same* series `item` already belongs to - the "+ Add Next Spell"
+   * button right next to each individual spell's own Edit button, as opposed to `addSpellSeries`'s
+   * own "start a whole new one." Inherits `item`'s own SpellGroup (see `add_next_spell_in_series`
+   * on the Rust side for exactly why that matters - the real, reported bug this whole pair of
+   * buttons exists to let the user avoid by construction, instead of having to notice and fix
+   * SpellGroup by hand afterward). */
+  async function addNextSpell(item: OwnedSpellInLine) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus("Adding the next spell in this series..."));
+    try {
+      const cfg = await ensureCfg();
+      const added = await invoke<OwnedSpellInLine>("add_next_spell_in_series", {
+        cfg,
+        classId,
+        sourceLineXspellId: item.line_xspell_id,
+      });
+      setStatus(okStatus("Added - edit it below to make it do what you actually want."));
+      busyRef.current = false; // see the matching comment in save() above
+      await load();
+      startEditing(added);
+    } catch (e) {
+      setStatus(errorStatus(`Could not add the next spell: ${e}`));
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -795,8 +833,8 @@ function SpellSpecEditor({
                     </button>
                   )}
                 <p>
-                  <button onClick={() => addSpell(group)} disabled={busy}>
-                    + Add spell
+                  <button onClick={() => addSpellSeries(group)} disabled={busy}>
+                    + Add Spell Line
                   </button>
                 </p>
                 <table className="spec-table">
@@ -848,9 +886,14 @@ function SpellSpecEditor({
                                   </button>
                                 </>
                               ) : (
-                                <button onClick={() => startEditing(item)} disabled={busy}>
-                                  Edit
-                                </button>
+                                <>
+                                  <button onClick={() => startEditing(item)} disabled={busy}>
+                                    Edit
+                                  </button>{" "}
+                                  <button onClick={() => addNextSpell(item)} disabled={busy}>
+                                    + Add Next Spell
+                                  </button>
+                                </>
                               )}
                             </td>
                           </tr>

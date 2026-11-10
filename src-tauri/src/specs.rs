@@ -564,7 +564,7 @@ pub fn create_new_combat_spec(
 
 /// Adds one more combat style to an existing combat spec `spec_key` already grants - the "Add
 /// style" counterpart to `CombatSpecEditor`'s per-style field/level editors, which (like
-/// `SpellSpecEditor`'s own, see `add_spell_to_line`'s doc comment for the full reported gap) had
+/// `SpellSpecEditor`'s own, see `add_new_spell_series_to_line`'s doc comment for the full reported gap) had
 /// no way at all to grow a spec past whatever styles it already had.
 ///
 /// Ensures this class actually owns (or, for a `NEVER_CLONE_SPECS` spec, has been granted its own
@@ -700,13 +700,15 @@ pub fn create_new_spell_spec(
     })
 }
 
-/// Adds one more spell to an existing spell line `line_key` under `spec_key` - the "Add spell"
-/// counterpart to `SpellSpecEditor`'s per-spell field/level editors, which, until now, had no way
-/// at all to grow a spell line past whatever spells `create_new_spell_spec` (or an earlier clone)
-/// already seeded it with: a real, reported gap - building out a multi-rank progression (e.g. a
-/// "Brisk Movement" / "Greater Brisk Movement" / ... SpeedEnhancement line) meant editing the
-/// line's one existing spell over and over, with nowhere to actually add a second, third, ...
-/// rank at all.
+/// Starts a brand-new series within an existing spell line `line_key` under `spec_key` - a
+/// genuinely different ability from anything else already in the line, not another rank of one
+/// that's already there (see `add_next_spell_in_series`'s own doc comment for growing an
+/// *existing* series instead - adding a whole second, unrelated ability to one and the same line
+/// is a real, reported, supported thing to do: e.g. a "Movement" line holding both a speed buff
+/// series and an entirely separate combat-speed-buff series). The "Add spell line" counterpart to
+/// `SpellSpecEditor`'s per-spell field/level editors, which, until now, had no way at all to grow
+/// a spell line past whatever spells `create_new_spell_spec` (or an earlier clone) already seeded
+/// it with.
 ///
 /// Ensures the owning spec (and therefore this line) is independently owned by `class_id` first,
 /// exactly like `ensure_line_owned` does before any edit to an existing spell - see its own doc
@@ -714,19 +716,22 @@ pub fn create_new_spell_spec(
 /// `"{new_spec_key}_{old_line_key}"` naming its own clone of this line always ends up with.
 ///
 /// The new spell is cloned (via `SpellCloner`, the same primitive every other spell clone in this
-/// tool already uses) from whichever spell on this line currently sits at the *highest* `Level` -
-/// a new rank in a progression is overwhelmingly more likely to want broadly similar fields
-/// (Type, Target, flavor-text shape) to the rank right before it than to some unrelated spell,
-/// leaving exactly the fields that actually matter for a new rank (Value/Damage/Duration/Level)
-/// to tune from there. Its Name is reset to "New Spell" (same placeholder
-/// `create_new_spell_spec` already uses), the one field deliberately *not* carried over from the
-/// template - otherwise two different ranks of the same progression would default to showing an
-/// identical name in the spellbook until manually renamed. Falls back to the same "very first
-/// real `Spell` row" template `create_new_spell_spec` uses if the line is (unexpectedly)
-/// completely empty.
+/// tool already uses) from the same "very first real `Spell` row" template
+/// `create_new_spell_spec` itself uses - deliberately *never* from anything already in this line,
+/// unlike `add_next_spell_in_series`: a genuinely new, unrelated ability has no sensible "sibling
+/// spell already in this line" to take its own starting shape from at all. Its own `SpellGroup`
+/// (the real server-side signal the game client uses to treat several spells as "ranks of the
+/// same ability" for delve/tooltip display - confirmed live: this exact gap, inheriting a
+/// template's own real `SpellGroup` even when starting an entirely new, unrelated ability, left
+/// the client showing one ability's own delve text for all of several genuinely independent
+/// abilities sharing one line, despite each one's own real mechanics - which don't care about
+/// `SpellGroup` at all - performing correctly throughout) is always freshly allocated (one more
+/// than the highest real `SpellGroup` in use anywhere, so it can never collide with anything
+/// real), never inherited from the template. Name is reset to "New Spell" the same way.
 ///
-/// `level` defaults to one above the line's own current highest level if not given explicitly.
-pub fn add_spell_to_line(
+/// `level` defaults to 1 if not given explicitly - a brand-new series starts fresh, with no
+/// relationship at all to whatever level any other series in this same line happens to be at.
+pub fn add_new_spell_series_to_line(
     cfg: &SshConfig,
     class_id: i64,
     spec_key: &str,
@@ -741,33 +746,90 @@ pub fn add_spell_to_line(
     };
     let owned_line_key_q = sql_quote(&owned_line_key);
 
-    let existing = run_remote_sql_json(
-        cfg,
-        &format!(
-            "SELECT SpellID, Level FROM LineXSpell WHERE LineName = '{owned_line_key_q}' \
-             ORDER BY Level DESC LIMIT 1;"
-        ),
-    )?;
-    let (template_spell_id, new_level) = if let Some(top) = existing.first() {
-        (int_field(top, "SpellID"), level.unwrap_or(int_field(top, "Level") + 1))
-    } else {
-        let template_rows =
-            run_remote_sql_json(cfg, "SELECT SpellID FROM Spell ORDER BY SpellID LIMIT 1;")?;
-        let template_spell_id = template_rows.first().map(|r| int_field(r, "SpellID")).ok_or_else(|| {
-            "could not find any existing spell to seed this new spell from".to_string()
-        })?;
-        (template_spell_id, level.unwrap_or(1))
-    };
+    let template_rows = run_remote_sql_json(cfg, "SELECT SpellID FROM Spell ORDER BY SpellID LIMIT 1;")?;
+    let template_spell_id = template_rows.first().map(|r| int_field(r, "SpellID")).ok_or_else(|| {
+        "could not find any existing spell to seed this new series from".to_string()
+    })?;
 
     let mut cloner = SpellCloner::new(cfg, class_id)?;
     let new_spell_id = cloner.clone_for_class(cfg, template_spell_id)?;
+
+    let fresh_group_rows = run_remote_sql_json(cfg, "SELECT COALESCE(MAX(SpellGroup), 0) + 1 AS NextGroup FROM Spell;")?;
+    let fresh_group = fresh_group_rows.first().map(|r| int_field(r, "NextGroup")).unwrap_or(1);
+
+    let new_level = level.unwrap_or(1);
+    let new_line_xspell_id = Uuid::new_v4().to_string();
+    run_remote_sql(
+        cfg,
+        &format!(
+            "UPDATE Spell SET Name = 'New Spell', SpellGroup = {fresh_group} WHERE SpellID = {new_spell_id};\n\
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
+             VALUES ('{owned_line_key_q}', {new_spell_id}, {new_level}, '{new_line_xspell_id}');"
+        ),
+    )?;
+
+    let rows = run_remote_sql_json(cfg, &format!("SELECT * FROM Spell WHERE SpellID = {new_spell_id};"))?;
+    let fields = rows.into_iter().next().ok_or_else(|| {
+        format!("could not re-read newly cloned spell {new_spell_id} - it may no longer exist")
+    })?;
+    Ok(OwnedSpellInLine {
+        line_xspell_id: new_line_xspell_id,
+        level: new_level,
+        spell_id: new_spell_id,
+        is_owned: true,
+        fields,
+    })
+}
+
+/// Adds the next rank to the *same* series `source_line_xspell_id` already belongs to - the
+/// "Add next spell" counterpart, right next to each individual spell's own Edit button, to
+/// `add_new_spell_series_to_line`'s "start a whole new one." Clones (via `SpellCloner`, as
+/// always) directly from `source_line_xspell_id`'s own current spell - inheriting its own
+/// `SpellGroup` unchanged (so the client keeps treating the new rank as "the same ability" as the
+/// one it was added from - see `add_new_spell_series_to_line`'s own doc comment for the real,
+/// reported bug this distinction exists to avoid), along with every other field (Type, Target,
+/// flavor-text shape) a new rank in a progression is overwhelmingly more likely to want similar
+/// to the rank right before it than to some unrelated spell - leaving exactly the fields that
+/// actually matter for a new rank (Value/Damage/Duration/Level) to tune from there. Name is reset
+/// to "New Spell" the same way `add_new_spell_series_to_line` resets it.
+///
+/// Ensures the owning spec (and this specific spell) are independently owned by `class_id` first
+/// via `ensure_line_owned`, exactly like field-editing an existing spell already does - see its
+/// own doc comment for why a shared/stock line can't just be appended to directly.
+///
+/// `level` defaults to one above `source_line_xspell_id`'s own current level if not given
+/// explicitly.
+pub fn add_next_spell_in_series(
+    cfg: &SshConfig,
+    class_id: i64,
+    source_line_xspell_id: &str,
+    level: Option<i64>,
+) -> Result<OwnedSpellInLine, String> {
+    let (owned_line_xspell_id, owned_spell_id) = ensure_line_owned(cfg, class_id, source_line_xspell_id)?;
+    let owned_line_xspell_id_q = sql_quote(&owned_line_xspell_id);
+    let source_rows = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT LineName, Level FROM LineXSpell WHERE LineXSpell_ID = '{owned_line_xspell_id_q}';"
+        ),
+    )?;
+    let source_row = source_rows.first().ok_or_else(|| {
+        format!("no LineXSpell row found for '{source_line_xspell_id}' - it may have been removed")
+    })?;
+    let line_key = str_field(source_row, "LineName");
+    let line_key_q = sql_quote(&line_key);
+    let source_level = int_field(source_row, "Level");
+    let new_level = level.unwrap_or(source_level + 1);
+
+    let mut cloner = SpellCloner::new(cfg, class_id)?;
+    let new_spell_id = cloner.clone_for_class(cfg, owned_spell_id)?;
     let new_line_xspell_id = Uuid::new_v4().to_string();
     run_remote_sql(
         cfg,
         &format!(
             "UPDATE Spell SET Name = 'New Spell' WHERE SpellID = {new_spell_id};\n\
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
-             VALUES ('{owned_line_key_q}', {new_spell_id}, {new_level}, '{new_line_xspell_id}');"
+             VALUES ('{line_key_q}', {new_spell_id}, {new_level}, '{new_line_xspell_id}');"
         ),
     )?;
 
@@ -793,7 +855,7 @@ pub fn add_spell_to_line(
 /// the line's own name wasn't even shown anywhere in the editor at all, only its owning spec's.
 ///
 /// Ensures the owning spec (and therefore this line) is independently owned by `class_id` first,
-/// exactly like `add_spell_to_line` does before adding to it - see `ensure_class_owns_spec`'s own
+/// exactly like `add_new_spell_series_to_line` does before adding to it - see `ensure_class_owns_spec`'s own
 /// doc comment for why a shared/stock line can't just be renamed directly, and for why this
 /// refuses outright (the same way any other edit to one already does) for a `NEVER_CLONE_SPECS`
 /// spec's own line, which can never be renamed at all.
@@ -3746,18 +3808,23 @@ mod tests {
     }
 
     #[test]
-    fn add_spell_to_line_extends_an_already_owned_line_at_the_next_level() {
-        let dir = setup_test_db("add-spell-owned");
+    fn add_new_spell_series_to_line_starts_a_fresh_series_at_level_1_by_default() {
+        let dir = setup_test_db("add-series-owned");
         let cfg = test_cfg(&dir);
 
-        // create_new_spell_spec seeds exactly one spell at Level = 1, already owned by class 2 -
-        // the simplest case: nothing left to clone, just append.
+        // create_new_spell_spec seeds exactly one spell at Level = 1, SpellGroup = 0 (the
+        // fixture's own default), already owned by class 2 - the simplest case: nothing left to
+        // clone, just append a second, unrelated series to the same line.
         create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
 
-        let added = add_spell_to_line(&cfg, 2, "earthshatter_2", "earthshatter_2_line", None).unwrap();
+        let added = add_new_spell_series_to_line(&cfg, 2, "earthshatter_2", "earthshatter_2_line", None).unwrap();
         assert!(added.is_owned);
-        assert_eq!(added.level, 2, "one above the seeded spell's own level 1");
+        assert_eq!(added.level, 1, "a brand-new series starts fresh, not one above whatever else is in the line");
         assert_eq!(str_field(&added.fields, "Name"), "New Spell");
+        // Never inherited from the seeded spell already in the line (SpellGroup 0) - a genuinely
+        // new, unrelated series always gets its own fresh one, so the client never conflates it
+        // with whatever else already shares this line.
+        assert_ne!(int_field(&added.fields, "SpellGroup"), 0, "{:?}", added.fields);
 
         let spell_rows = run_remote_sql_json(
             &cfg,
@@ -3770,15 +3837,15 @@ mod tests {
     }
 
     #[test]
-    fn add_spell_to_line_clones_a_still_shared_lines_spec_first() {
-        let dir = setup_test_db("add-spell-shared");
+    fn add_new_spell_series_to_line_clones_a_still_shared_lines_spec_first() {
+        let dir = setup_test_db("add-series-shared");
         let cfg = test_cfg(&dir);
 
         // Class 1 has "smite" assigned under its plain, shared KeyName (never cloned through
-        // this tool) - adding a spell to its "smite_base" line must clone the whole spec (and
+        // this tool) - adding a series to its "smite_base" line must clone the whole spec (and
         // its existing spell line/spells) under class 1's own key first, exactly like editing an
         // existing spell already does.
-        let added = add_spell_to_line(&cfg, 1, "smite", "smite_base", Some(25)).unwrap();
+        let added = add_new_spell_series_to_line(&cfg, 1, "smite", "smite_base", Some(25)).unwrap();
         assert!(added.is_owned);
         assert_eq!(added.level, 25, "explicit level overrides the default");
 
@@ -3788,7 +3855,7 @@ mod tests {
         )
         .unwrap();
         // The original Smite (level 1) + Greater Smite (level 10), carried over from the clone,
-        // plus the brand-new spell just added at level 25 - 3 rows total.
+        // plus the brand-new series just added at level 25 - 3 rows total.
         assert_eq!(cloned_spells.len(), 3, "{cloned_spells:?}");
         assert_eq!(int_field(&cloned_spells[2], "Level"), 25);
 
@@ -3797,9 +3864,10 @@ mod tests {
             run_remote_sql_json(&cfg, "SELECT LineXSpell_ID FROM LineXSpell WHERE LineName = 'smite_base';").unwrap();
         assert_eq!(original_spells.len(), 2);
 
-        // The new spell is cloned from this class's own copy of "Greater Smite" (the line's own
-        // highest-level spell after cloning, not the unrelated global template) - a fully
-        // independent new SpellID, tracked the same way every other spell clone in this tool is.
+        // The new spell is a fully independent new SpellID, tracked the same way every other
+        // spell clone in this tool is - cloned from the universal global template (never from
+        // anything already in the line, unlike add_next_spell_in_series), so it's never the same
+        // ID as "Greater Smite" (9002) either.
         assert_ne!(added.spell_id, 9002);
         let ownership_rows = run_remote_sql_json(
             &cfg,
@@ -3807,6 +3875,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ownership_rows.len(), 1, "the new spell must be tracked as this class's own clone");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_next_spell_in_series_extends_an_already_owned_spells_own_series() {
+        let dir = setup_test_db("add-next-owned");
+        let cfg = test_cfg(&dir);
+
+        create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        let seeded = run_remote_sql_json(&cfg, "SELECT LineXSpell_ID, SpellID FROM LineXSpell WHERE LineName = 'earthshatter_2_line';").unwrap();
+        let seeded_line_xspell_id = str_field(&seeded[0], "LineXSpell_ID");
+        run_remote_sql(&cfg, &format!("UPDATE Spell SET SpellGroup = 777 WHERE SpellID = {};", int_field(&seeded[0], "SpellID"))).unwrap();
+
+        let added = add_next_spell_in_series(&cfg, 2, &seeded_line_xspell_id, None).unwrap();
+        assert!(added.is_owned);
+        assert_eq!(added.level, 2, "one above the source spell's own level 1");
+        assert_eq!(str_field(&added.fields, "Name"), "New Spell");
+        assert_eq!(int_field(&added.fields, "SpellGroup"), 777, "inherits the source's own SpellGroup - it's another rank of the SAME series");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_next_spell_in_series_clones_a_still_shared_spells_spec_first() {
+        let dir = setup_test_db("add-next-shared");
+        let cfg = test_cfg(&dir);
+
+        // Class 1's own "smite_base" seed spell (SpellID 9001) is still shared/un-owned - adding
+        // the next rank in its series must clone the owning spec (and this specific spell) for
+        // class 1 first, exactly like field-editing an existing spell already does.
+        let added = add_next_spell_in_series(&cfg, 1, "seed-smite-1", Some(7)).unwrap();
+        assert!(added.is_owned);
+        assert_eq!(added.level, 7, "explicit level overrides the default");
+        assert_ne!(added.spell_id, 9001, "a fully independent new clone, not the shared source itself");
+
+        let cloned_spells =
+            run_remote_sql_json(&cfg, "SELECT Level FROM LineXSpell WHERE LineName = 'smite_1_smite_base' ORDER BY Level;").unwrap();
+        assert_eq!(cloned_spells.len(), 3, "{cloned_spells:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3861,7 +3968,7 @@ mod tests {
 
         // Class 1 has "smite" assigned under its plain, shared KeyName (never cloned through
         // this tool) - renaming its "smite_base" line must clone the whole spec first, exactly
-        // like add_spell_to_line already does, never renaming the real shared line itself.
+        // like add_new_spell_series_to_line already does, never renaming the real shared line itself.
         rename_spell_line(&cfg, 1, "smite", "smite_base", "Holy Fury").unwrap();
 
         let cloned = run_remote_sql_json(&cfg, "SELECT Name FROM SpellLine WHERE KeyName = 'smite_1_smite_base';").unwrap();

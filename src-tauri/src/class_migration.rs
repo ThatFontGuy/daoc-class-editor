@@ -7,7 +7,7 @@
 //! second time against live, since that call is fully declarative (always specifies the *whole*
 //! desired spec-assignment state, never an incremental delta) - `ClassSpecsSection.tsx`'s own
 //! operations (`save_line_spell_fields`, `update_line_spell_level`, `save_style_fields`,
-//! `add_spell_to_line`, `add_style_to_spec`, ...) are all small, imperative edits to *specific
+//! `add_new_spell_series_to_line`/`add_next_spell_in_series`, `add_style_to_spec`, ...) are all small, imperative edits to *specific
 //! existing row identities* over however long a design session runs. There is no single "replay
 //! the last call" primitive that could reproduce all of that - this module instead diffs the
 //! session's own current state against live and reconciles it directly, one table at a time.
@@ -216,7 +216,7 @@ fn insert_spell_with_fresh_id(cfg: &SshConfig, fields: &Value) -> Result<i64, St
 /// every other independent spell clone in this tool already uses) from `session_cfg` onto
 /// `live_cfg` - updating an already-existing live row's own fields to match (a field edit made
 /// during the design session), or inserting a brand-new one with a fresh live `SpellID` (a spell
-/// created entirely during the session, via `add_spell_to_line`/`create_new_spell_spec`, or one
+/// created entirely during the session, via `add_new_spell_series_to_line`/`add_next_spell_in_series`/`create_new_spell_spec`, or one
 /// newly cloned the moment a still-shared line was first touched) otherwise, recording its own
 /// `ClassEditorSpellClone` row on live too so it's immediately recognized as already-owned by any
 /// later direct live edit. Returns every owned spell's own session-side `SpellID` mapped to
@@ -429,7 +429,7 @@ fn sync_style_procs(
 /// own doc comment) - updating `SpellID` (remapped through `spell_id_map`)/`Level` on an already-
 /// existing live row if either changed (a level edit, or a spell swapped in via
 /// `ensure_line_owned`'s own first-touch cloning), or inserting a brand-new one (a new spell added
-/// via `add_spell_to_line`, or an entire line newly cloned this session) otherwise.
+/// via `add_new_spell_series_to_line`/`add_next_spell_in_series`, or an entire line newly cloned this session) otherwise.
 fn sync_line_memberships(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64, spell_id_map: &HashMap<i64, i64>) -> Result<(usize, usize), String> {
     let owned_keys = owned_spec_keys(session_cfg, class_id)?;
     if owned_keys.is_empty() {
@@ -562,7 +562,7 @@ pub fn migrate_class_design_to_live(session_cfg: &SshConfig, live_cfg: &SshConfi
 mod tests {
     use super::*;
     use crate::specs::{
-        add_spell_to_line, add_style_to_spec, create_new_combat_spec, create_new_spell_spec,
+        add_new_spell_series_to_line, add_style_to_spec, create_new_combat_spec, create_new_spell_spec,
     };
     use std::process::Command;
 
@@ -626,7 +626,7 @@ mod tests {
         // Everything below happens only against the session - live never sees any of it until
         // migrate_class_design_to_live runs.
         create_new_spell_spec(&session, 2, "Earthshatter", 5).unwrap();
-        add_spell_to_line(&session, 2, "earthshatter_2", "earthshatter_2_line", None).unwrap();
+        add_new_spell_series_to_line(&session, 2, "earthshatter_2", "earthshatter_2_line", Some(2)).unwrap();
         create_new_combat_spec(&session, 2, "Ironwill", 1).unwrap();
         add_style_to_spec(&session, 2, "ironwill_2", None).unwrap();
 

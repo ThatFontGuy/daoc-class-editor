@@ -321,7 +321,7 @@ fn add_style_to_spec(
 }
 
 #[tauri::command]
-fn add_spell_to_line(
+fn add_new_spell_series_to_line(
     cfg: SshConfig,
     class_id: i64,
     spec_key: String,
@@ -329,7 +329,18 @@ fn add_spell_to_line(
     level: Option<i64>,
 ) -> Result<specs::OwnedSpellInLine, String> {
     deploy::ensure_safe_to_write(&cfg)?;
-    specs::add_spell_to_line(&cfg, class_id, &spec_key, &line_key, level)
+    specs::add_new_spell_series_to_line(&cfg, class_id, &spec_key, &line_key, level)
+}
+
+#[tauri::command]
+fn add_next_spell_in_series(
+    cfg: SshConfig,
+    class_id: i64,
+    source_line_xspell_id: String,
+    level: Option<i64>,
+) -> Result<specs::OwnedSpellInLine, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::add_next_spell_in_series(&cfg, class_id, &source_line_xspell_id, level)
 }
 
 #[tauri::command]
@@ -522,7 +533,8 @@ pub fn run() {
             create_new_combat_spec,
             create_new_spell_spec,
             add_style_to_spec,
-            add_spell_to_line,
+            add_new_spell_series_to_line,
+            add_next_spell_in_series,
             rename_spell_line,
             update_line_spell_level,
             update_style_level,
