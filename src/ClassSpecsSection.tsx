@@ -710,6 +710,35 @@ function SpellSpecEditor({
     }
   }
 
+  /** Deletes one spell outright - the "Delete" button, right between each individual spell's own
+   * Edit and "+ Add Next Spell" buttons. A real, reported gap: there was no way at all to remove
+   * a spell once added, only to keep editing its fields in place forever. Always confirmed first
+   * (same as every other destructive action in this tool), since there's no undo. */
+  async function deleteSpell(item: OwnedSpellInLine) {
+    if (busyRef.current) return;
+    const name = String(item.fields.Name ?? `spell ${item.spell_id}`);
+    if (!confirm(`Delete "${name}" (level ${item.level}) entirely? This cannot be undone.`)) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus("Deleting..."));
+    try {
+      const cfg = await ensureCfg();
+      await invoke("delete_spell_from_line", {
+        cfg,
+        classId,
+        lineXspellId: item.line_xspell_id,
+      });
+      setStatus(okStatus(`Deleted "${name}".`));
+      busyRef.current = false; // see the matching comment in save() above
+      await load();
+    } catch (e) {
+      setStatus(errorStatus(`Delete failed: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
   /** Renames a spell line's own display Name - a real, reported gap: there was no way at all to
    * rename a line once created (short of recreating the whole thing from scratch), most visible
    * for the common case of a spec with only one spell line, where the line's own name wasn't
@@ -894,6 +923,9 @@ function SpellSpecEditor({
                                   <button onClick={() => startEditing(item)} disabled={busy}>
                                     Edit
                                   </button>{" "}
+                                  <button onClick={() => deleteSpell(item)} disabled={busy} className="danger">
+                                    Delete
+                                  </button>{" "}
                                   <button onClick={() => addNextSpell(item)} disabled={busy}>
                                     + Add Next Spell
                                   </button>
@@ -939,12 +971,14 @@ function SpecSummaryRow({
   spec,
   expanded,
   onToggle,
+  onDelete,
   busy,
   children,
 }: {
   spec: ClassSpecSummary;
   expanded: boolean;
   onToggle: () => void;
+  onDelete: () => void;
   busy: boolean;
   children: React.ReactNode;
 }) {
@@ -957,6 +991,9 @@ function SpecSummaryRow({
         <td>
           <button onClick={onToggle} disabled={busy}>
             {expanded ? "Hide" : "Edit"}
+          </button>{" "}
+          <button onClick={onDelete} disabled={busy} className="danger">
+            Delete
           </button>
         </td>
       </tr>
@@ -1191,6 +1228,47 @@ export default function ClassSpecsSection({
     }
   }
 
+  /** Deletes a spec outright - the "Delete" button next to each spec's own Edit/Hide toggle in
+   * the "Combat specs"/"Spells" summary lists. A real, reported gap: there was no way to remove a
+   * spec from the Classes tab at all, short of going through the Clone Wizard's own whole-list
+   * resubmission flow instead. Always confirmed first, since there's no undo - see
+   * `delete_class_spec` on the Rust side for exactly what gets removed (its whole independent
+   * clone) versus merely unassigned (a still-shared/stock spec, whose real data other classes
+   * might still be using is always left untouched). */
+  async function deleteSpec(spec: ClassSpecSummary) {
+    if (
+      !confirm(
+        `Delete "${spec.name}" from this class entirely?\n\n` +
+          (spec.is_owned
+            ? "This removes its whole spec/spell line/spell/style data - it's this class's own independent copy, nothing else uses it."
+            : "This only unassigns it from this class - it's still shared/stock, so its real data (other classes may use it) is left untouched.") +
+          "\n\nAny existing character already using this class would have its points in this spec reset (a free respec is granted). This cannot be undone.",
+      )
+    )
+      return;
+    setBusy(true);
+    setStatus(okStatus(`Deleting "${spec.name}"...`));
+    try {
+      const cfg = await ensureCfg();
+      const result = await invoke<string>("delete_class_spec", {
+        cfg,
+        classId,
+        specKey: spec.key_name,
+      });
+      setStatus(okStatus(result));
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        next.delete(spec.key_name);
+        return next;
+      });
+      await load();
+    } catch (e) {
+      setStatus(errorStatus(`Delete failed: ${e}`));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // A spec with styles is always a combat spec, full stop, even if it also happens to carry an
   // incidental SpellLine of its own (a real, reproduced case: "Shields" has both 157 Style rows
   // *and* a "Warrior Shields (Live)" spell line, presumably internal bookkeeping for some
@@ -1296,6 +1374,7 @@ export default function ClassSpecsSection({
                   spec={s}
                   expanded={expanded.has(s.key_name)}
                   onToggle={() => toggle(s.key_name)}
+                  onDelete={() => deleteSpec(s)}
                   busy={busy}
                 >
                   <CombatSpecEditor currentCfg={currentCfg} ensureCfg={ensureCfg} classId={classId} specKey={s.key_name} />
@@ -1330,6 +1409,7 @@ export default function ClassSpecsSection({
                   spec={s}
                   expanded={expanded.has(s.key_name)}
                   onToggle={() => toggle(s.key_name)}
+                  onDelete={() => deleteSpec(s)}
                   busy={busy}
                 >
                   <SpellSpecEditor currentCfg={currentCfg} ensureCfg={ensureCfg} classId={classId} specKey={s.key_name} onSpecRenamed={load} />

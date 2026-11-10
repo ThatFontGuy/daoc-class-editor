@@ -906,6 +906,58 @@ pub fn rename_spell_line(
     Ok(format!("renamed to \"{trimmed}\""))
 }
 
+/// Deletes one spell from its own line entirely - the `LineXSpell` membership row, and (if this
+/// class's own independent clone, tracked via `ClassEditorSpellClone` - never a still-shared
+/// spell, which might still be in active use by some other class/spec line) the underlying
+/// `Spell` row itself too, via `delete_owned_spells`. The "Delete" button counterpart, right next
+/// to each individual spell's own Edit button in `SpellSpecEditor` - a real, reported gap: there
+/// was no way at all to remove a spell once added, only to keep editing its fields in place.
+///
+/// Ensures the owning spec (and this specific spell) are independently owned by `class_id` first,
+/// exactly like field-editing an existing spell already does (`ensure_line_owned`) - deleting a
+/// still-shared line's own `LineXSpell` row directly would remove it from *every* class sharing
+/// that line, not just this one.
+pub fn delete_spell_from_line(cfg: &SshConfig, class_id: i64, line_xspell_id: &str) -> Result<String, String> {
+    let (owned_line_xspell_id, owned_spell_id) = ensure_line_owned(cfg, class_id, line_xspell_id)?;
+    let owned_line_xspell_id_q = sql_quote(&owned_line_xspell_id);
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM LineXSpell WHERE LineXSpell_ID = '{owned_line_xspell_id_q}';"),
+    )?;
+    delete_owned_spells(cfg, &[owned_spell_id])?;
+    Ok("deleted".to_string())
+}
+
+/// Removes `spec_key` entirely from `class_id`'s own spec assignments - the "Delete spec" button
+/// counterpart to `ClassSpecsSection.tsx`'s own per-spec summary row, for deleting a spec outright
+/// without going through the Clone Wizard's own whole-list resubmission flow at all (a real,
+/// reported gap: there was no way to remove a spec from the Classes tab directly). Reuses exactly
+/// the same removal logic `apply_class_specs` already applies to a spec dropped from its own
+/// assignment list - see its own doc comment above `delete_existing_clone`'s own call site for
+/// the full reasoning: deletes this class's own independent clone entirely (Specialization/
+/// SpellLine/LineXSpell/Spell/Style/SpecXAbility) if it's one, or just unassigns (never deletes)
+/// a still-shared/stock spec's own `ClassXSpecialization` row (and this class's own locked
+/// styles, if any) otherwise - scrubs `spec_key` from every character's own saved
+/// `SerializedSpecs` first (the exact login crash `scrub_spec_from_characters`'s own doc comment
+/// describes), and grants a free full respec token to every character currently on this class
+/// afterward, for the identical reason.
+pub fn delete_class_spec(cfg: &SshConfig, class_id: i64, spec_key: &str) -> Result<String, String> {
+    let mut log = scrub_spec_from_characters(cfg, class_id, spec_key)?;
+    let suffix = format!("_{class_id}");
+    if spec_key.ends_with(&suffix) {
+        delete_existing_clone(cfg, spec_key)?;
+        log.push_str(&format!("removed '{spec_key}' from this class entirely\n"));
+    } else {
+        unassign_shared_spec_from_class(cfg, class_id, spec_key)?;
+        log.push_str(&format!(
+            "unassigned '{spec_key}' from this class only - its real Specialization/SpellLine/Style \
+             data (shared by other classes) was left untouched\n"
+        ));
+    }
+    log.push_str(&grant_respec_to_characters(cfg, class_id)?);
+    Ok(log)
+}
+
 
 /// Fields worth suggesting type-appropriate defaults for - everything in
 /// `ClassSpecsSection.tsx`'s own `EDITABLE_SPELL_FIELD_HINTS` except Name/Type/Description/
@@ -3988,6 +4040,87 @@ mod tests {
         create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
         let result = rename_spell_line(&cfg, 2, "earthshatter_2", "earthshatter_2_line", "   ");
         assert!(result.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_spell_from_line_removes_an_already_owned_spell() {
+        let dir = setup_test_db("delete-spell-owned");
+        let cfg = test_cfg(&dir);
+
+        create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        let seeded = run_remote_sql_json(&cfg, "SELECT LineXSpell_ID, SpellID FROM LineXSpell WHERE LineName = 'earthshatter_2_line';").unwrap();
+        let line_xspell_id = str_field(&seeded[0], "LineXSpell_ID");
+        let spell_id = int_field(&seeded[0], "SpellID");
+
+        delete_spell_from_line(&cfg, 2, &line_xspell_id).unwrap();
+
+        let remaining = run_remote_sql_json(&cfg, "SELECT 1 FROM LineXSpell WHERE LineName = 'earthshatter_2_line';").unwrap();
+        assert!(remaining.is_empty(), "{remaining:?}");
+        let spell_gone = run_remote_sql_json(&cfg, &format!("SELECT 1 FROM Spell WHERE SpellID = {spell_id};")).unwrap();
+        assert!(spell_gone.is_empty(), "the owned spell's own Spell row must be deleted too");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_spell_from_line_clones_a_still_shared_lines_spec_first_then_deletes_just_this_rank() {
+        let dir = setup_test_db("delete-spell-shared");
+        let cfg = test_cfg(&dir);
+
+        // Class 1's own "smite_base" seed spell (SpellID 9001, via LineXSpell_ID 'seed-smite-1')
+        // is still shared/un-owned - deleting it must clone the owning spec (and this specific
+        // spell) for class 1 first, exactly like field-editing an existing spell already does,
+        // never deleting the still-shared original line's own row.
+        delete_spell_from_line(&cfg, 1, "seed-smite-1").unwrap();
+
+        let cloned_remaining = run_remote_sql_json(&cfg, "SELECT Level FROM LineXSpell WHERE LineName = 'smite_1_smite_base';").unwrap();
+        assert_eq!(cloned_remaining.len(), 1, "only the other rank (level 10) should survive: {cloned_remaining:?}");
+        assert_eq!(int_field(&cloned_remaining[0], "Level"), 10);
+
+        let original_untouched = run_remote_sql_json(&cfg, "SELECT 1 FROM LineXSpell WHERE LineXSpell_ID = 'seed-smite-1';").unwrap();
+        assert_eq!(original_untouched.len(), 1, "the real, still-shared original row must be completely untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_class_spec_removes_an_owned_clone_entirely() {
+        let dir = setup_test_db("delete-spec-owned");
+        let cfg = test_cfg(&dir);
+
+        create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        let log = delete_class_spec(&cfg, 2, "earthshatter_2").unwrap();
+        assert!(log.contains("removed 'earthshatter_2' from this class entirely"), "{log}");
+
+        let spec_gone = run_remote_sql_json(&cfg, "SELECT 1 FROM Specialization WHERE KeyName = 'earthshatter_2';").unwrap();
+        assert!(spec_gone.is_empty());
+        let assignment_gone =
+            run_remote_sql_json(&cfg, "SELECT 1 FROM ClassXSpecialization WHERE ClassID = 2 AND SpecKeyName = 'earthshatter_2';").unwrap();
+        assert!(assignment_gone.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_class_spec_unassigns_a_shared_key_without_touching_its_real_data() {
+        let dir = setup_test_db("delete-spec-shared");
+        let cfg = test_cfg(&dir);
+
+        let log = delete_class_spec(&cfg, 1, "smite").unwrap();
+        assert!(log.contains("unassigned 'smite' from this class only"), "{log}");
+
+        let assignment_gone =
+            run_remote_sql_json(&cfg, "SELECT 1 FROM ClassXSpecialization WHERE ClassID = 1 AND SpecKeyName = 'smite';").unwrap();
+        assert!(assignment_gone.is_empty());
+
+        // The real, shared "smite" spec/line/spells must be completely untouched - some other
+        // class might still be using it.
+        let spec_survives = run_remote_sql_json(&cfg, "SELECT 1 FROM Specialization WHERE KeyName = 'smite';").unwrap();
+        assert_eq!(spec_survives.len(), 1);
+        let spells_survive = run_remote_sql_json(&cfg, "SELECT 1 FROM LineXSpell WHERE LineName = 'smite_base';").unwrap();
+        assert_eq!(spells_survive.len(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }

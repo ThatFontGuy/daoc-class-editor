@@ -350,6 +350,18 @@ fn rename_spell_line(cfg: SshConfig, class_id: i64, spec_key: String, line_key: 
 }
 
 #[tauri::command]
+fn delete_spell_from_line(cfg: SshConfig, class_id: i64, line_xspell_id: String) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::delete_spell_from_line(&cfg, class_id, &line_xspell_id)
+}
+
+#[tauri::command]
+fn delete_class_spec(cfg: SshConfig, class_id: i64, spec_key: String) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::delete_class_spec(&cfg, class_id, &spec_key)
+}
+
+#[tauri::command]
 fn update_line_spell_level(
     cfg: SshConfig,
     class_id: i64,
@@ -536,6 +548,8 @@ pub fn run() {
             add_new_spell_series_to_line,
             add_next_spell_in_series,
             rename_spell_line,
+            delete_spell_from_line,
+            delete_class_spec,
             update_line_spell_level,
             update_style_level,
             update_owned_spell_fields,
