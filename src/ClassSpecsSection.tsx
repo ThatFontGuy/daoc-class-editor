@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ClassSpecSummary,
-  DamageTypeOption,
+  EnumOption,
   KnownOptions,
   OwnedSpellInLine,
   SpellLineGroup,
@@ -120,6 +120,35 @@ function splitPrimaryFields(keys: string[], primary: string[]): { primaryKeys: s
   };
 }
 
+/** A plain `<select>` of `options` (each a real `{name, value}` straight from the server's own
+ * vendored enum - see KnownOptions's own doc comments on the Rust side for which field this
+ * backs) - falls back to showing `current` marked "(unrecognized)" if it doesn't match any of
+ * them (a value set before this picker existed, or directly via SQL), so nothing already present
+ * is ever silently hidden or clobbered just by opening the editor. Shared by every numeric-enum
+ * dropdown in both the spell and combat-skill (Style) field editors (DamageType,
+ * WeaponTypeRequirement, AttackResultRequirement, OpeningRequirementType/Value). */
+function EnumDropdown({
+  options,
+  current,
+  onChange,
+}: {
+  options: EnumOption[];
+  current: string;
+  onChange: (value: string) => void;
+}) {
+  const known = options.some((o) => String(o.value) === current);
+  return (
+    <select value={current} onChange={(e) => onChange(e.target.value)}>
+      {current !== "" && !known && <option value={current}>{current} (unrecognized)</option>}
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 /** One spec's combat styles, fetched and edited only once its own row is actually expanded -
  * cloning/granting this class its own copy of a style on the spot the moment it's actually saved
  * (see `save_style_fields`/`update_style_level` on the Rust side), whether the spec is one of
@@ -151,7 +180,24 @@ function CombatSpecEditor({
   const [levelDrafts, setLevelDrafts] = useState<Record<number, string>>({});
   const [status, setStatus] = useState<StatusState>(emptyStatus);
   const [busy, setBusy] = useState(false);
+  // WeaponTypeRequirement/AttackResultRequirement/OpeningRequirementType/OpeningRequirementValue
+  // (the last only when OpeningRequirementType is Positional) all get a dropdown of real values
+  // instead of a bare number a typo could silently turn into an unrecognized one - see
+  // renderStyleDraftField's own doc comment.
+  const [weaponTypes, setWeaponTypes] = useState<EnumOption[]>([]);
+  const [attackResults, setAttackResults] = useState<EnumOption[]>([]);
+  const [openingTypes, setOpeningTypes] = useState<EnumOption[]>([]);
+  const [openingPositions, setOpeningPositions] = useState<EnumOption[]>([]);
   const busyRef = useRef(false);
+
+  useEffect(() => {
+    invoke<KnownOptions>("known_options").then((opts) => {
+      setWeaponTypes(opts.weapon_type_requirements);
+      setAttackResults(opts.attack_result_requirements);
+      setOpeningTypes(opts.opening_requirement_types);
+      setOpeningPositions(opts.opening_positions);
+    });
+  }, []);
 
   useEffect(() => {
     load();
@@ -322,6 +368,49 @@ function CombatSpecEditor({
     }
   }
 
+  /** WeaponTypeRequirement/AttackResultRequirement/OpeningRequirementType each get a dropdown of
+   * every real value instead of a bare number a typo could silently turn into an unrecognized
+   * one - see KnownOptions's own doc comments on the Rust side for exactly what each list is.
+   *
+   * OpeningRequirementValue's own real meaning depends entirely on whatever
+   * OpeningRequirementType currently is: only when it's "Positional" (2) does
+   * OpeningRequirementValue hold one of a small, fixed set of real values (Back/Side/Front) worth
+   * a dropdown at all - for "Offensive"/"Defensive" (0/1) it instead holds a prerequisite style's
+   * own StyleID (0 meaning "any style"), which has no fixed, known-good list to offer, so it
+   * stays a plain number there, with a hint explaining what it actually means right now. */
+  function renderStyleDraftField(key: string) {
+    const onChange = (value: string) => setDraft((prev) => ({ ...prev, [key]: value }));
+    if (key === "WeaponTypeRequirement") {
+      return <EnumDropdown options={weaponTypes} current={draft[key] ?? ""} onChange={onChange} />;
+    }
+    if (key === "AttackResultRequirement") {
+      return <EnumDropdown options={attackResults} current={draft[key] ?? ""} onChange={onChange} />;
+    }
+    if (key === "OpeningRequirementType") {
+      return <EnumDropdown options={openingTypes} current={draft[key] ?? ""} onChange={onChange} />;
+    }
+    if (key === "OpeningRequirementValue") {
+      if ((draft.OpeningRequirementType ?? "") === "2") {
+        return <EnumDropdown options={openingPositions} current={draft[key] ?? ""} onChange={onChange} />;
+      }
+      return (
+        <>
+          <input
+            value={draft[key] ?? ""}
+            onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+          />
+          <span className="hint">0 = any style; otherwise the prerequisite style's own StyleID</span>
+        </>
+      );
+    }
+    return (
+      <input
+        value={draft[key] ?? ""}
+        onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+      />
+    );
+  }
+
   return (
     <div>
       {busy && <p className="hint">⏳ Working - please wait...</p>}
@@ -398,20 +487,14 @@ function CombatSpecEditor({
                         {primaryKeys.map((key) => (
                           <label className="field" key={key}>
                             <span>{key}</span>
-                            <input
-                              value={draft[key] ?? ""}
-                              onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-                            />
+                            {renderStyleDraftField(key)}
                           </label>
                         ))}
                         <div className="compact-field-grid">
                           {restKeys.map((key) => (
                             <label className="field" key={key}>
                               <span>{key}</span>
-                              <input
-                                value={draft[key] ?? ""}
-                                onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
-                              />
+                              {renderStyleDraftField(key)}
                             </label>
                           ))}
                         </div>
@@ -461,7 +544,7 @@ function SpellSpecEditor({
   const [spellTypes, setSpellTypes] = useState<string[]>([]);
   // Name -> real numeric eDamageType value - lets DamageType offer a dropdown of real damage
   // types instead of a bare number a typo could silently turn into an unrecognized value.
-  const [damageTypes, setDamageTypes] = useState<DamageTypeOption[]>([]);
+  const [damageTypes, setDamageTypes] = useState<EnumOption[]>([]);
   // What's typical for whatever Type the spell currently being edited has - refreshed every time
   // Type changes, so the rest of the form can suggest (and, the first time Type is actually
   // picked after this field was first offered, auto-fill) values consistent with the rest of the
@@ -812,17 +895,12 @@ function SpellSpecEditor({
     // Same idea as Type, but DamageType is a plain integer column, not a string one - the
     // dropdown's own value is the real eDamageType numeric value, its label the human name.
     if (key === "DamageType") {
-      const current = draft[key] ?? "";
-      const known = damageTypes.some((d) => String(d.value) === current);
       return (
-        <select value={current} onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}>
-          {current !== "" && !known && <option value={current}>{current} (unrecognized)</option>}
-          {damageTypes.map((d) => (
-            <option key={d.value} value={d.value}>
-              {d.name}
-            </option>
-          ))}
-        </select>
+        <EnumDropdown
+          options={damageTypes}
+          current={draft[key] ?? ""}
+          onChange={(value) => setDraft((prev) => ({ ...prev, [key]: value }))}
+        />
       );
     }
     // MoveCast ("can this be cast while moving")/Uninterruptible ("can this cast be interrupted

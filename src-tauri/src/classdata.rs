@@ -588,16 +588,53 @@ pub struct KnownOptions {
     /// numeric value, since `DamageType` itself is a plain integer column, not a string one like
     /// `Type`. `GM`/`Falling` (254/255 - a GM command, or fall damage) are deliberately excluded;
     /// neither is ever a real choice when authoring a spell.
-    pub damage_types: Vec<DamageTypeOption>,
+    pub damage_types: Vec<EnumOption>,
+    /// Every real weapon-like `eObjectType` value (`GenericWeapon` through `MaulerStaff`,
+    /// covering every realm's own weapon skills - armor/housing/siege values are deliberately
+    /// excluded, never a real choice for a style's own weapon requirement) plus the two special
+    /// non-`eObjectType` sentinel values `Style.SpecialWeaponType` itself defines
+    /// (`DualWield`=1000, `AnyWeapon`=1001) appended after them - straight from the vendored
+    /// `eObjectType.cs`/`Style.cs`. Lets the combat-skill (Style) field editor offer
+    /// `WeaponTypeRequirement` as a picker instead of a bare number.
+    pub weapon_type_requirements: Vec<EnumOption>,
+    /// Every real `Style.eAttackResultRequirement` value (`Any`/`Miss`/`Hit`/`Parry`/`Block`/
+    /// `Evade`/`Fumble`/`Style`), straight from the vendored enum - lets a Style's own
+    /// `AttackResultRequirement` be picked from a known-good list instead of a bare number.
+    pub attack_result_requirements: Vec<EnumOption>,
+    /// Every real `Style.eOpening` value (`Offensive`/`Defensive`/`Positional`), straight from
+    /// the vendored enum - lets a Style's own `OpeningRequirementType` be picked from a known-
+    /// good list instead of a bare number.
+    pub opening_requirement_types: Vec<EnumOption>,
+    /// Every real `Style.eOpeningPosition` value (`Back`/`Side`/`Front`) - only meaningful for a
+    /// Style's own `OpeningRequirementValue` when its `OpeningRequirementType` is `Positional`
+    /// (2); for `Offensive`/`Defensive` (0/1), `OpeningRequirementValue` instead holds a
+    /// prerequisite style's own `StyleID` (0 meaning "any style"), which has no fixed, known-good
+    /// list to offer at all - see `Style.OpeningRequirementValue`'s own doc comment in the real
+    /// source for the full, conditional meaning.
+    pub opening_positions: Vec<EnumOption>,
     /// Race name -> realm ("Albion"/"Midgard"/"Hibernia"), so the frontend can filter the full
     /// race list down to just the realm of whatever class is being cloned.
     pub race_realms: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DamageTypeOption {
+pub struct EnumOption {
     pub name: String,
     pub value: i64,
+}
+
+/// Locates one named enum's own `{ ... }` block within `text` - shared by `extract_enum_members`/
+/// `extract_enum_values` below. Matches on a real word boundary right after `enum_name` (never a
+/// bare substring search), since a real, found case exists where one enum's own name is a literal
+/// prefix of another declared later in the exact same file (`Style.cs`'s own `eOpening` versus
+/// `eOpeningPosition`) - a plain `text.find("enum eOpening")` would just as happily match "enum
+/// eOpeningPosition" too, only working by sheer luck of declaration order.
+fn find_enum_block<'a>(text: &'a str, enum_name: &str) -> Option<&'a str> {
+    let start_re = Regex::new(&format!(r"enum\s+{}\b", regex::escape(enum_name))).ok()?;
+    let start = start_re.find(text)?.start();
+    let open = text[start..].find('{')? + start;
+    let close = text[open..].find('}')? + open;
+    Some(&text[open..close])
 }
 
 /// Extracts every member name from a plain `enum X { A, B, C, ... }` block (neither `eClassType`
@@ -606,10 +643,7 @@ pub struct DamageTypeOption {
 /// sneak in as a false match.
 fn extract_enum_members(text: &str, enum_name: &str) -> Vec<String> {
     (|| {
-        let start = text.find(&format!("enum {enum_name}"))?;
-        let open = text[start..].find('{')? + start;
-        let close = text[open..].find('}')? + open;
-        let block = &text[open..close];
+        let block = find_enum_block(text, enum_name)?;
         let re = Regex::new(r"(?m)^\s*(\w+)\s*,?\s*$").ok()?;
         Some(
             re.captures_iter(block)
@@ -621,14 +655,15 @@ fn extract_enum_members(text: &str, enum_name: &str) -> Vec<String> {
 }
 
 /// `extract_enum_members`'s own counterpart for an enum whose members *do* assign explicit
-/// numeric values (`eDamageType`, unlike `eClassType`/`eSpellType`) - returns `(name, value)`
-/// pairs in declaration order, scoped to the same one enum's own `{ ... }` block.
+/// numeric values (`eDamageType`/`eObjectType`/`Style`'s own `eOpening`/`eOpeningPosition`/
+/// `eAttackResultRequirement`, unlike `eClassType`/`eSpellType`) - returns `(name, value)` pairs
+/// in declaration order, scoped to the same one enum's own `{ ... }` block. A member whose own
+/// value is followed by an inline `//` comment on the same line (a real shape found in
+/// `eObjectType.cs`'s own housing/siege entries) is simply skipped, not matched at all - harmless
+/// here, since every caller already filters down to a narrow, known-relevant value range anyway.
 fn extract_enum_values(text: &str, enum_name: &str) -> Vec<(String, i64)> {
     (|| {
-        let start = text.find(&format!("enum {enum_name}"))?;
-        let open = text[start..].find('{')? + start;
-        let close = text[open..].find('}')? + open;
-        let block = &text[open..close];
+        let block = find_enum_block(text, enum_name)?;
         let re = Regex::new(r"(?m)^\s*(\w+)\s*=\s*(\d+)\s*,?\s*$").ok()?;
         Some(
             re.captures_iter(block)
@@ -639,10 +674,10 @@ fn extract_enum_values(text: &str, enum_name: &str) -> Vec<(String, i64)> {
     .unwrap_or_default()
 }
 
-/// Extracts the canonical stat/race/class-type/spell-type/damage-type names straight from the
-/// vendored source files (eStat.cs, PlayerRace.cs, ICharacterClass.cs, eSpellType.cs,
-/// eDamageType.cs) rather than hardcoding lists in the frontend, so this stays correct if the
-/// server's own enums ever change.
+/// Extracts the canonical stat/race/class-type/spell-type/damage-type/style-requirement names
+/// straight from the vendored source files (eStat.cs, PlayerRace.cs, ICharacterClass.cs,
+/// eSpellType.cs, eDamageType.cs, eObjectType.cs, Style.cs) rather than hardcoding lists in the
+/// frontend, so this stays correct if the server's own enums ever change.
 pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
     // `_First`/`_Last` are sentinel bounds, not real trainable stats - skip anything starting `_`.
     let stats = extract_idents(
@@ -670,7 +705,36 @@ pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
         .unwrap_or_default()
         .into_iter()
         .filter(|(name, value)| !name.starts_with('_') && *value <= 15)
-        .map(|(name, value)| DamageTypeOption { name, value })
+        .map(|(name, value)| EnumOption { name, value })
+        .collect();
+    // `_FirstWeapon`/`_LastWeapon` (2/28) bound the real weapon types - GenericWeapon (1) is
+    // included too (a real, valid "any weapon" requirement); every armor/housing/siege value
+    // past that is never a real choice for a style's own weapon requirement. `DualWield`/
+    // `AnyWeapon` (1000/1001) aren't `eObjectType` values at all - they're Style.cs's own
+    // `SpecialWeaponType` sentinels, stable and small enough to just state directly here rather
+    // than build a whole separate `public const int X = N;` extraction mechanism for two values.
+    let mut weapon_type_requirements: Vec<EnumOption> =
+        std::fs::read_to_string(resources_dir.join("core").join("eObjectType.cs"))
+            .map(|text| extract_enum_values(&text, "eObjectType"))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(name, value)| !name.starts_with('_') && *value >= 1 && *value <= 28)
+            .map(|(name, value)| EnumOption { name, value })
+            .collect();
+    weapon_type_requirements.push(EnumOption { name: "DualWield".to_string(), value: 1000 });
+    weapon_type_requirements.push(EnumOption { name: "AnyWeapon".to_string(), value: 1001 });
+    let style_text = std::fs::read_to_string(resources_dir.join("core").join("Style.cs")).unwrap_or_default();
+    let attack_result_requirements = extract_enum_values(&style_text, "eAttackResultRequirement")
+        .into_iter()
+        .map(|(name, value)| EnumOption { name, value })
+        .collect();
+    let opening_requirement_types = extract_enum_values(&style_text, "eOpening")
+        .into_iter()
+        .map(|(name, value)| EnumOption { name, value })
+        .collect();
+    let opening_positions = extract_enum_values(&style_text, "eOpeningPosition")
+        .into_iter()
+        .map(|(name, value)| EnumOption { name, value })
         .collect();
     KnownOptions {
         stats,
@@ -678,6 +742,10 @@ pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
         class_types,
         spell_types,
         damage_types,
+        weapon_type_requirements,
+        attack_result_requirements,
+        opening_requirement_types,
+        opening_positions,
         race_realms,
     }
 }
@@ -1143,6 +1211,66 @@ mod known_options_tests {
             ],
             "{:?}",
             opts.damage_types
+        );
+
+        // Every real weapon-like eObjectType value, plus Style.cs's own two special
+        // SpecialWeaponType sentinels appended after them - armor/housing/siege values excluded.
+        let weapon_names: Vec<&str> = opts.weapon_type_requirements.iter().map(|o| o.name.as_str()).collect();
+        assert!(weapon_names.contains(&"GenericWeapon"));
+        assert!(weapon_names.contains(&"Sword"));
+        assert!(weapon_names.contains(&"MaulerStaff"));
+        assert!(!weapon_names.contains(&"Shield"), "{weapon_names:?}");
+        assert!(!weapon_names.contains(&"Cloth"), "{weapon_names:?}");
+        assert_eq!(
+            opts.weapon_type_requirements.last().map(|o| (o.name.as_str(), o.value)),
+            Some(("AnyWeapon", 1001))
+        );
+        assert_eq!(
+            opts.weapon_type_requirements[opts.weapon_type_requirements.len() - 2]
+                .name
+                .as_str(),
+            "DualWield"
+        );
+
+        // Style.cs's own eAttackResultRequirement/eOpening/eOpeningPosition - the real, found
+        // case this all exists to get right: "eOpening" is a literal prefix of "eOpeningPosition"
+        // declared later in the exact same file, so each of these three must resolve to its own
+        // real enum block, never accidentally bleeding into the other.
+        assert_eq!(
+            opts.attack_result_requirements
+                .iter()
+                .map(|d| (d.name.as_str(), d.value))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Any", 0),
+                ("Miss", 1),
+                ("Hit", 2),
+                ("Parry", 3),
+                ("Block", 4),
+                ("Evade", 5),
+                ("Fumble", 6),
+                ("Style", 7),
+            ],
+            "{:?}",
+            opts.attack_result_requirements
+        );
+        assert_eq!(
+            opts.opening_requirement_types
+                .iter()
+                .map(|d| (d.name.as_str(), d.value))
+                .collect::<Vec<_>>(),
+            vec![("Offensive", 0), ("Defensive", 1), ("Positional", 2)],
+            "{:?}",
+            opts.opening_requirement_types
+        );
+        assert_eq!(
+            opts.opening_positions
+                .iter()
+                .map(|d| (d.name.as_str(), d.value))
+                .collect::<Vec<_>>(),
+            vec![("Back", 0), ("Side", 1), ("Front", 2)],
+            "{:?}",
+            opts.opening_positions
         );
     }
 }

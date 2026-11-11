@@ -35,6 +35,10 @@ export default function ClonePanel() {
     class_types: [],
     spell_types: [],
     damage_types: [],
+    weapon_type_requirements: [],
+    attack_result_requirements: [],
+    opening_requirement_types: [],
+    opening_positions: [],
     race_realms: {},
   });
   const [sshConfig, setSshConfig] = useState<SshConfig>(emptySshConfig);

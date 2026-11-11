@@ -46,7 +46,7 @@ export function leafClassesOf(classes: ClassInfo[]): ClassInfo[] {
   return classes.filter((c) => c.parent_ident !== "CharacterClassBase");
 }
 
-export interface DamageTypeOption {
+export interface EnumOption {
   name: string;
   value: number;
 }
@@ -56,7 +56,11 @@ export interface KnownOptions {
   races: string[];
   class_types: string[];
   spell_types: string[];
-  damage_types: DamageTypeOption[];
+  damage_types: EnumOption[];
+  weapon_type_requirements: EnumOption[];
+  attack_result_requirements: EnumOption[];
+  opening_requirement_types: EnumOption[];
+  opening_positions: EnumOption[];
   race_realms: Record<string, string>;
 }
 
