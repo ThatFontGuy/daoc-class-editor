@@ -173,10 +173,20 @@ select {
 .compact-field-grid .field {
   margin-bottom: 0;
   gap: 0.1rem;
+  /* Without this, a flex item's default min-width (`auto`) refuses to shrink narrower than its
+     own content's natural (unwrapped) width - exactly what let a long single-word label
+     (WeaponTypeRequirement, AttackResultRequirement, OpeningRequirementValue, ...) overflow this
+     grid cell's own 100px-ish column and visually overlap the next field over, a real, reported
+     readability bug in the combat-skill (Style) field editor. */
+  min-width: 0;
 }
 
 .compact-field-grid .field span {
   font-size: 0.7rem;
+  /* Lets a long single-word label wrap onto a second line within its own cell instead of
+     overflowing past its own column's right edge - see this rule's own .field sibling above for
+     the other half of this same fix. */
+  overflow-wrap: anywhere;
 }
 
 .compact-field-grid .field input {

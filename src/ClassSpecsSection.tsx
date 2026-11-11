@@ -2,6 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ClassSpecSummary,
+  DamageTypeOption,
   KnownOptions,
   OwnedSpellInLine,
   SpellLineGroup,
@@ -47,6 +48,12 @@ import { useProject } from "./ProjectContext";
 // value, after a line's own existing spell was cloned as a starting template, left the client
 // showing one ability's own description for all of them, despite each one's own real mechanics -
 // which don't read `SpellGroup` at all - performing correctly throughout).
+//
+// "MoveCast" (can this spell be cast while moving) and "Uninterruptible" (can this spell's own
+// cast be interrupted by taking damage) are both plain booleans on the real schema - rendered as
+// a Yes/No picker, not a free-text field, by renderDraftField below. A real, reported gap: there
+// was no way at all to toggle either one, only to leave whatever a brand-new/cloned spell
+// happened to already have.
 const EDITABLE_SPELL_FIELD_HINTS = [
   "Name",
   "Type",
@@ -65,6 +72,8 @@ const EDITABLE_SPELL_FIELD_HINTS = [
   "Power",
   "CastTime",
   "RecastDelay",
+  "MoveCast",
+  "Uninterruptible",
   "Icon",
   "ClientEffect",
   "Target",
@@ -450,6 +459,9 @@ function SpellSpecEditor({
   const [status, setStatus] = useState<StatusState>(emptyStatus);
   const [busy, setBusy] = useState(false);
   const [spellTypes, setSpellTypes] = useState<string[]>([]);
+  // Name -> real numeric eDamageType value - lets DamageType offer a dropdown of real damage
+  // types instead of a bare number a typo could silently turn into an unrecognized value.
+  const [damageTypes, setDamageTypes] = useState<DamageTypeOption[]>([]);
   // What's typical for whatever Type the spell currently being edited has - refreshed every time
   // Type changes, so the rest of the form can suggest (and, the first time Type is actually
   // picked after this field was first offered, auto-fill) values consistent with the rest of the
@@ -458,9 +470,10 @@ function SpellSpecEditor({
   const busyRef = useRef(false);
 
   useEffect(() => {
-    invoke<KnownOptions>("known_options").then((opts) =>
-      setSpellTypes([...opts.spell_types].sort((a, b) => a.localeCompare(b))),
-    );
+    invoke<KnownOptions>("known_options").then((opts) => {
+      setSpellTypes([...opts.spell_types].sort((a, b) => a.localeCompare(b)));
+      setDamageTypes(opts.damage_types);
+    });
   }, []);
 
   useEffect(() => {
@@ -793,6 +806,34 @@ function SpellSpecEditor({
               {t}
             </option>
           ))}
+        </select>
+      );
+    }
+    // Same idea as Type, but DamageType is a plain integer column, not a string one - the
+    // dropdown's own value is the real eDamageType numeric value, its label the human name.
+    if (key === "DamageType") {
+      const current = draft[key] ?? "";
+      const known = damageTypes.some((d) => String(d.value) === current);
+      return (
+        <select value={current} onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}>
+          {current !== "" && !known && <option value={current}>{current} (unrecognized)</option>}
+          {damageTypes.map((d) => (
+            <option key={d.value} value={d.value}>
+              {d.name}
+            </option>
+          ))}
+        </select>
+      );
+    }
+    // MoveCast ("can this be cast while moving")/Uninterruptible ("can this cast be interrupted
+    // by taking damage") are both plain booleans on the real schema - a Yes/No picker, not a
+    // bare "0"/"1" a typo could turn into anything.
+    if (key === "MoveCast" || key === "Uninterruptible") {
+      const current = draft[key] ?? "0";
+      return (
+        <select value={current} onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}>
+          <option value="0">No</option>
+          <option value="1">Yes</option>
         </select>
       );
     }

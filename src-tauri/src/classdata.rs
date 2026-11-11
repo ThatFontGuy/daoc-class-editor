@@ -582,9 +582,22 @@ pub struct KnownOptions {
     /// `eSpellType.cs`'s own vendored copy). Lets the spell field editor offer this as a picker
     /// instead of a free-text field a typo could silently break.
     pub spell_types: Vec<String>,
+    /// Every real `eDamageType` value actually meaningful for authoring a spell's own
+    /// `DamageType` field (`Natural`/`Crush`/`Slash`/`Thrust`/`Body`/`Cold`/`Energy`/`Heat`/
+    /// `Matter`/`Spirit`), straight from the vendored enum - name paired with its own real
+    /// numeric value, since `DamageType` itself is a plain integer column, not a string one like
+    /// `Type`. `GM`/`Falling` (254/255 - a GM command, or fall damage) are deliberately excluded;
+    /// neither is ever a real choice when authoring a spell.
+    pub damage_types: Vec<DamageTypeOption>,
     /// Race name -> realm ("Albion"/"Midgard"/"Hibernia"), so the frontend can filter the full
     /// race list down to just the realm of whatever class is being cloned.
     pub race_realms: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DamageTypeOption {
+    pub name: String,
+    pub value: i64,
 }
 
 /// Extracts every member name from a plain `enum X { A, B, C, ... }` block (neither `eClassType`
@@ -607,9 +620,29 @@ fn extract_enum_members(text: &str, enum_name: &str) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// Extracts the canonical stat/race/class-type/spell-type names straight from the vendored source
-/// files (eStat.cs, PlayerRace.cs, ICharacterClass.cs, eSpellType.cs) rather than hardcoding lists
-/// in the frontend, so this stays correct if the server's own enums ever change.
+/// `extract_enum_members`'s own counterpart for an enum whose members *do* assign explicit
+/// numeric values (`eDamageType`, unlike `eClassType`/`eSpellType`) - returns `(name, value)`
+/// pairs in declaration order, scoped to the same one enum's own `{ ... }` block.
+fn extract_enum_values(text: &str, enum_name: &str) -> Vec<(String, i64)> {
+    (|| {
+        let start = text.find(&format!("enum {enum_name}"))?;
+        let open = text[start..].find('{')? + start;
+        let close = text[open..].find('}')? + open;
+        let block = &text[open..close];
+        let re = Regex::new(r"(?m)^\s*(\w+)\s*=\s*(\d+)\s*,?\s*$").ok()?;
+        Some(
+            re.captures_iter(block)
+                .filter_map(|c| Some((c[1].to_string(), c[2].parse::<i64>().ok()?)))
+                .collect::<Vec<_>>(),
+        )
+    })()
+    .unwrap_or_default()
+}
+
+/// Extracts the canonical stat/race/class-type/spell-type/damage-type names straight from the
+/// vendored source files (eStat.cs, PlayerRace.cs, ICharacterClass.cs, eSpellType.cs,
+/// eDamageType.cs) rather than hardcoding lists in the frontend, so this stays correct if the
+/// server's own enums ever change.
 pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
     // `_First`/`_Last` are sentinel bounds, not real trainable stats - skip anything starting `_`.
     let stats = extract_idents(
@@ -630,11 +663,21 @@ pub fn load_known_options(resources_dir: &Path) -> KnownOptions {
     let spell_types = std::fs::read_to_string(resources_dir.join("core").join("eSpellType.cs"))
         .map(|text| extract_enum_members(&text, "eSpellType"))
         .unwrap_or_default();
+    // `_FirstResist`/`_LastResist` (0/15) bound the real, player-authorable damage types -
+    // `GM`/`Falling` (254/255) sit well above that and are never a real choice here.
+    let damage_types = std::fs::read_to_string(resources_dir.join("core").join("eDamageType.cs"))
+        .map(|text| extract_enum_values(&text, "eDamageType"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(name, value)| !name.starts_with('_') && *value <= 15)
+        .map(|(name, value)| DamageTypeOption { name, value })
+        .collect();
     KnownOptions {
         stats,
         races,
         class_types,
         spell_types,
+        damage_types,
         race_realms,
     }
 }
@@ -1076,6 +1119,30 @@ mod known_options_tests {
             opts.spell_types.len() > 400,
             "expected the full eSpellType enum (500+ entries), got {}",
             opts.spell_types.len()
+        );
+
+        // Every real, player-authorable eDamageType value, paired with its own real numeric
+        // value - GM (254)/Falling (255) excluded, since neither is ever a real choice when
+        // authoring a spell's own DamageType.
+        assert_eq!(
+            opts.damage_types
+                .iter()
+                .map(|d| (d.name.as_str(), d.value))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Natural", 0),
+                ("Crush", 1),
+                ("Slash", 2),
+                ("Thrust", 3),
+                ("Body", 10),
+                ("Cold", 11),
+                ("Energy", 12),
+                ("Heat", 13),
+                ("Matter", 14),
+                ("Spirit", 15),
+            ],
+            "{:?}",
+            opts.damage_types
         );
     }
 }

@@ -46,11 +46,17 @@ export function leafClassesOf(classes: ClassInfo[]): ClassInfo[] {
   return classes.filter((c) => c.parent_ident !== "CharacterClassBase");
 }
 
+export interface DamageTypeOption {
+  name: string;
+  value: number;
+}
+
 export interface KnownOptions {
   stats: string[];
   races: string[];
   class_types: string[];
   spell_types: string[];
+  damage_types: DamageTypeOption[];
   race_realms: Record<string, string>;
 }
 
