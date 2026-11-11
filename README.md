@@ -282,3 +282,18 @@ changed.
 
 See `docs/future-improvements.md` for ideas explicitly deferred for later, detailed enough to
 pick back up without re-researching from scratch.
+
+## Cutting a release
+
+`.github/workflows/release.yml` builds macOS (Apple Silicon + Intel), Windows, and Linux
+installers and attaches them to a GitHub Release whenever a `vX.Y.Z` tag is pushed (or via
+"Run workflow" in the Actions tab). macOS builds are code-signed and notarized if this
+repository's own `APPLE_CERTIFICATE`/`APPLE_API_KEY_P8_BASE64` secrets are set - otherwise they
+still build successfully, just ad-hoc signed.
+
+The maintainer's own local tooling for bumping/tagging a release and setting up those signing
+secrets lives in `release-tools/` - deliberately not committed to this repo (it references the
+maintainer's own local Apple Developer certificate/API key paths), gitignored alongside its own
+`archive/` output folder. A contributor without that tooling can still trigger the same workflow
+manually from the Actions tab; it just won't be macOS-signed without those two secrets configured
+on their own fork.
