@@ -9,6 +9,7 @@ import {
   SpellTypeFieldStat,
   SshConfig,
   StyleInfo,
+  StyleProc,
   emptySshConfig,
 } from "./types";
 import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
@@ -495,6 +496,312 @@ function CombatSpecEditor({
                             <label className="field" key={key}>
                               <span>{key}</span>
                               {renderStyleDraftField(key)}
+                            </label>
+                          ))}
+                        </div>
+                        <StyleProcsEditor
+                          currentCfg={currentCfg}
+                          ensureCfg={ensureCfg}
+                          classId={classId}
+                          specKey={specKey}
+                          styleId={s.style_id}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+/** A style's own secondary effects (`StyleXSpell` - a snare, stun, bleed, extra damage, taunt,
+ * ...) applied automatically whenever it successfully lands, e.g. the real "Spinning Staff"'s own
+ * "Hindered" (a 60%/15s snare) - confirmed live, 789 real procs server-wide. A real, reported gap
+ * this exists to fix: there was no way at all to give a style a new effect through this tool, or
+ * to edit/remove one already attached, only to see one a spec happened to come with when cloned.
+ * Mirrors `SpellSpecEditor`'s own field-editing shape, with `Chance` (the real `StyleXSpell`
+ * column - the % chance of actually triggering on a landed hit) added alongside the effect's own
+ * Spell fields. Embedded directly inside the owning style's own expanded edit row in
+ * `CombatSpecEditor`, fetched fresh every time a different style is expanded. */
+function StyleProcsEditor({
+  currentCfg,
+  ensureCfg,
+  classId,
+  specKey,
+  styleId,
+}: {
+  currentCfg: () => SshConfig;
+  ensureCfg: () => Promise<SshConfig>;
+  classId: number;
+  specKey: string;
+  styleId: number;
+}) {
+  const [procs, setProcs] = useState<StyleProc[] | null>(null);
+  const [editingProcId, setEditingProcId] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [status, setStatus] = useState<StatusState>(emptyStatus);
+  const [busy, setBusy] = useState(false);
+  const [spellTypes, setSpellTypes] = useState<string[]>([]);
+  const [damageTypes, setDamageTypes] = useState<EnumOption[]>([]);
+  const busyRef = useRef(false);
+
+  useEffect(() => {
+    invoke<KnownOptions>("known_options").then((opts) => {
+      setSpellTypes([...opts.spell_types].sort((a, b) => a.localeCompare(b)));
+      setDamageTypes(opts.damage_types);
+    });
+  }, []);
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [styleId]);
+
+  async function load() {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setEditingProcId(null);
+    try {
+      const rows = await invoke<StyleProc[]>("list_style_procs", { cfg: currentCfg(), styleId });
+      setProcs(rows);
+    } catch (e) {
+      setStatus(errorStatus(`Could not load this style's own effects: ${e}`));
+      setProcs(null);
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  function startEditing(p: StyleProc) {
+    setEditingProcId(p.style_x_spell_id);
+    const initial: Record<string, string> = { Chance: String(p.chance) };
+    for (const [key, value] of Object.entries(p.fields)) {
+      initial[key] = value === null || value === undefined ? "" : String(value);
+    }
+    setDraft(initial);
+  }
+
+  async function addEffect() {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus("Adding a new effect..."));
+    try {
+      const cfg = await ensureCfg();
+      const added = await invoke<StyleProc>("add_style_proc", { cfg, classId, specKey, styleId });
+      setStatus(okStatus("Added - edit it below to make it do what you actually want."));
+      busyRef.current = false; // see the matching comment in SpellSpecEditor's own save() below
+      await load();
+      startEditing(added);
+    } catch (e) {
+      setStatus(errorStatus(`Could not add a new effect: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  async function save(p: StyleProc) {
+    if (editingProcId == null || busyRef.current) return;
+    const fields: Record<string, string | number> = {};
+    for (const [key, value] of Object.entries(draft)) {
+      if (key === "Chance" || key === "SpellID") continue;
+      const originalValue = p.fields[key];
+      const originalAsString = originalValue === null || originalValue === undefined ? "" : String(originalValue);
+      if (value === originalAsString) continue;
+      const wasNumber = typeof originalValue === "number";
+      fields[key] = wasNumber && value.trim() !== "" && !Number.isNaN(Number(value)) ? Number(value) : value;
+    }
+    const chanceDraft = draft.Chance ?? String(p.chance);
+    const chanceChanged = chanceDraft !== String(p.chance);
+    const newChance = chanceChanged ? Number(chanceDraft) : null;
+    if (chanceChanged && (chanceDraft.trim() === "" || newChance === null || Number.isNaN(newChance))) {
+      setStatus(errorStatus("Chance must be a number."));
+      return;
+    }
+    if (Object.keys(fields).length === 0 && !chanceChanged) {
+      setStatus(okStatus("Nothing changed."));
+      setEditingProcId(null);
+      return;
+    }
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus(p.is_owned ? "Saving..." : "Cloning this effect for this class, then saving..."));
+    try {
+      const cfg = await ensureCfg();
+      const result = await invoke<{ message: string }>("save_style_proc_fields", {
+        cfg,
+        classId,
+        specKey,
+        styleXSpellId: p.style_x_spell_id,
+        fields,
+        chance: chanceChanged ? newChance : null,
+      });
+      setStatus(okStatus(result.message));
+      setEditingProcId(null);
+      busyRef.current = false;
+      await load();
+    } catch (e) {
+      setStatus(errorStatus(`Save failed: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  /** Deletes one effect outright. Always confirmed first, since there's no undo. Only ever
+   * enabled for an already-owned effect (disabled otherwise below) - the same "deleting should
+   * never be possible on a class's real, original/stock content, only on something that's
+   * already this class's own independent clone" stance every other delete button in this tool
+   * already takes. `delete_style_proc` refuses the same way server-side regardless. */
+  async function deleteProc(p: StyleProc) {
+    if (busyRef.current || !p.is_owned) return;
+    const name = String(p.fields.Name ?? `effect ${p.spell_id}`);
+    if (!confirm(`Delete "${name}" entirely? This cannot be undone.`)) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus("Deleting..."));
+    try {
+      const cfg = await ensureCfg();
+      await invoke("delete_style_proc", { cfg, classId, styleXSpellId: p.style_x_spell_id });
+      setStatus(okStatus(`Deleted "${name}".`));
+      busyRef.current = false;
+      await load();
+    } catch (e) {
+      setStatus(errorStatus(`Delete failed: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
+  function renderProcDraftField(key: string) {
+    if (key === "Type") {
+      const current = draft[key] ?? "";
+      return (
+        <select value={current} onChange={(e) => setDraft((prev) => ({ ...prev, Type: e.target.value }))}>
+          {current !== "" && !spellTypes.includes(current) && <option value={current}>{current} (unrecognized)</option>}
+          {spellTypes.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+      );
+    }
+    if (key === "DamageType") {
+      return (
+        <EnumDropdown
+          options={damageTypes}
+          current={draft[key] ?? ""}
+          onChange={(value) => setDraft((prev) => ({ ...prev, [key]: value }))}
+        />
+      );
+    }
+    if (key === "MoveCast" || key === "Uninterruptible") {
+      const current = draft[key] ?? "0";
+      return (
+        <select value={current} onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}>
+          <option value="0">No</option>
+          <option value="1">Yes</option>
+        </select>
+      );
+    }
+    return (
+      <input
+        value={draft[key] ?? ""}
+        onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+      />
+    );
+  }
+
+  return (
+    <div style={{ marginTop: "0.75rem", borderTop: "1px solid var(--border)", paddingTop: "0.5rem" }}>
+      <p>
+        <strong>Secondary effects</strong>{" "}
+        <button onClick={addEffect} disabled={busy}>
+          + Add Effect
+        </button>
+      </p>
+      <StatusMessage status={status} />
+      {procs && procs.length === 0 && <p className="hint">No secondary effects on this style.</p>}
+      {procs && procs.length > 0 && (
+        <table className="spec-table">
+          <thead>
+            <tr>
+              <th>Chance</th>
+              <th>Name</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {procs.map((p) => {
+              const isEditingThis = editingProcId === p.style_x_spell_id;
+              const editableKeys = EDITABLE_SPELL_FIELD_HINTS.filter((k) => k in p.fields);
+              const { primaryKeys, restKeys } = splitPrimaryFields(editableKeys, PRIMARY_SPELL_FIELDS);
+              return (
+                <Fragment key={p.style_x_spell_id}>
+                  <tr>
+                    <td>{p.chance}%</td>
+                    <td>
+                      {String(p.fields.Name ?? "")}
+                      {!p.is_owned && <span className="hint"> (shared - saving clones it for this class)</span>}
+                    </td>
+                    <td>
+                      {isEditingThis ? (
+                        <>
+                          <button onClick={() => save(p)} disabled={busy}>
+                            Save
+                          </button>{" "}
+                          <button onClick={() => setEditingProcId(null)} disabled={busy}>
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button onClick={() => startEditing(p)} disabled={busy}>
+                            Edit
+                          </button>{" "}
+                          <button
+                            onClick={() => deleteProc(p)}
+                            disabled={busy || !p.is_owned}
+                            className="danger"
+                            title={p.is_owned ? undefined : "Edit it first to clone it for this class, then it can be deleted"}
+                          >
+                            Delete
+                          </button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                  {isEditingThis && (
+                    <tr>
+                      <td colSpan={3}>
+                        <label className="field">
+                          <span>Chance (%)</span>
+                          <input
+                            value={draft.Chance ?? String(p.chance)}
+                            onChange={(e) => setDraft((prev) => ({ ...prev, Chance: e.target.value }))}
+                          />
+                        </label>
+                        {primaryKeys.map((key) => (
+                          <label className="field" key={key}>
+                            <span>{key}</span>
+                            {renderProcDraftField(key)}
+                          </label>
+                        ))}
+                        <div className="compact-field-grid">
+                          {restKeys.map((key) => (
+                            <label className="field" key={key}>
+                              <span>{key}</span>
+                              {renderProcDraftField(key)}
                             </label>
                           ))}
                         </div>

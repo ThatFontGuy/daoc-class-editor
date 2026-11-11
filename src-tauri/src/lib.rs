@@ -385,6 +385,29 @@ fn update_style_level(
 }
 
 #[tauri::command]
+fn list_style_procs(cfg: SshConfig, style_id: i64) -> Result<Vec<specs::StyleProc>, String> {
+    specs::list_style_procs(&cfg, style_id)
+}
+
+#[tauri::command]
+fn add_style_proc(cfg: SshConfig, class_id: i64, spec_key: String, style_id: i64) -> Result<specs::StyleProc, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::add_style_proc(&cfg, class_id, &spec_key, style_id)
+}
+
+#[tauri::command]
+fn update_style_proc_chance(cfg: SshConfig, class_id: i64, style_x_spell_id: String, chance: i64) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::update_style_proc_chance(&cfg, class_id, &style_x_spell_id, chance)
+}
+
+#[tauri::command]
+fn delete_style_proc(cfg: SshConfig, class_id: i64, style_x_spell_id: String) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::delete_style_proc(&cfg, class_id, &style_x_spell_id)
+}
+
+#[tauri::command]
 fn update_owned_spell_fields(
     cfg: SshConfig,
     spell_id: i64,
@@ -445,6 +468,42 @@ fn save_style_fields(
         specs::update_style_fields(&cfg, class_id, owned_style_id, &fields)?
     };
     Ok(SaveStyleResult { style_id: owned_style_id, message })
+}
+
+#[derive(serde::Serialize)]
+struct SaveStyleProcResult {
+    style_x_spell_id: String,
+    spell_id: i64,
+    message: String,
+}
+
+/// Clones a style's own secondary effect (and/or the style itself) on the spot - if either isn't
+/// an independent copy for this class already - and applies the field/Chance edits in one call,
+/// the style-proc equivalent of `save_line_spell_fields`/`save_style_fields`.
+#[tauri::command]
+fn save_style_proc_fields(
+    cfg: SshConfig,
+    class_id: i64,
+    spec_key: String,
+    style_x_spell_id: String,
+    fields: std::collections::HashMap<String, serde_json::Value>,
+    chance: Option<i64>,
+) -> Result<SaveStyleProcResult, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    let (owned_proc_id, owned_spell_id) = specs::ensure_style_proc_owned(&cfg, class_id, &spec_key, &style_x_spell_id)?;
+    let mut messages = Vec::new();
+    if !fields.is_empty() {
+        messages.push(spell_ownership::update_owned_spell_fields(&cfg, owned_spell_id, &fields)?);
+    }
+    if let Some(chance) = chance {
+        messages.push(specs::update_style_proc_chance(&cfg, class_id, &owned_proc_id, chance)?);
+    }
+    let message = if messages.is_empty() {
+        format!("cloned effect {owned_spell_id} independently for this class")
+    } else {
+        messages.join("; ")
+    };
+    Ok(SaveStyleProcResult { style_x_spell_id: owned_proc_id, spell_id: owned_spell_id, message })
 }
 
 #[tauri::command]
@@ -552,9 +611,14 @@ pub fn run() {
             delete_class_spec,
             update_line_spell_level,
             update_style_level,
+            list_style_procs,
+            add_style_proc,
+            update_style_proc_chance,
+            delete_style_proc,
             update_owned_spell_fields,
             save_line_spell_fields,
             save_style_fields,
+            save_style_proc_fields,
             save_project_file,
             load_project_file,
             delete_deployed_class,

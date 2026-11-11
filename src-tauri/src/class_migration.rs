@@ -373,36 +373,62 @@ fn sync_styles(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64) -> 
 /// Syncs every `StyleXSpell` proc row belonging to this class (`ClassID = class_id`) from session
 /// onto live - inserted fresh (with its own `StyleID`/`SpellID` remapped through `style_id_map`/
 /// `spell_id_map`, same as `sync_line_memberships` does for a `LineXSpell` row) if missing,
-/// otherwise left alone entirely (there is no field-level editor for a proc anywhere in
-/// `ClassSpecsSection.tsx` today, so an already-existing one never needs updating, only ever
-/// either exists already or doesn't).
+/// updating `Chance` on an already-existing live row if it changed (`update_style_proc_chance`,
+/// the "Classes" tab's own secondary-effect editor, added after this function's own original
+/// insert-only shape - see this function's own removal pass below for the matching, equally real
+/// gap that left open at the same time: deleting one, `delete_style_proc`, never propagated
+/// either), or removing a live row whose own GUID no longer exists in the session at all -
+/// matched the same stable-key way `sync_line_memberships` already does for a `LineXSpell` row.
+/// Falls back to matching by `(StyleID, SpellID, ClassID)` instead, and skips the removal pass
+/// entirely, only on a fork whose `StyleXSpell` has no GUID-style primary key at all (see
+/// `style_x_spell_guid_column`'s own doc comment) - there's no way to tell two otherwise-
+/// identical-looking rows apart without one.
 fn sync_style_procs(
     session_cfg: &SshConfig,
     live_cfg: &SshConfig,
     class_id: i64,
     spell_id_map: &HashMap<i64, i64>,
     style_id_map: &HashMap<i64, i64>,
-) -> Result<usize, String> {
+) -> Result<(usize, usize, usize), String> {
     let guid_col = style_x_spell_guid_column(session_cfg)?;
     let rows = run_remote_sql_json(session_cfg, &format!("SELECT * FROM StyleXSpell WHERE ClassID = {class_id};"))?;
-    let mut created = 0;
+    let mut session_ids: HashSet<String> = HashSet::new();
+    let (mut created, mut updated) = (0, 0);
     for row in &rows {
         let session_style_id = int_field(row, "StyleID");
         let session_spell_id = int_field(row, "SpellID");
         let live_style_id = style_id_map.get(&session_style_id).copied().unwrap_or(session_style_id);
         let live_spell_id = spell_id_map.get(&session_spell_id).copied().unwrap_or(session_spell_id);
+        let chance = int_field(row, "Chance");
 
-        let exists = if let Some(col) = &guid_col {
+        let existing = if let Some(col) = &guid_col {
             let pk_val = str_field(row, col);
-            !run_remote_sql_json(live_cfg, &format!("SELECT 1 FROM StyleXSpell WHERE {col} = '{}';", sql_quote(&pk_val)))?.is_empty()
+            session_ids.insert(pk_val.clone());
+            run_remote_sql_json(live_cfg, &format!("SELECT Chance FROM StyleXSpell WHERE {col} = '{}';", sql_quote(&pk_val)))?
         } else {
-            !run_remote_sql_json(
+            run_remote_sql_json(
                 live_cfg,
-                &format!("SELECT 1 FROM StyleXSpell WHERE StyleID = {live_style_id} AND SpellID = {live_spell_id} AND ClassID = {class_id};"),
+                &format!("SELECT Chance FROM StyleXSpell WHERE StyleID = {live_style_id} AND SpellID = {live_spell_id} AND ClassID = {class_id};"),
             )?
-            .is_empty()
         };
-        if exists {
+        if let Some(live_row) = existing.first() {
+            if int_field(live_row, "Chance") != chance {
+                if let Some(col) = &guid_col {
+                    let pk_val = str_field(row, col);
+                    run_remote_sql(
+                        live_cfg,
+                        &format!("UPDATE StyleXSpell SET Chance = {chance} WHERE {col} = '{}';", sql_quote(&pk_val)),
+                    )?;
+                } else {
+                    run_remote_sql(
+                        live_cfg,
+                        &format!(
+                            "UPDATE StyleXSpell SET Chance = {chance} WHERE StyleID = {live_style_id} AND SpellID = {live_spell_id} AND ClassID = {class_id};"
+                        ),
+                    )?;
+                }
+                updated += 1;
+            }
             continue;
         }
 
@@ -420,7 +446,26 @@ fn sync_style_procs(
         run_remote_sql(live_cfg, &format!("INSERT INTO StyleXSpell ({}) VALUES ({});", cols.join(", "), vals.join(", ")))?;
         created += 1;
     }
-    Ok(created)
+
+    let mut removed = 0;
+    if let Some(col) = &guid_col {
+        let live_rows = run_remote_sql_json(
+            live_cfg,
+            &format!("SELECT {col} AS ProcId, SpellID FROM StyleXSpell WHERE ClassID = {class_id};"),
+        )?;
+        for row in &live_rows {
+            let proc_id = str_field(row, "ProcId");
+            if session_ids.contains(&proc_id) {
+                continue;
+            }
+            let spell_id = int_field(row, "SpellID");
+            run_remote_sql(live_cfg, &format!("DELETE FROM StyleXSpell WHERE {col} = '{}';", sql_quote(&proc_id)))?;
+            delete_owned_spells(live_cfg, &[spell_id])?;
+            removed += 1;
+        }
+    }
+
+    Ok((created, updated, removed))
 }
 
 /// Syncs every `LineXSpell` row under this class's own owned spell line(s) (see
@@ -562,7 +607,8 @@ pub fn migrate_class_design_to_live(session_cfg: &SshConfig, live_cfg: &SshConfi
     let specs_created = sync_specializations_and_lines(session_cfg, live_cfg, class_id)?;
     let (spell_id_map, spells_created, spells_updated) = sync_spells(session_cfg, live_cfg, class_id)?;
     let (style_id_map, styles_created, styles_updated) = sync_styles(session_cfg, live_cfg, class_id)?;
-    let procs_created = sync_style_procs(session_cfg, live_cfg, class_id, &spell_id_map, &style_id_map)?;
+    let (procs_created, procs_updated, procs_removed) =
+        sync_style_procs(session_cfg, live_cfg, class_id, &spell_id_map, &style_id_map)?;
     let (lines_created, lines_updated, lines_removed) = sync_line_memberships(session_cfg, live_cfg, class_id, &spell_id_map)?;
     let assignment_synced = sync_class_spec_assignment(session_cfg, live_cfg, class_id)?;
 
@@ -576,8 +622,10 @@ pub fn migrate_class_design_to_live(session_cfg: &SshConfig, live_cfg: &SshConfi
     if styles_created > 0 || styles_updated > 0 {
         summary.push(format!("{styles_created} new style(s), {styles_updated} updated"));
     }
-    if procs_created > 0 {
-        summary.push(format!("{procs_created} new style proc(s)"));
+    if procs_created > 0 || procs_updated > 0 || procs_removed > 0 {
+        summary.push(format!(
+            "{procs_created} new style effect(s), {procs_updated} updated, {procs_removed} deleted"
+        ));
     }
     if lines_created > 0 || lines_updated > 0 || lines_removed > 0 {
         summary.push(format!(
@@ -598,8 +646,8 @@ pub fn migrate_class_design_to_live(session_cfg: &SshConfig, live_cfg: &SshConfi
 mod tests {
     use super::*;
     use crate::specs::{
-        add_new_spell_series_to_line, add_style_to_spec, create_new_combat_spec, create_new_spell_spec,
-        delete_spell_from_line,
+        add_new_spell_series_to_line, add_style_proc, add_style_to_spec, create_new_combat_spec, create_new_spell_spec,
+        delete_spell_from_line, delete_style_proc, update_style_proc_chance,
     };
     use std::process::Command;
 
@@ -749,6 +797,47 @@ mod tests {
 
         let live_spell_gone = run_remote_sql_json(&live, &format!("SELECT 1 FROM Spell WHERE SpellID = {};", second_spell.spell_id)).unwrap();
         assert!(live_spell_gone.is_empty(), "the deleted spell's own underlying Spell row must be gone on live too");
+
+        std::fs::remove_dir_all(&live_dir).ok();
+        std::fs::remove_dir_all(&session_dir).ok();
+    }
+
+    #[test]
+    fn migrate_syncs_a_style_effects_own_chance_change_and_removal_after_an_earlier_migration() {
+        // The exact same class of bug the spell-deletion test above covers, just for a style's
+        // own secondary effect (StyleXSpell) instead of a spell-line entry: add_style_proc/
+        // update_style_proc_chance/delete_style_proc only ever touch the session's own database,
+        // so a Chance edit or an outright removal made mid-session must still correctly reach
+        // live once (re-)migrated, not just a brand-new effect's own first creation.
+        let (live_dir, session_dir) = setup_pair("style-proc-sync");
+        let live = test_cfg(&live_dir);
+        let session = test_cfg(&session_dir);
+
+        create_new_combat_spec(&session, 2, "Ironwill", 1).unwrap();
+        let style_id = int_field(
+            &run_remote_sql_json(&session, "SELECT StyleID FROM Style WHERE SpecKeyName = 'ironwill_2';").unwrap()[0],
+            "StyleID",
+        );
+        let kept = add_style_proc(&session, 2, "ironwill_2", style_id).unwrap();
+        let removed = add_style_proc(&session, 2, "ironwill_2", style_id).unwrap();
+        migrate_class_design_to_live(&session, &live, 2).unwrap();
+
+        let live_before = run_remote_sql_json(&live, "SELECT Chance FROM StyleXSpell WHERE ClassID = 2;").unwrap();
+        assert_eq!(live_before.len(), 2, "both effects must be live after the first migration: {live_before:?}");
+
+        // Only the session's own copy is touched from here on.
+        update_style_proc_chance(&session, 2, &kept.style_x_spell_id, 42).unwrap();
+        delete_style_proc(&session, 2, &removed.style_x_spell_id).unwrap();
+        let summary = migrate_class_design_to_live(&session, &live, 2).unwrap();
+        assert!(summary.contains("1 updated") && summary.contains("1 deleted"), "{summary}");
+
+        let live_after = run_remote_sql_json(&live, "SELECT Chance FROM StyleXSpell WHERE ClassID = 2;").unwrap();
+        assert_eq!(live_after.len(), 1, "the deleted effect's own row must be gone on live too: {live_after:?}");
+        assert_eq!(int_field(&live_after[0], "Chance"), 42, "the kept effect's own Chance edit must have reached live too");
+
+        let live_spell_gone =
+            run_remote_sql_json(&live, &format!("SELECT 1 FROM Spell WHERE SpellID = {};", removed.spell_id)).unwrap();
+        assert!(live_spell_gone.is_empty(), "the deleted effect's own underlying Spell row must be gone on live too");
 
         std::fs::remove_dir_all(&live_dir).ok();
         std::fs::remove_dir_all(&session_dir).ok();

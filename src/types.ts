@@ -195,6 +195,16 @@ export interface StyleInfo {
   fields: OwnedSpellRow;
 }
 
+// Mirrors specs.rs's StyleProc - one secondary effect (a snare, stun, bleed, extra damage, ...)
+// applied automatically whenever a style successfully lands.
+export interface StyleProc {
+  style_x_spell_id: string;
+  spell_id: number;
+  chance: number;
+  is_owned: boolean;
+  fields: OwnedSpellRow;
+}
+
 // Mirrors src-tauri/src/trainer.rs.
 
 export interface TrainerRequest {
