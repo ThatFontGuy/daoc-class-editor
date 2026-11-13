@@ -15,6 +15,7 @@ import {
 import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
 import { useProject } from "./ProjectContext";
 import { assignProgressionColors } from "./spellProgression";
+import { assignChainColors } from "./styleChains";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
@@ -432,87 +433,116 @@ function CombatSpecEditor({
             </tr>
           </thead>
           <tbody>
-            {styles.map((s) => {
-              const isEditingField = editingStyleId === s.style_id;
-              const currentLevel = String(s.fields.SpecLevelRequirement ?? 0);
-              const levelDraft = levelDrafts[s.style_id] ?? currentLevel;
-              const levelChanged = levelDraft !== currentLevel;
-              const editableKeys = EDITABLE_STYLE_FIELD_HINTS.filter((k) => k in s.fields);
-              const fallbackKeys = Object.keys(s.fields).filter(
-                (k) => k !== "StyleID" && k !== "SpecLevelRequirement",
+            {(() => {
+              // Resolved from known_options() (see styleChains.ts's own module doc comment for
+              // why never a hardcoded 7/0/1) - undefined only if this fork's own vendored Style.cs
+              // doesn't define these at all, in which case no style here can ever be treated as
+              // chained (every style falls back to "no prerequisite" below).
+              const styleResultValue = attackResults.find((o) => o.name === "Style")?.value;
+              const offensiveValue = openingTypes.find((o) => o.name === "Offensive")?.value;
+              const defensiveValue = openingTypes.find((o) => o.name === "Defensive")?.value;
+              // Cosmetic only, purely for this editing view - color-codes a style and whatever it
+              // chains off of (and whatever chains off *that*, transitively) with a shared
+              // background, so a combo's own dependency is easy to spot at a glance. Most real
+              // styles have no prerequisite at all ("Anytime") and stay uncolored - see
+              // styleChains.ts's own doc comment for exactly when one actually does.
+              const chainColors = assignChainColors(
+                styles,
+                (s) => String(s.style_id),
+                (s) => s.style_id,
+                (s) => {
+                  const openingType = Number(s.fields.OpeningRequirementType ?? -1);
+                  const attackResult = Number(s.fields.AttackResultRequirement ?? -1);
+                  const isChainable = openingType === offensiveValue || openingType === defensiveValue;
+                  if (!isChainable || styleResultValue === undefined || attackResult !== styleResultValue) {
+                    return null;
+                  }
+                  return Number(s.fields.OpeningRequirementValue ?? 0);
+                },
               );
-              const { primaryKeys, restKeys } = splitPrimaryFields(
-                editableKeys.length > 0 ? editableKeys : fallbackKeys,
-                PRIMARY_STYLE_FIELDS,
-              );
-              return (
-                <Fragment key={s.style_id}>
-                  <tr>
-                    <td>
-                      <input
-                        type="number"
-                        value={levelDraft}
-                        onChange={(e) => setLevelDrafts((prev) => ({ ...prev, [s.style_id]: e.target.value }))}
-                        style={{ width: "4em" }}
-                        disabled={busy}
-                      />{" "}
-                      {levelChanged && !isEditingField && (
-                        <button onClick={() => saveLevel(s)} disabled={busy}>
-                          Save
-                        </button>
-                      )}
-                    </td>
-                    <td>
-                      {String(s.fields.Name ?? "")}
-                      {!s.is_owned && <span className="hint"> (shared - saving clones/grants it for this class)</span>}
-                    </td>
-                    <td>
-                      {isEditingField ? (
-                        <>
-                          <button onClick={() => save(s)} disabled={busy}>
+              return styles.map((s) => {
+                const chainColor = chainColors.get(String(s.style_id));
+                const isEditingField = editingStyleId === s.style_id;
+                const currentLevel = String(s.fields.SpecLevelRequirement ?? 0);
+                const levelDraft = levelDrafts[s.style_id] ?? currentLevel;
+                const levelChanged = levelDraft !== currentLevel;
+                const editableKeys = EDITABLE_STYLE_FIELD_HINTS.filter((k) => k in s.fields);
+                const fallbackKeys = Object.keys(s.fields).filter(
+                  (k) => k !== "StyleID" && k !== "SpecLevelRequirement",
+                );
+                const { primaryKeys, restKeys } = splitPrimaryFields(
+                  editableKeys.length > 0 ? editableKeys : fallbackKeys,
+                  PRIMARY_STYLE_FIELDS,
+                );
+                return (
+                  <Fragment key={s.style_id}>
+                    <tr style={chainColor ? { backgroundColor: chainColor } : undefined}>
+                      <td>
+                        <input
+                          type="number"
+                          value={levelDraft}
+                          onChange={(e) => setLevelDrafts((prev) => ({ ...prev, [s.style_id]: e.target.value }))}
+                          style={{ width: "4em" }}
+                          disabled={busy}
+                        />{" "}
+                        {levelChanged && !isEditingField && (
+                          <button onClick={() => saveLevel(s)} disabled={busy}>
                             Save
-                          </button>{" "}
-                          <button onClick={() => setEditingStyleId(null)} disabled={busy}>
-                            Cancel
                           </button>
-                        </>
-                      ) : (
-                        <button onClick={() => startEditing(s)} disabled={busy}>
-                          Edit
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                  {isEditingField && (
-                    <tr>
-                      <td colSpan={3}>
-                        {primaryKeys.map((key) => (
-                          <label className="field" key={key}>
-                            <span>{key}</span>
-                            {renderStyleDraftField(key)}
-                          </label>
-                        ))}
-                        <div className="compact-field-grid">
-                          {restKeys.map((key) => (
+                        )}
+                      </td>
+                      <td>
+                        {String(s.fields.Name ?? "")}
+                        {!s.is_owned && <span className="hint"> (shared - saving clones/grants it for this class)</span>}
+                      </td>
+                      <td>
+                        {isEditingField ? (
+                          <>
+                            <button onClick={() => save(s)} disabled={busy}>
+                              Save
+                            </button>{" "}
+                            <button onClick={() => setEditingStyleId(null)} disabled={busy}>
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <button onClick={() => startEditing(s)} disabled={busy}>
+                            Edit
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                    {isEditingField && (
+                      <tr style={chainColor ? { backgroundColor: chainColor } : undefined}>
+                        <td colSpan={3}>
+                          {primaryKeys.map((key) => (
                             <label className="field" key={key}>
                               <span>{key}</span>
                               {renderStyleDraftField(key)}
                             </label>
                           ))}
-                        </div>
-                        <StyleProcsEditor
-                          currentCfg={currentCfg}
-                          ensureCfg={ensureCfg}
-                          classId={classId}
-                          specKey={specKey}
-                          styleId={s.style_id}
-                        />
-                      </td>
-                    </tr>
-                  )}
-                </Fragment>
-              );
-            })}
+                          <div className="compact-field-grid">
+                            {restKeys.map((key) => (
+                              <label className="field" key={key}>
+                                <span>{key}</span>
+                                {renderStyleDraftField(key)}
+                              </label>
+                            ))}
+                          </div>
+                          <StyleProcsEditor
+                            currentCfg={currentCfg}
+                            ensureCfg={ensureCfg}
+                            classId={classId}
+                            specKey={specKey}
+                            styleId={s.style_id}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              });
+            })()}
           </tbody>
         </table>
       )}

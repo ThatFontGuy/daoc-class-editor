@@ -4,6 +4,8 @@
 // background so a series is easy to spot at a glance). Kept in one place so the two views can
 // never silently disagree about what counts as "the same ability".
 
+import { assignGroupColors } from "./groupColors";
+
 /** Groups items that represent ranks of the same real ability - two items are linked if either
  * (a) they share the exact same display Name (the common case, and what the custom Vampiir-
  * sourced spells in this project actually have, since their own SpellGroup is 0 for every one of
@@ -62,27 +64,8 @@ export function groupSpellsByProgression<T>(
     .sort((a, b) => getLevel(a[0]) - getLevel(b[0]));
 }
 
-// A small, dark-theme-friendly palette (muted/desaturated hues, not literal bright pastels - this
-// app's own color-scheme is dark throughout, see App.css's own `:root`, so a true pastel washes
-// out the light `--text` color on top of it) cycling through enough distinct hues that two
-// adjacent progressions in a long spell line are never confusable. Deliberately distinct from the
-// existing --albion/--midgard/--hibernia realm colors so this never looks like a realm indicator.
-const PROGRESSION_COLORS = [
-  "#2a2216", // amber
-  "#16221f", // teal
-  "#1c1826", // violet
-  "#241a1a", // rose
-  "#1a2416", // olive
-  "#161e2a", // steel blue
-  "#261a24", // plum
-  "#221c14", // sand
-];
-
-/** Maps each item to a background color - every item in the same (more-than-one-member)
- * progression group shares one color, cycling through PROGRESSION_COLORS by group order; a
- * singleton (nothing else in this line shares its Name/SpellGroup) gets no color at all
- * (`undefined`), left at the table's own default background - tinting every unrelated spell a
- * different color would be more visual noise than help, the opposite of the point. */
+/** Maps each item to a background color - see assignGroupColors's own doc comment for exactly how
+ * (only an actual multi-member progression gets colored at all). */
 export function assignProgressionColors<T>(
   items: T[],
   getKey: (item: T) => string,
@@ -90,16 +73,5 @@ export function assignProgressionColors<T>(
   getSpellGroup: (item: T) => number,
   getLevel: (item: T) => number,
 ): Map<string, string> {
-  const groups = groupSpellsByProgression(items, getName, getSpellGroup, getLevel);
-  const colors = new Map<string, string>();
-  let colorIndex = 0;
-  for (const group of groups) {
-    if (group.length < 2) continue;
-    const color = PROGRESSION_COLORS[colorIndex % PROGRESSION_COLORS.length];
-    colorIndex++;
-    for (const item of group) {
-      colors.set(getKey(item), color);
-    }
-  }
-  return colors;
+  return assignGroupColors(groupSpellsByProgression(items, getName, getSpellGroup, getLevel), getKey);
 }
