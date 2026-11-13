@@ -201,6 +201,13 @@ export interface StyleProc {
   style_x_spell_id: string;
   spell_id: number;
   chance: number;
+  // The real owning ClassID on this StyleXSpell row - 0 for a universal default every class
+  // sharing this style gets, or a specific class's own override.
+  proc_class_id: number;
+  // Whether this is the effect that actually fires for the class currently being viewed (mirrors
+  // the real server's own override-beats-universal precedence) - a row can still be listed here
+  // with this false, meaning it's some *other* class's own override and never fires here at all.
+  applies_to_this_class: boolean;
   is_owned: boolean;
   fields: OwnedSpellRow;
 }

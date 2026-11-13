@@ -1548,9 +1548,21 @@ pub fn migrate_class_to_owned_spells(
         line_xspell_id: String,
         old_spell_id: i64,
     }
-    struct ProcWork {
+    // Already this class's own override (`ClassID = class_id`) - its own spell just needs
+    // cloning in place, the exact same row is reused.
+    struct ProcUpdateWork {
         row_key: String,
         old_spell_id: i64,
+    }
+    // Still universal (`ClassID = 0`) or another class's own override - cloning *in place* would
+    // wrongly change what every other class sharing it sees, so this creates a brand-new row
+    // instead (`ensure_style_proc_owned`'s own exact clone-on-first-edit philosophy), scoped via
+    // the style's shared `ID` (see `style_shared_id`'s own doc comment for why - this module's
+    // entire style-proc feature originally confused this with the per-row `StyleID`).
+    struct ProcCloneWork {
+        shared_style_id: i64,
+        old_spell_id: i64,
+        chance: i64,
     }
 
     let keys_csv = owned_keys
@@ -1581,26 +1593,56 @@ pub fn migrate_class_to_owned_spells(
 
     let style_rows = run_remote_sql_json(
         cfg,
-        &format!("SELECT StyleID FROM Style WHERE SpecKeyName IN ({keys_csv});"),
+        &format!("SELECT ID FROM Style WHERE SpecKeyName IN ({keys_csv});"),
     )?;
-    let style_ids: Vec<i64> = style_rows.iter().map(|r| int_field(r, "StyleID")).collect();
+    let shared_ids: Vec<i64> = {
+        let mut ids: Vec<i64> = style_rows.iter().map(|r| int_field(r, "ID")).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
 
     let mut proc_rows: Vec<Value> = Vec::new();
-    if !style_ids.is_empty() {
-        let style_ids_csv = style_ids
+    if !shared_ids.is_empty() {
+        let shared_ids_csv = shared_ids
             .iter()
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
         let select_cols = match &style_x_spell_pk {
-            Some(col) => format!("{col} AS RowKey, SpellID"),
-            None => "StyleID AS RowKey, SpellID".to_string(),
+            Some(col) => format!("{col} AS RowKey, SpellID, ClassID, StyleID, Chance"),
+            None => "StyleID AS RowKey, SpellID, ClassID, StyleID, Chance".to_string(),
         };
         proc_rows = run_remote_sql_json(
             cfg,
-            &format!("SELECT {select_cols} FROM StyleXSpell WHERE StyleID IN ({style_ids_csv});"),
+            &format!("SELECT {select_cols} FROM StyleXSpell WHERE StyleID IN ({shared_ids_csv});"),
         )?;
     }
+
+    // Every (shared style ID, real source spell) pair this class already has its own override
+    // for, from a previous run - skipped below so a second Migrate never creates a duplicate
+    // override alongside the one it already made.
+    let existing_overrides: std::collections::HashSet<(i64, i64)> = if shared_ids.is_empty() {
+        Default::default()
+    } else {
+        let shared_ids_csv = shared_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        run_remote_sql_json(
+            cfg,
+            &format!(
+                "SELECT StyleXSpell.StyleID AS SharedId, ClassEditorSpellClone.SourceSpellID AS SourceId \
+                 FROM StyleXSpell JOIN ClassEditorSpellClone ON ClassEditorSpellClone.NewSpellID = StyleXSpell.SpellID \
+                 WHERE StyleXSpell.ClassID = {class_id} AND ClassEditorSpellClone.OwningClassId = {class_id} \
+                 AND StyleXSpell.StyleID IN ({shared_ids_csv});"
+            ),
+        )?
+        .iter()
+        .map(|r| (int_field(r, "SharedId"), int_field(r, "SourceId")))
+        .collect()
+    };
 
     // One batched ownership check covering every distinct spell either kind of row references,
     // instead of one check per row.
@@ -1633,10 +1675,10 @@ pub fn migrate_class_to_owned_spells(
             old_spell_id: int_field(r, "SpellID"),
         })
         .collect();
-    let proc_work: Vec<ProcWork> = proc_rows
+    let proc_update_work: Vec<ProcUpdateWork> = proc_rows
         .iter()
-        .filter(|r| !already_owned.contains(&int_field(r, "SpellID")))
-        .map(|r| ProcWork {
+        .filter(|r| int_field(r, "ClassID") == class_id && !already_owned.contains(&int_field(r, "SpellID")))
+        .map(|r| ProcUpdateWork {
             row_key: if style_x_spell_pk.is_some() {
                 str_field(r, "RowKey")
             } else {
@@ -1645,8 +1687,18 @@ pub fn migrate_class_to_owned_spells(
             old_spell_id: int_field(r, "SpellID"),
         })
         .collect();
+    let proc_clone_work: Vec<ProcCloneWork> = proc_rows
+        .iter()
+        .filter(|r| int_field(r, "ClassID") != class_id)
+        .filter(|r| !existing_overrides.contains(&(int_field(r, "StyleID"), int_field(r, "SpellID"))))
+        .map(|r| ProcCloneWork {
+            shared_style_id: int_field(r, "StyleID"),
+            old_spell_id: int_field(r, "SpellID"),
+            chance: int_field(r, "Chance"),
+        })
+        .collect();
 
-    let total = line_work.len() + proc_work.len();
+    let total = line_work.len() + proc_update_work.len() + proc_clone_work.len();
     let mut processed = 0usize;
     on_progress(processed, total);
 
@@ -1663,7 +1715,7 @@ pub fn migrate_class_to_owned_spells(
         on_progress(processed, total);
     }
 
-    for item in &proc_work {
+    for item in &proc_update_work {
         let new_spell_id = cloner.clone_for_class(cfg, item.old_spell_id)?;
         let where_clause = match &style_x_spell_pk {
             Some(col) => format!("{col} = '{}'", sql_quote(&item.row_key)),
@@ -1679,6 +1731,22 @@ pub fn migrate_class_to_owned_spells(
         on_progress(processed, total);
     }
 
+    for item in &proc_clone_work {
+        let new_spell_id = cloner.clone_for_class(cfg, item.old_spell_id)?;
+        let new_proc_id = Uuid::new_v4().to_string();
+        let (pk_col, pk_val) = match &style_x_spell_pk {
+            Some(col) => (format!(", {col}"), format!(", '{new_proc_id}'")),
+            None => (String::new(), String::new()),
+        };
+        batch.push_str(&format!(
+            "INSERT INTO StyleXSpell (SpellID, ClassID, StyleID, Chance{pk_col}) \
+             VALUES ({new_spell_id}, {class_id}, {}, {}{pk_val});\n",
+            item.shared_style_id, item.chance
+        ));
+        processed += 1;
+        on_progress(processed, total);
+    }
+
     if !batch.is_empty() {
         run_remote_sql(cfg, &batch)?;
     }
@@ -1686,7 +1754,7 @@ pub fn migrate_class_to_owned_spells(
         "migrated {} spell(s) and {} proc(s), across {} owned spec(s), to independent, editable \
          copies\n",
         line_work.len(),
-        proc_work.len(),
+        proc_update_work.len() + proc_clone_work.len(),
         owned_keys.len()
     ))
 }
@@ -2130,6 +2198,27 @@ pub fn ensure_style_owned(
         .ok_or_else(|| format!("could not find this class's own copy of '{name}' after cloning/granting its spec"))
 }
 
+/// Resolves a per-row `Style.StyleID` (the primary key every other `Style`-keyed lookup in this
+/// module uses, e.g. `ensure_style_owned`'s own parameter/return value) to that row's own shared
+/// `Style.ID` - the value `StyleXSpell`'s own (confusingly identically-named) `StyleID` column
+/// actually has to match, confirmed directly in the real server's own ORM mapping
+/// (`DbStyle.AttachedProcs`, `CoreDatabase/Tables/DbStyle.cs`):
+/// `[Relation(LocalField = "ID", RemoteField = "StyleID")]` - i.e. `StyleXSpell.StyleID` is
+/// joined against `Style.ID`, never `Style.StyleID`. Every style-proc function in this module
+/// originally got this backwards (writing/matching `Style.StyleID` values into `StyleXSpell`
+/// instead), which is why effects added or edited through this tool never actually took effect
+/// in-game: the live server's own `style.Procs`/`AttachedProcs` lookup simply never found a
+/// `Style.ID` match for whatever per-row `StyleID` had been written there by mistake (confirmed
+/// live: a tool-added "Friar's Regeneration" proc on Heavy Friar's own Holy Staff row had
+/// `StyleXSpell.StyleID = 6942`, that row's own literal primary key - but no `Style.ID` of 6942
+/// exists at all, since Holy Staff's real shared `ID` is 241).
+fn style_shared_id(cfg: &SshConfig, style_id: i64) -> Result<i64, String> {
+    let rows = run_remote_sql_json(cfg, &format!("SELECT ID FROM Style WHERE StyleID = {style_id};"))?;
+    rows.first()
+        .map(|r| int_field(r, "ID"))
+        .ok_or_else(|| format!("style {style_id} not found"))
+}
+
 /// Returns (owned `StyleXSpell_ID`, owned `SpellID`) for whatever `style_x_spell_id` now maps to,
 /// after ensuring both the owning style and this one secondary effect are independently owned by
 /// `class_id` - a no-op (echoes the same IDs straight back) if everything already was. Mirrors
@@ -2141,36 +2230,51 @@ pub fn ensure_style_owned(
 /// copying any of its own real procs along with it, so the first edit to one of those must still
 /// clone it on the spot here, the same as any other first-touch edit in this tool.
 ///
-/// When the owning style itself wasn't owned yet and its own promotion/grant just created a
-/// brand-new style row with none of this proc's own kind on it at all, this class's own already-
-/// cloned counterpart (if this isn't the first time this exact proc has been touched since) is
-/// found via `ClassEditorSpellClone.SourceSpellID` - the same "was this spell ever cloned from
-/// that one, for this class" correlation this tool already relies on elsewhere - rather than any
-/// fragile match on the proc's own `Chance`/position, which could collide with another proc on
-/// the same style sharing an identical `Chance`.
+/// `style_id` is this class's own view of the owning style (the same per-row `Style.StyleID` the
+/// "Classes" tab is already showing/editing) - needed explicitly rather than derived purely from
+/// `style_x_spell_id`'s own row, because (see `style_shared_id`'s own doc comment) a `StyleXSpell`
+/// row's own `StyleID` column is actually a `Style.ID` (the *shared*, cross-class business id),
+/// not a per-row primary key - it alone can't say which specific class's own row is being edited.
+///
+/// A proc not already owned by `class_id` (still the universal `ClassID = 0` default, or another
+/// class's own override) is never edited or moved in place - a brand-new row, cloning the spell
+/// specifically for `class_id`, is created instead (mirroring `ensure_style_owned`'s own clone-on-
+/// first-edit philosophy exactly), so an edit never silently changes what every *other* class
+/// sharing this style still sees. Found via `ClassEditorSpellClone.SourceSpellID` - the same "was
+/// this spell ever cloned from that one, for this class" correlation this tool already relies on
+/// elsewhere - rather than any fragile match on the proc's own `Chance`/position, which could
+/// collide with another proc on the same style sharing an identical `Chance`.
 pub fn ensure_style_proc_owned(
     cfg: &SshConfig,
     class_id: i64,
     spec_key: &str,
+    style_id: i64,
     style_x_spell_id: &str,
 ) -> Result<(String, i64), String> {
+    let owned_style_id = ensure_style_owned(cfg, class_id, spec_key, style_id)?;
+    let shared_id = style_shared_id(cfg, owned_style_id)?;
+    ensure_tracking_table(cfg)?;
+
     let id_q = sql_quote(style_x_spell_id);
     let rows = run_remote_sql_json(
         cfg,
-        &format!("SELECT StyleID, SpellID, Chance FROM StyleXSpell WHERE StyleXSpell_ID = '{id_q}';"),
+        &format!("SELECT StyleID, ClassID, SpellID, Chance FROM StyleXSpell WHERE StyleXSpell_ID = '{id_q}';"),
     )?;
     let row = rows.first().ok_or_else(|| {
         format!("no StyleXSpell row found for '{style_x_spell_id}' - it may have been removed")
     })?;
-    let style_id = int_field(row, "StyleID");
+    let proc_shared_id = int_field(row, "StyleID");
+    if proc_shared_id != shared_id {
+        return Err(format!(
+            "effect '{style_x_spell_id}' does not belong to style {style_id} - refusing to touch it"
+        ));
+    }
+    let proc_class_id = int_field(row, "ClassID");
     let current_spell_id = int_field(row, "SpellID");
     let chance = int_field(row, "Chance");
 
-    let owned_style_id = ensure_style_owned(cfg, class_id, spec_key, style_id)?;
-    ensure_tracking_table(cfg)?;
-
-    if owned_style_id == style_id {
-        // Already this class's own style - only this one effect's own spell might still need
+    if proc_class_id == class_id {
+        // Already this class's own override - only this one effect's own spell might still need
         // its own clone.
         let already_owned = run_remote_sql_json(
             cfg,
@@ -2193,7 +2297,8 @@ pub fn ensure_style_proc_owned(
         &format!(
             "SELECT StyleXSpell.StyleXSpell_ID AS Id, StyleXSpell.SpellID AS SpellId FROM StyleXSpell \
              JOIN ClassEditorSpellClone ON ClassEditorSpellClone.NewSpellID = StyleXSpell.SpellID \
-             WHERE StyleXSpell.StyleID = {owned_style_id} AND ClassEditorSpellClone.SourceSpellID = {current_spell_id} \
+             WHERE StyleXSpell.StyleID = {shared_id} AND StyleXSpell.ClassID = {class_id} \
+             AND ClassEditorSpellClone.SourceSpellID = {current_spell_id} \
              AND ClassEditorSpellClone.OwningClassId = {class_id};"
         ),
     )?;
@@ -2213,7 +2318,7 @@ pub fn ensure_style_proc_owned(
         cfg,
         &format!(
             "INSERT INTO StyleXSpell (SpellID, ClassID, StyleID, Chance{pk_col}) \
-             VALUES ({new_spell_id}, {class_id}, {owned_style_id}, {chance}{pk_val});"
+             VALUES ({new_spell_id}, {class_id}, {shared_id}, {chance}{pk_val});"
         ),
     )?;
     Ok((new_proc_id, new_spell_id))
@@ -2286,21 +2391,43 @@ pub struct StyleProc {
     pub style_x_spell_id: String,
     pub spell_id: i64,
     pub chance: i64,
+    /// The real `ClassID` on this `StyleXSpell` row itself - `0` for a universal effect every
+    /// class sharing this style's own `ID` gets by default, or a specific class's own override
+    /// that only ever applies when *that* class's own copy of the style triggers it. A style's
+    /// own procs are shared cross-class data (joined via `Style.ID`, not any one class's own
+    /// `StyleID` row - see `style_shared_id`'s own doc comment) - the class actually being viewed
+    /// is `applies_to_this_class`'s own problem, not this field's.
+    pub proc_class_id: i64,
+    /// Whether this is the one effect that actually fires for the class currently being viewed -
+    /// mirrors the real server's own precedence exactly (`StyleProcessor.cs`): a class-specific
+    /// override (`proc_class_id` equal to the class being viewed) always wins over the universal
+    /// default; the universal default (`proc_class_id == 0`) only applies when that class has no
+    /// override of its own. A row that's neither (some *other* class's own override) is still
+    /// listed here, but never fires for the class being viewed at all - deliberately: hiding it
+    /// would hide exactly the kind of cross-class collision/confusion a real, reported bug was
+    /// traced to (a tool-added proc landing on one class's own override while the live server
+    /// kept showing a *different* class's own effect for what looked like "the same" style).
+    pub applies_to_this_class: bool,
     pub is_owned: bool,
     pub fields: Value,
 }
 
-/// Every `StyleXSpell` proc currently attached to `style_id` - the "Classes" tab's own combat-
-/// skill (Style) editor's source list for displaying/editing a style's own secondary effects, the
-/// same role `list_spell_lines_for_spec` plays for a spell line's own spells.
-pub fn list_style_procs(cfg: &SshConfig, style_id: i64) -> Result<Vec<StyleProc>, String> {
+/// Every `StyleXSpell` proc that actually exists for the conceptual style `style_id` belongs to
+/// (every class's own override *and* the universal default, if any - resolved via
+/// `style_shared_id`, not `style_id` itself) - the "Classes" tab's own combat-skill (Style)
+/// editor's source list for displaying/editing a style's own secondary effects, the same role
+/// `list_spell_lines_for_spec` plays for a spell line's own spells. `class_id` is the class
+/// currently being viewed, used only to compute each row's own `applies_to_this_class`.
+pub fn list_style_procs(cfg: &SshConfig, class_id: i64, style_id: i64) -> Result<Vec<StyleProc>, String> {
     ensure_tracking_table(cfg)?;
+    let shared_id = style_shared_id(cfg, style_id)?;
     let rows = run_remote_sql_json(
         cfg,
         &format!(
-            "SELECT StyleXSpell.StyleXSpell_ID AS OwnerProcId, StyleXSpell.Chance AS OwnerChance, Spell.* \
+            "SELECT StyleXSpell.StyleXSpell_ID AS OwnerProcId, StyleXSpell.Chance AS OwnerChance, \
+             StyleXSpell.ClassID AS OwnerClassId, Spell.* \
              FROM StyleXSpell JOIN Spell ON Spell.SpellID = StyleXSpell.SpellID \
-             WHERE StyleXSpell.StyleID = {style_id};"
+             WHERE StyleXSpell.StyleID = {shared_id};"
         ),
     )?;
     let spell_ids: Vec<i64> = rows.iter().map(|r| int_field(r, "SpellID")).collect();
@@ -2316,15 +2443,21 @@ pub fn list_style_procs(cfg: &SshConfig, style_id: i64) -> Result<Vec<StyleProc>
         .map(|r| int_field(r, "NewSpellID"))
         .collect()
     };
+    let has_own_override = rows.iter().any(|r| int_field(r, "OwnerClassId") == class_id);
     Ok(rows
         .into_iter()
         .map(|r| {
             let spell_id = int_field(&r, "SpellID");
+            let proc_class_id = int_field(&r, "OwnerClassId");
+            let applies_to_this_class =
+                proc_class_id == class_id || (proc_class_id == 0 && !has_own_override);
             StyleProc {
                 style_x_spell_id: str_field(&r, "OwnerProcId"),
                 spell_id,
                 chance: int_field(&r, "OwnerChance"),
-                is_owned: owned_ids.contains(&spell_id),
+                proc_class_id,
+                applies_to_this_class,
+                is_owned: proc_class_id == class_id && owned_ids.contains(&spell_id),
                 fields: r,
             }
         })
@@ -2340,9 +2473,11 @@ pub fn list_style_procs(cfg: &SshConfig, style_id: i64) -> Result<Vec<StyleProc>
 /// from (`create_new_spell_spec`'s own doc comment - "New Spell"'s own fields are expected to be
 /// immediately rewritten via the existing field editor into whatever the effect is actually meant
 /// to be), and defaults `Chance` to 100 (triggers on every landed hit, the overwhelmingly common
-/// real case).
+/// real case). The new row is always `class_id`'s own override (`ClassID = class_id`, `StyleID =`
+/// the style's shared `ID` - see `style_shared_id`), so it only ever affects this one class.
 pub fn add_style_proc(cfg: &SshConfig, class_id: i64, spec_key: &str, style_id: i64) -> Result<StyleProc, String> {
     let owned_style_id = ensure_style_owned(cfg, class_id, spec_key, style_id)?;
+    let shared_id = style_shared_id(cfg, owned_style_id)?;
 
     let template_rows = run_remote_sql_json(cfg, "SELECT SpellID FROM Spell ORDER BY SpellID LIMIT 1;")?;
     let template_spell_id = template_rows.first().map(|r| int_field(r, "SpellID")).ok_or_else(|| {
@@ -2362,7 +2497,7 @@ pub fn add_style_proc(cfg: &SshConfig, class_id: i64, spec_key: &str, style_id: 
         &format!(
             "UPDATE Spell SET Name = 'New Effect' WHERE SpellID = {new_spell_id};\n\
              INSERT INTO StyleXSpell (SpellID, ClassID, StyleID, Chance{pk_col}) \
-             VALUES ({new_spell_id}, {class_id}, {owned_style_id}, 100{pk_val});"
+             VALUES ({new_spell_id}, {class_id}, {shared_id}, 100{pk_val});"
         ),
     )?;
 
@@ -2374,32 +2509,33 @@ pub fn add_style_proc(cfg: &SshConfig, class_id: i64, spec_key: &str, style_id: 
         style_x_spell_id: new_proc_id,
         spell_id: new_spell_id,
         chance: 100,
+        proc_class_id: class_id,
+        applies_to_this_class: true,
         is_owned: true,
         fields,
     })
 }
 
-/// Updates one `StyleXSpell` row's own `Chance` - refuses outright unless the owning `Style` is
-/// already locked exclusively to `class_id` (the same safety stance every other direct style/
-/// spell edit in this module already takes - never let the editing UI reach a row still shared
-/// with another class, even by mistake).
+/// Updates one `StyleXSpell` row's own `Chance` - refuses outright unless this row's own `ClassID`
+/// already equals `class_id` directly (the same safety stance every other direct style/spell edit
+/// in this module already takes - never let the editing UI reach a row still shared with another
+/// class, or genuinely belonging to a *different* class, even by mistake). Checked directly
+/// against the row's own `ClassID`, not via a `Style` join - a proc's own class-scoping is
+/// entirely its own `StyleXSpell.ClassID` column (see `style_shared_id`'s own doc comment for why
+/// joining through a specific `Style` row would be wrong here).
 pub fn update_style_proc_chance(cfg: &SshConfig, class_id: i64, style_x_spell_id: &str, chance: i64) -> Result<String, String> {
     let id_q = sql_quote(style_x_spell_id);
     let rows = run_remote_sql_json(
         cfg,
-        &format!(
-            "SELECT Style.ClassId AS OwnerClassId FROM StyleXSpell \
-             JOIN Style ON Style.StyleID = StyleXSpell.StyleID \
-             WHERE StyleXSpell.StyleXSpell_ID = '{id_q}';"
-        ),
+        &format!("SELECT ClassID AS OwnerClassId FROM StyleXSpell WHERE StyleXSpell_ID = '{id_q}';"),
     )?;
     let row = rows.first().ok_or_else(|| {
         format!("no StyleXSpell row found for '{style_x_spell_id}' - it may have been removed")
     })?;
     if int_field(row, "OwnerClassId") != class_id {
         return Err(
-            "this style is still a shared/stock one, not an independent clone owned by this \
-             class - edit one of its fields first, then try again"
+            "this effect is still a shared/universal one (or another class's own override), not \
+             an independent clone owned by this class - edit one of its fields first, then try again"
                 .to_string(),
         );
     }
@@ -2414,25 +2550,21 @@ pub fn update_style_proc_chance(cfg: &SshConfig, class_id: i64, style_x_spell_id
 /// class's own independent clone, tracked via `ClassEditorSpellClone` - never a still-shared
 /// effect spell) the underlying `Spell` row itself too, via `delete_owned_spells`. Deliberately
 /// refuses outright - no auto-cloning fallback, matching `delete_spell_from_line`'s own exact
-/// stance and reasoning - unless both the owning style and this effect's own spell are already
-/// independently owned by `class_id`.
+/// stance and reasoning - unless this row's own `ClassID` already equals `class_id` directly (see
+/// `update_style_proc_chance`'s own doc comment for why no `Style` join is involved here).
 pub fn delete_style_proc(cfg: &SshConfig, class_id: i64, style_x_spell_id: &str) -> Result<String, String> {
     let id_q = sql_quote(style_x_spell_id);
     let rows = run_remote_sql_json(
         cfg,
-        &format!(
-            "SELECT Style.ClassId AS OwnerClassId, StyleXSpell.SpellID AS OwnerSpellId \
-             FROM StyleXSpell JOIN Style ON Style.StyleID = StyleXSpell.StyleID \
-             WHERE StyleXSpell.StyleXSpell_ID = '{id_q}';"
-        ),
+        &format!("SELECT ClassID AS OwnerClassId, SpellID AS OwnerSpellId FROM StyleXSpell WHERE StyleXSpell_ID = '{id_q}';"),
     )?;
     let row = rows.first().ok_or_else(|| {
         format!("no StyleXSpell row found for '{style_x_spell_id}' - it may have been removed")
     })?;
     if int_field(row, "OwnerClassId") != class_id {
         return Err(
-            "this style is still a shared/stock one, not an independent clone owned by this \
-             class - only an effect on an already-owned style can be deleted"
+            "this effect is still a shared/universal one (or another class's own override), not \
+             an independent clone owned by this class - only an already-owned effect can be deleted"
                 .to_string(),
         );
     }
@@ -2751,6 +2883,21 @@ fn reparent_onto_real_spec(
 /// (which only needs one because it generates a *new*, not-yet-existing style set under a
 /// brand-new `SpecKeyName`).
 ///
+/// A real, confirmed-live bug this used to have: it picked candidate rows via `GROUP BY Name,
+/// SpecLevelRequirement`, scanning every class that shares the spec rather than just one. Two
+/// real classes can legitimately disagree on the level a shared style unlocks at (confirmed live:
+/// Friar's own "Figure Eight" is level 44, Drengr's is level 4 - same `Style.ID`, different
+/// `SpecLevelRequirement`, both genuine) - grouping by `(Name, SpecLevelRequirement)` treated
+/// those as *two different* styles and granted both, leaving the new class with two rows sharing
+/// one `Style.ID`. That collides head-on with the real server's own `m_styleIndex`, keyed by
+/// exactly `(Style.ID, ClassId)` and populated via `TryAdd` at boot (`SkillBase.cs`) - whichever
+/// row loses the race is silently dropped (a warning-only log), so the style a player actually
+/// sees/trains for that `ID` becomes a boot-order coincidence, and any secondary effect attached
+/// to the "losing" row's own class-specific `StyleXSpell` override can end up silently invisible
+/// in-game. Grouping by `Style.ID` instead - preferring whichever real class has the *lowest*
+/// `ClassId` as the canonical source when more than one genuinely disagrees - guarantees exactly
+/// one row per `Style.ID` is ever granted to one class, closing that hazard outright.
+///
 /// A clean no-op if the spec has no styles at all (e.g. Parry/Envenom/Thrown Weapons, which don't
 /// grant styles), already has a `ClassId = 0` universal bucket (nothing to grant - already
 /// visible to every class), or `new_class_id` already has its own copy (idempotent across
@@ -2787,12 +2934,14 @@ fn grant_styles_for_uncloneable_spec(
              StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
              WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, \
              RandomProc, ArmorHitLocation, ID) \
-             SELECT {new_class_id}, Name, '{real_name_q}', SpecLevelRequirement, Icon, EnduranceCost, \
-             StealthRequirement, OpeningRequirementType, OpeningRequirementValue, AttackResultRequirement, \
-             WeaponTypeRequirement, GrowthOffset, GrowthRate, BonusToHit, BonusToDefense, TwoHandAnimation, \
-             RandomProc, ArmorHitLocation, ID \
-             FROM Style WHERE SpecKeyName = '{real_name_q}' AND ClassId != 0 \
-             GROUP BY Name, SpecLevelRequirement;"
+             SELECT {new_class_id}, s.Name, '{real_name_q}', s.SpecLevelRequirement, s.Icon, s.EnduranceCost, \
+             s.StealthRequirement, s.OpeningRequirementType, s.OpeningRequirementValue, s.AttackResultRequirement, \
+             s.WeaponTypeRequirement, s.GrowthOffset, s.GrowthRate, s.BonusToHit, s.BonusToDefense, s.TwoHandAnimation, \
+             s.RandomProc, s.ArmorHitLocation, s.ID \
+             FROM Style s WHERE s.SpecKeyName = '{real_name_q}' AND s.ClassId = ( \
+                 SELECT MIN(s2.ClassId) FROM Style s2 \
+                 WHERE s2.SpecKeyName = s.SpecKeyName AND s2.ID = s.ID AND s2.ClassId != 0 \
+             );"
         ),
     )?;
 
@@ -3151,7 +3300,7 @@ fn clone_spec(
     let source_styles = run_remote_sql_json(
         cfg,
         &format!(
-            "SELECT StyleID, ClassId, Name, SpecLevelRequirement FROM Style \
+            "SELECT StyleID, ClassId, Name, SpecLevelRequirement, ID FROM Style \
              WHERE SpecKeyName = '{source_key_q}';"
         ),
     )?;
@@ -3189,19 +3338,24 @@ fn clone_spec(
             clone_style_with_fresh_id(cfg, representative_style_id, &new_key_q, &class_expr)?;
 
         // Procs: gather every StyleXSpell row attached to *any* of this group's collapsed source
-        // StyleIDs (not just the representative one - the real data's own duplicates are
-        // expected to carry the same procs, but this stays correct even if that ever isn't
-        // true), deduped by (SpellID, ClassID, Chance) so an identical proc recorded under
-        // several of the duplicate rows doesn't get attached to the new style more than once.
-        let old_style_ids_csv = rows
-            .iter()
-            .map(|r| int_field(r, "StyleID").to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        // styles' own shared `ID` (not their per-row `StyleID` - see `style_shared_id`'s own doc
+        // comment for why: `StyleXSpell.StyleID` is actually a `Style.ID` foreign key, confirmed
+        // in the real server's own ORM relation. Getting this backwards here meant cloning *any*
+        // spec whose stock styles have real, pre-existing procs - the overwhelmingly common case
+        // for most real combat specs - silently cloned zero of them, since no stock style's own
+        // per-row `StyleID` happens to equal its own `StyleXSpell.StyleID` value), deduped by
+        // (SpellID, ClassID, Chance) so an identical proc recorded under several of the
+        // duplicate rows doesn't get attached to the new style more than once.
+        let old_shared_ids_csv = {
+            let mut ids: Vec<i64> = rows.iter().map(|r| int_field(r, "ID")).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+        };
         let procs = run_remote_sql_json(
             cfg,
             &format!(
-                "SELECT SpellID, ClassID, Chance FROM StyleXSpell WHERE StyleID IN ({old_style_ids_csv});"
+                "SELECT SpellID, ClassID, Chance FROM StyleXSpell WHERE StyleID IN ({old_shared_ids_csv});"
             ),
         )?;
         let mut seen_procs: Vec<(i64, i64, i64)> = Vec::new();
@@ -3479,14 +3633,15 @@ mod tests {
         // procs (StyleXSpell) used to not be cloned at all. "Pulverize" (ClassId=1, locked to
         // the source class) gets a proc here - the clone must get its own StyleXSpell row,
         // pointing at the new style, repointed to the new class, and referencing its own
-        // independent Spell row (not the source's own SpellID 9099).
+        // independent Spell row (not the source's own SpellID 9099). Seeded against Pulverize's
+        // own real shared `ID` (0 in this fixture - see `style_shared_id`'s own doc comment for
+        // why that, not its per-row `StyleID`, is the real `StyleXSpell` foreign key).
         let dir = setup_test_db("clone-style-proc");
         let cfg = test_cfg(&dir);
         run_remote_sql(
             &cfg,
             "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
-             VALUES ('seed-proc-1', 9099, 1, \
-             (SELECT StyleID FROM Style WHERE Name='Pulverize' AND SpecKeyName='slash'), 25);",
+             VALUES ('seed-proc-1', 9099, 1, 0, 25);",
         )
         .unwrap();
 
@@ -3534,8 +3689,7 @@ mod tests {
         // The source's own proc must be completely untouched.
         let original_procs = run_remote_sql_json(
             &cfg,
-            "SELECT 1 FROM StyleXSpell WHERE StyleID = \
-             (SELECT StyleID FROM Style WHERE Name='Pulverize' AND SpecKeyName='slash');",
+            "SELECT 1 FROM StyleXSpell WHERE StyleID = 0;",
         )
         .unwrap();
         assert_eq!(original_procs.len(), 1, "the source proc must be untouched");
@@ -3548,7 +3702,8 @@ mod tests {
         // Simulates a class that was cloned *before* `clone_spec` started independently cloning
         // spells - its LineXSpell/StyleXSpell still point straight at the real stock spec's own
         // shared SpellIDs, exactly the shape every class created before this feature existed is
-        // left in.
+        // left in. "Shatter"'s own proc is seeded against its real shared `ID` (0 in this
+        // fixture - see `style_shared_id`'s own doc comment), not its per-row `StyleID`.
         let dir = setup_test_db("migrate-old-class");
         let cfg = test_cfg(&dir);
         run_remote_sql(
@@ -3560,7 +3715,7 @@ mod tests {
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('earthshatter_64_smite_base', 9001, 1, 'old-line-1');
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('earthshatter_64_smite_base', 9002, 10, 'old-line-2');
              INSERT INTO Style VALUES (NULL, 64, 'Shatter', 'earthshatter_64', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);
-             INSERT INTO StyleXSpell VALUES ('old-proc-1', 9099, 64, (SELECT StyleID FROM Style WHERE SpecKeyName='earthshatter_64'), 25);",
+             INSERT INTO StyleXSpell VALUES ('old-proc-1', 9099, 64, 0, 25);",
         )
         .unwrap();
 
@@ -6215,7 +6370,7 @@ mod tests {
             &cfg,
             "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
                 VALUES ('Sword', 'Sword', 'Sword weapons', 100, NULL, 0);
-             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);",
+             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 900);",
         )
         .unwrap();
         let source_style_id = int_field(
@@ -6226,17 +6381,14 @@ mod tests {
         let added = add_style_proc(&cfg, 64, "Sword", source_style_id).unwrap();
         assert_eq!(added.chance, 100);
         assert!(added.is_owned);
+        assert_eq!(added.proc_class_id, 64);
+        assert!(added.applies_to_this_class);
         assert_eq!(str_field(&added.fields, "Name"), "New Effect");
 
-        let owned_style_id = int_field(
-            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE SpecKeyName='Sword' AND ClassId=64;").unwrap()[0],
-            "StyleID",
-        );
-        let procs = run_remote_sql_json(
-            &cfg,
-            &format!("SELECT SpellID, ClassID, Chance FROM StyleXSpell WHERE StyleID = {owned_style_id};"),
-        )
-        .unwrap();
+        // The new row is keyed by this style's real shared `ID` (900 in this fixture - see
+        // `style_shared_id`'s own doc comment), not its own granted row's per-row `StyleID` -
+        // this is exactly what the live server's own `AttachedProcs` relation actually matches.
+        let procs = run_remote_sql_json(&cfg, "SELECT SpellID, ClassID, Chance FROM StyleXSpell WHERE StyleID = 900;").unwrap();
         assert_eq!(procs.len(), 1, "{procs:?}");
         assert_eq!(int_field(&procs[0], "ClassID"), 64);
         assert_eq!(int_field(&procs[0], "Chance"), 100);
@@ -6247,12 +6399,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tracked.len(), 1, "the new effect's own spell must be tracked as this class's own clone");
-
-        // The real, still-shared original style must be completely untouched - no proc of its
-        // own was ever added.
-        let original_procs =
-            run_remote_sql_json(&cfg, &format!("SELECT 1 FROM StyleXSpell WHERE StyleID = {source_style_id};")).unwrap();
-        assert!(original_procs.is_empty(), "{original_procs:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6265,21 +6411,67 @@ mod tests {
             &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
             "StyleID",
         );
+        // Pulverize's own real shared `ID` is 0 in this fixture (the default for every row that
+        // doesn't explicitly set one) - the real `StyleXSpell` foreign key, not its own per-row
+        // `StyleID` (see `style_shared_id`'s own doc comment).
         run_remote_sql(
             &cfg,
-            &format!(
-                "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
-                 VALUES ('seed-proc-1', 9099, 1, {pulverize_id}, 25);"
-            ),
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('seed-proc-1', 9099, 1, 0, 25);",
         )
         .unwrap();
 
-        let procs = list_style_procs(&cfg, pulverize_id).unwrap();
+        let procs = list_style_procs(&cfg, 1, pulverize_id).unwrap();
         assert_eq!(procs.len(), 1, "{procs:?}");
         assert_eq!(procs[0].chance, 25);
         assert_eq!(procs[0].spell_id, 9099);
+        assert_eq!(procs[0].proc_class_id, 1);
+        assert!(procs[0].applies_to_this_class, "class 1 is exactly this proc's own ClassID");
         assert!(!procs[0].is_owned, "9099 is still the real, un-cloned spell - never tracked as this tool's own clone");
         assert_eq!(str_field(&procs[0].fields, "Name"), "Blinding Light");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_style_procs_prefers_a_classs_own_override_over_the_universal_default() {
+        // The real, confirmed-live precedence `StyleProcessor.cs` itself applies: a universal
+        // default (ClassID=0) applies to every class sharing this style's shared ID, *unless*
+        // that class has its own override - in which case the override wins and the universal
+        // default simply never fires for that one class (while still applying to any other class
+        // with neither). Both rows are still returned for the "Classes" tab's own visibility
+        // (`applies_to_this_class` tells it which is actually live), the exact clarity gap a
+        // real, reported bug (a tool-added proc landing on the "wrong" row, invisible in-game)
+        // was traced to.
+        let dir = setup_test_db("list-style-procs-override-precedence");
+        let cfg = test_cfg(&dir);
+        let pulverize_id = int_field(
+            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
+            "StyleID",
+        );
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('universal-proc', 9099, 0, 0, 25);\n\
+             INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('override-proc-64', 9099, 64, 0, 50);",
+        )
+        .unwrap();
+
+        // Class 1 has no override of its own - only the universal default applies to it.
+        let for_class_1 = list_style_procs(&cfg, 1, pulverize_id).unwrap();
+        assert_eq!(for_class_1.len(), 2, "{for_class_1:?}");
+        let universal = for_class_1.iter().find(|p| p.style_x_spell_id == "universal-proc").unwrap();
+        assert!(universal.applies_to_this_class);
+        let others_override = for_class_1.iter().find(|p| p.style_x_spell_id == "override-proc-64").unwrap();
+        assert!(!others_override.applies_to_this_class, "class 64's own override is not class 1's");
+
+        // Class 64 has its own override - that one wins, the universal default no longer applies.
+        let for_class_64 = list_style_procs(&cfg, 64, pulverize_id).unwrap();
+        let universal = for_class_64.iter().find(|p| p.style_x_spell_id == "universal-proc").unwrap();
+        assert!(!universal.applies_to_this_class, "overridden by class 64's own effect");
+        let own_override = for_class_64.iter().find(|p| p.style_x_spell_id == "override-proc-64").unwrap();
+        assert!(own_override.applies_to_this_class);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6292,7 +6484,7 @@ mod tests {
             &cfg,
             "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
                 VALUES ('Sword', 'Sword', 'Sword weapons', 100, NULL, 0);
-             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);",
+             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 900);",
         )
         .unwrap();
         let source_style_id = int_field(
@@ -6312,16 +6504,10 @@ mod tests {
 
         // A real, still-shared style's own effect (never touched by this class at all) must be
         // refused outright, never silently edited.
-        let pulverize_id = int_field(
-            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
-            "StyleID",
-        );
         run_remote_sql(
             &cfg,
-            &format!(
-                "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
-                 VALUES ('shared-proc-1', 9099, 1, {pulverize_id}, 25);"
-            ),
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('shared-proc-1', 9099, 1, 0, 25);",
         )
         .unwrap();
         let refused = update_style_proc_chance(&cfg, 64, "shared-proc-1", 99);
@@ -6338,7 +6524,7 @@ mod tests {
             &cfg,
             "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
                 VALUES ('Sword', 'Sword', 'Sword weapons', 100, NULL, 0);
-             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);",
+             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 900);",
         )
         .unwrap();
         let source_style_id = int_field(
@@ -6358,16 +6544,10 @@ mod tests {
         assert!(spell_gone.is_empty(), "the owned effect's own Spell row must be deleted too");
 
         // A real, still-shared style's own effect must be refused outright, never deleted.
-        let pulverize_id = int_field(
-            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
-            "StyleID",
-        );
         run_remote_sql(
             &cfg,
-            &format!(
-                "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
-                 VALUES ('shared-proc-1', 9099, 1, {pulverize_id}, 25);"
-            ),
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('shared-proc-1', 9099, 1, 0, 25);",
         )
         .unwrap();
         let refused = delete_style_proc(&cfg, 64, "shared-proc-1");
@@ -6390,16 +6570,18 @@ mod tests {
             &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
             "StyleID",
         );
+        // Pulverize's own real shared `ID` is 0 in this fixture (the default for every row that
+        // doesn't explicitly set one) - the real `StyleXSpell` foreign key, not its own per-row
+        // `StyleID` (see `style_shared_id`'s own doc comment).
         run_remote_sql(
             &cfg,
-            &format!(
-                "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
-                 VALUES ('seed-proc-1', 9099, 1, {pulverize_id}, 25);"
-            ),
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('seed-proc-1', 9099, 1, 0, 25);",
         )
         .unwrap();
 
-        let (owned_proc_id, owned_spell_id) = ensure_style_proc_owned(&cfg, 1, "slash", "seed-proc-1").unwrap();
+        let (owned_proc_id, owned_spell_id) =
+            ensure_style_proc_owned(&cfg, 1, "slash", pulverize_id, "seed-proc-1").unwrap();
         assert_eq!(owned_proc_id, "seed-proc-1", "the row itself is reused in place, never a new one");
         assert_ne!(owned_spell_id, 9099, "must be a fresh, independent clone of the spell");
 
@@ -6411,7 +6593,8 @@ mod tests {
 
         // Idempotent: calling again with everything already owned must echo the same IDs back,
         // never cloning a second time.
-        let (again_proc_id, again_spell_id) = ensure_style_proc_owned(&cfg, 1, "slash", "seed-proc-1").unwrap();
+        let (again_proc_id, again_spell_id) =
+            ensure_style_proc_owned(&cfg, 1, "slash", pulverize_id, "seed-proc-1").unwrap();
         assert_eq!(again_proc_id, owned_proc_id);
         assert_eq!(again_spell_id, owned_spell_id);
 
@@ -6431,36 +6614,36 @@ mod tests {
             &cfg,
             "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
                 VALUES ('Sword', 'Sword', 'Sword weapons', 100, NULL, 0);
-             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 0);",
+             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 900);",
         )
         .unwrap();
         let source_style_id = int_field(
             &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE SpecKeyName='Sword';").unwrap()[0],
             "StyleID",
         );
+        // Keyed by this style's real shared `ID` (900 - see `style_shared_id`'s own doc
+        // comment), not its own un-owned source row's per-row `StyleID`.
         run_remote_sql(
             &cfg,
-            &format!(
-                "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
-                 VALUES ('seed-proc-1', 9099, 0, {source_style_id}, 30);"
-            ),
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('seed-proc-1', 9099, 0, 900, 30);",
         )
         .unwrap();
 
-        let (owned_proc_id, owned_spell_id) = ensure_style_proc_owned(&cfg, 64, "Sword", "seed-proc-1").unwrap();
+        let (owned_proc_id, owned_spell_id) =
+            ensure_style_proc_owned(&cfg, 64, "Sword", source_style_id, "seed-proc-1").unwrap();
         assert_ne!(owned_proc_id, "seed-proc-1", "must be a brand-new row on this class's own granted style");
         assert_ne!(owned_spell_id, 9099);
 
-        let owned_style_id = int_field(
-            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE SpecKeyName='Sword' AND ClassId=64;").unwrap()[0],
-            "StyleID",
-        );
+        // "Sword" is a NEVER_CLONE_SPECS spec - granting it preserves the real shared `ID` (900)
+        // as-is rather than allocating a fresh one, unlike a regular spec's own clone-with-fresh-
+        // id path.
         let new_proc = run_remote_sql_json(
             &cfg,
             &format!("SELECT StyleID, ClassID, Chance FROM StyleXSpell WHERE StyleXSpell_ID = '{owned_proc_id}';"),
         )
         .unwrap();
-        assert_eq!(int_field(&new_proc[0], "StyleID"), owned_style_id);
+        assert_eq!(int_field(&new_proc[0], "StyleID"), 900);
         assert_eq!(int_field(&new_proc[0], "ClassID"), 64);
         assert_eq!(int_field(&new_proc[0], "Chance"), 30, "Chance must carry over from the real, un-owned source proc");
 
@@ -6470,7 +6653,8 @@ mod tests {
 
         // Idempotent: a second call (e.g. editing the same effect again later) must find and
         // reuse this exact same new row, never creating yet another duplicate.
-        let (again_proc_id, again_spell_id) = ensure_style_proc_owned(&cfg, 64, "Sword", "seed-proc-1").unwrap();
+        let (again_proc_id, again_spell_id) =
+            ensure_style_proc_owned(&cfg, 64, "Sword", source_style_id, "seed-proc-1").unwrap();
         assert_eq!(again_proc_id, owned_proc_id);
         assert_eq!(again_spell_id, owned_spell_id);
 

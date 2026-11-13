@@ -385,8 +385,8 @@ fn update_style_level(
 }
 
 #[tauri::command]
-fn list_style_procs(cfg: SshConfig, style_id: i64) -> Result<Vec<specs::StyleProc>, String> {
-    specs::list_style_procs(&cfg, style_id)
+fn list_style_procs(cfg: SshConfig, class_id: i64, style_id: i64) -> Result<Vec<specs::StyleProc>, String> {
+    specs::list_style_procs(&cfg, class_id, style_id)
 }
 
 #[tauri::command]
@@ -485,12 +485,14 @@ fn save_style_proc_fields(
     cfg: SshConfig,
     class_id: i64,
     spec_key: String,
+    style_id: i64,
     style_x_spell_id: String,
     fields: std::collections::HashMap<String, serde_json::Value>,
     chance: Option<i64>,
 ) -> Result<SaveStyleProcResult, String> {
     deploy::ensure_safe_to_write(&cfg)?;
-    let (owned_proc_id, owned_spell_id) = specs::ensure_style_proc_owned(&cfg, class_id, &spec_key, &style_x_spell_id)?;
+    let (owned_proc_id, owned_spell_id) =
+        specs::ensure_style_proc_owned(&cfg, class_id, &spec_key, style_id, &style_x_spell_id)?;
     let mut messages = Vec::new();
     if !fields.is_empty() {
         messages.push(spell_ownership::update_owned_spell_fields(&cfg, owned_spell_id, &fields)?);

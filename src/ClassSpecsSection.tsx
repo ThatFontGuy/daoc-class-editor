@@ -568,7 +568,7 @@ function StyleProcsEditor({
     setBusy(true);
     setEditingProcId(null);
     try {
-      const rows = await invoke<StyleProc[]>("list_style_procs", { cfg: currentCfg(), styleId });
+      const rows = await invoke<StyleProc[]>("list_style_procs", { cfg: currentCfg(), classId, styleId });
       setProcs(rows);
     } catch (e) {
       setStatus(errorStatus(`Could not load this style's own effects: ${e}`));
@@ -640,6 +640,7 @@ function StyleProcsEditor({
         cfg,
         classId,
         specKey,
+        styleId,
         styleXSpellId: p.style_x_spell_id,
         fields,
         chance: chanceChanged ? newChance : null,
@@ -738,6 +739,7 @@ function StyleProcsEditor({
             <tr>
               <th>Chance</th>
               <th>Name</th>
+              <th>Scope</th>
               <th></th>
             </tr>
           </thead>
@@ -746,13 +748,28 @@ function StyleProcsEditor({
               const isEditingThis = editingProcId === p.style_x_spell_id;
               const editableKeys = EDITABLE_SPELL_FIELD_HINTS.filter((k) => k in p.fields);
               const { primaryKeys, restKeys } = splitPrimaryFields(editableKeys, PRIMARY_SPELL_FIELDS);
+              const scopeLabel =
+                p.proc_class_id === 0
+                  ? "Universal default"
+                  : p.proc_class_id === classId
+                    ? "This class only"
+                    : `Class ${p.proc_class_id}'s own override`;
               return (
                 <Fragment key={p.style_x_spell_id}>
-                  <tr>
+                  <tr style={p.applies_to_this_class ? undefined : { opacity: 0.5 }}>
                     <td>{p.chance}%</td>
                     <td>
                       {String(p.fields.Name ?? "")}
                       {!p.is_owned && <span className="hint"> (shared - saving clones it for this class)</span>}
+                    </td>
+                    <td>
+                      {scopeLabel}
+                      {!p.applies_to_this_class && (
+                        <span className="hint" title="Overridden by a different effect for this class - this one never fires here, even though it's still listed">
+                          {" "}
+                          (does not apply here)
+                        </span>
+                      )}
                     </td>
                     <td>
                       {isEditingThis ? (
@@ -783,7 +800,7 @@ function StyleProcsEditor({
                   </tr>
                   {isEditingThis && (
                     <tr>
-                      <td colSpan={3}>
+                      <td colSpan={4}>
                         <label className="field">
                           <span>Chance (%)</span>
                           <input
