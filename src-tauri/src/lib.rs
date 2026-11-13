@@ -180,8 +180,8 @@ fn list_class_specs(cfg: SshConfig, class_id: i64) -> Result<Vec<ClassSpecRow>, 
 }
 
 #[tauri::command]
-fn list_spec_spell_lines(cfg: SshConfig, spec_key: String) -> Result<Vec<SpecSpellLineRow>, String> {
-    specs::list_spec_spell_lines(&cfg, &spec_key)
+fn list_spec_spell_lines(cfg: SshConfig, spec_key: String, source_class_id: i64) -> Result<Vec<SpecSpellLineRow>, String> {
+    specs::list_spec_spell_lines(&cfg, &spec_key, source_class_id)
 }
 
 #[tauri::command]

@@ -299,6 +299,19 @@ pub struct SpecAssignment {
     pub new_key: String,
     pub new_name: String,
     pub level_acquired: i64,
+    /// Which real class's own view of `source_key` to clone - several real specs are shared by
+    /// multiple classes, each with its own distinct `SpellLine` row(s) tagged via `ClassIDHint`
+    /// (e.g. "Rejuvenation" has Friar's own "Rebirth", Cleric's own "Rebirth (Cleric)", Heretic's
+    /// own line, and a shared neutral baseline row) - see `resolve_spec_lines_for_class`'s own
+    /// doc comment for the full mechanic. `0` (the default, via `#[serde(default)]` for an older
+    /// saved project with no notion of this field yet, and for an assignment added by hand with
+    /// no particular class in mind) resolves to just the neutral/shared rows, never silently
+    /// pulling in every other class's own content the way a bare `WHERE Spec = key` query used
+    /// to, a real, reproduced bug found live: cloning Friar's own "Rejuvenation"/"Enhancement"
+    /// specs wholesale onto Heavy Friar pulled in Heretic's and Cleric's own lines too, mixed in
+    /// alongside Friar's.
+    #[serde(default)]
+    pub source_class_id: i64,
     /// Empty means "no customization was made - clone every SpellLine and every spell in it, in
     /// full" (the original, still-default behavior, and what every pre-existing saved project or
     /// test keeps getting via `#[serde(default)]`). Non-empty is the authoritative, explicit list
@@ -1212,19 +1225,28 @@ pub fn spell_type_field_stats(
     Ok(stats)
 }
 
-/// Every SpellLine attached to `spec_key` - the source list for the Edit flow's "customize which
-/// lines to include" picker (see `SpellLineSelection`'s own doc comment for why this exists).
+/// Every SpellLine that actually applies to `source_class_id` for `spec_key` (see
+/// `resolve_spec_lines_for_class`) - the source list for the Edit flow's "customize which lines
+/// to include" picker (see `SpellLineSelection`'s own doc comment for why this exists). Scoped
+/// the same way `clone_spec` itself now resolves what to clone by default, so this picker never
+/// shows (and lets a user accidentally explicitly re-include) some other class's own line that
+/// happens to share this spec's name - a real, reproduced bug found live: "Rejuvenation"'s own
+/// picker mixed Friar's, Cleric's, and Heretic's own lines together with no way to tell them
+/// apart.
 pub fn list_spec_spell_lines(
     cfg: &SshConfig,
     spec_key: &str,
+    source_class_id: i64,
 ) -> Result<Vec<SpecSpellLineRow>, String> {
     let spec_key_q = sql_quote(spec_key);
-    let rows = run_remote_sql_json(
+    let all_rows = run_remote_sql_json(
         cfg,
         &format!(
-            "SELECT KeyName, Name, IsBaseLine FROM SpellLine WHERE Spec = '{spec_key_q}' ORDER BY Name;"
+            "SELECT KeyName, Name, IsBaseLine, ClassIDHint FROM SpellLine WHERE Spec = '{spec_key_q}';"
         ),
     )?;
+    let mut rows = resolve_spec_lines_for_class(&all_rows, source_class_id);
+    rows.sort_by_key(|a| str_field(a, "Name"));
     Ok(rows
         .iter()
         .map(|r| SpecSpellLineRow {
@@ -1353,6 +1375,7 @@ pub fn apply_class_specs(
             &final_key,
             &a.new_name,
             new_class_id,
+            a.source_class_id,
             &a.spell_line_selection,
         )?;
 
@@ -1966,7 +1989,7 @@ fn ensure_class_owns_spec(cfg: &SshConfig, class_id: i64, spec_key: &str) -> Res
 
     let new_key = format!("{spec_key}_{class_id}");
     delete_existing_clone(cfg, &new_key)?;
-    clone_spec(cfg, spec_key, &new_key, &name, class_id, &[])?;
+    clone_spec(cfg, spec_key, &new_key, &name, class_id, class_id, &[])?;
 
     let new_key_q = sql_quote(&new_key);
     run_remote_sql(
@@ -3124,17 +3147,40 @@ fn prune_spell_lines_in_place(
 /// which spells within an included one) actually get cloned - see `SpellLineSelection`'s own doc
 /// comment; an empty slice clones every line and every spell in full, unchanged from before this
 /// existed.
+///
+/// Only the lines that actually apply to `source_class_id` (see `resolve_spec_lines_for_class`,
+/// `SpecAssignment::source_class_id`'s own doc comment) are even considered for cloning - a real,
+/// reproduced bug found live: several real specs are shared by multiple classes with their own
+/// distinct lines (e.g. "Rejuvenation" has Friar's own "Rebirth", Cleric's own "Rebirth (Cleric)",
+/// Heretic's own line, and a shared neutral baseline), and a bare `WHERE Spec = key` query cloned
+/// every one of them onto whatever class was being cloned into, not just the one actually wanted.
 fn clone_spec(
     cfg: &SshConfig,
     source_key: &str,
     new_key: &str,
     new_name: &str,
     new_class_id: i64,
+    source_class_id: i64,
     spell_line_selection: &[SpellLineSelection],
 ) -> Result<(), String> {
     let source_key_q = sql_quote(source_key);
     let new_key_q = sql_quote(new_key);
     let new_name_q = sql_quote(new_name);
+
+    // Whether this clone is meant to be a faithful, same-identity duplicate (the common "clone
+    // this whole class" case - every assignment defaults new_name to the source's own real Name
+    // unless the caller deliberately changes it) or a deliberate repurposing under a new name
+    // (e.g. "Smite" borrowed into a custom "Frostbolt Tree") - decides whether a cloned line keeps
+    // its source's own IsBaseLine status or is forced into a regular, point-gated line, a few
+    // lines down.
+    let source_name = run_remote_sql_json(
+        cfg,
+        &format!("SELECT Name FROM Specialization WHERE KeyName = '{source_key_q}';"),
+    )?
+    .first()
+    .map(|r| str_field(r, "Name"))
+    .unwrap_or_default();
+    let preserve_mechanics = source_name == new_name;
 
     // ClientStyleGroup isn't on every fork's own Specialization table at all - a real,
     // reproduced case: Divided Realms' actual live production server (unlike the stale "Othlyn"
@@ -3188,11 +3234,14 @@ fn clone_spec(
 
     // Spell lines attached to this spec each need their own new unique KeyName - read them first
     // so each clone statement can be built with a name we already know is unique (derived from
-    // the new spec key plus the new class ID).
-    let lines = run_remote_sql_json(
+    // the new spec key plus the new class ID). Resolved down to just `source_class_id`'s own
+    // applicable lines first (see this function's own doc comment) - a bare `WHERE Spec = key`
+    // query returns every class's own rows mixed together.
+    let all_lines = run_remote_sql_json(
         cfg,
-        &format!("SELECT KeyName, Name FROM SpellLine WHERE Spec = '{source_key_q}';"),
+        &format!("SELECT KeyName, Name, IsBaseLine, ClassIDHint FROM SpellLine WHERE Spec = '{source_key_q}';"),
     )?;
+    let lines = resolve_spec_lines_for_class(&all_lines, source_class_id);
     for line in &lines {
         let old_line_key = str_field(line, "KeyName");
 
@@ -3215,29 +3264,40 @@ fn clone_spec(
             }
         }
 
-        // A cloned line is always a regular, spec-point-gated line - never a base line, no
-        // matter what the source's own IsBaseLine was. A real, reproduced bug found live:
-        // cloning "Mind Twisting" (a genuine base line for the real Sorcerer, whose own class
-        // design grants it free based on character level alone, needing no spec investment)
-        // carried that flag over verbatim - Specialization.cs's own real granting logic sets a
-        // base line's effective level straight to the player's *character* level
+        // A faithful, same-identity clone (new_name unchanged from the source's own real Name -
+        // the common "clone this whole class" case) keeps the source's own IsBaseLine exactly -
+        // "A clone should inherit the same baseline spells as its origin class" (the owner's own
+        // stated requirement). A deliberate repurposing under a new name forces it to 0 (always a
+        // regular, point-gated line) instead - a real, reproduced bug found live: cloning "Mind
+        // Twisting" (a genuine base line for the real Sorcerer, whose own class design grants it
+        // free based on character level alone, needing no spec investment) into an unrelated
+        // custom spec carried that flag over verbatim - Specialization.cs's own real granting
+        // logic sets a base line's effective level straight to the player's *character* level
         // (`ls.Item1.Level = player.Level`), completely ignoring however many points were
-        // actually trained in the spec. The clone's spec points showed correctly on the
+        // actually trained in the new spec. The clone's spec points showed correctly on the
         // character sheet, but every spell up to the character's own level was silently granted
         // regardless, and the in-game trainer window had nothing to preview/train at all (there
-        // was never anything point-gated to show). Every other spec this tool clones is meant to
-        // unlock progressively as points are trained, so this is forced to 0 unconditionally.
+        // was never anything point-gated to show).
+        let is_base_line = if preserve_mechanics { int_field(line, "IsBaseLine") } else { 0 };
         let new_line_key = format!("{new_key}_{}", old_line_key);
         let old_line_key_q = sql_quote(&old_line_key);
         let new_line_key_q = sql_quote(&new_line_key);
         // The line's own display Name (shown wherever spell lines are listed, e.g. the
-        // spellbook) must follow the caller's chosen rename too, not the source's own - a real
+        // spellbook) must follow the caller's chosen rename for a deliberate repurposing - a real
         // bug found live: a spec cloned and renamed (e.g. "Dementia" -> "Fervor") still showed
         // its spell line as "Dementia" everywhere, since this copied the source's Name verbatim
         // instead of using new_name like the Specialization row itself already correctly does.
+        // A faithful, same-identity clone keeps each line's own distinct original Name instead -
+        // forcing every one of a spec's several lines (e.g. "Rejuvenation"'s own baseline row
+        // and Friar's own "Rebirth") to share one identical name the moment more than one is ever
+        // actually resolved for a single class would be its own new, previously-impossible-to-
+        // trigger bug (fixed alongside this one: see this function's own doc comment for why a
+        // single class correctly resolving more than one of a shared spec's own lines is now
+        // possible at all).
+        let line_name_q = if preserve_mechanics { sql_quote(&str_field(line, "Name")) } else { new_name_q.clone() };
         batch.push_str(&format!(
             "INSERT INTO SpellLine (KeyName, Name, Spec, IsBaseLine, ClassIDHint) \
-             VALUES ('{new_line_key_q}', '{new_name_q}', '{new_key_q}', 0, {new_class_id});\n"
+             VALUES ('{new_line_key_q}', '{line_name_q}', '{new_key_q}', {is_base_line}, {new_class_id});\n"
         ));
 
         // LineXSpell_ID is a GUID-style primary key the real schema requires explicitly (not an
@@ -3557,6 +3617,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -3650,6 +3711,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -3787,6 +3849,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -3959,6 +4022,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -3987,7 +4051,7 @@ mod tests {
         run_remote_sql(
             &cfg,
             "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);\
-             INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 1);\
+             INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 0);\
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('slash_base', 9001, 1, 'shared-line-1');",
         )
         .unwrap();
@@ -4082,7 +4146,7 @@ mod tests {
         run_remote_sql(
             &cfg,
             "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);\
-             INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 1);\
+             INSERT INTO SpellLine VALUES ('slash_base', 'Slash Styles', 'slash', 0, 0);\
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('slash_base', 9001, 1, 'shared-line-1');",
         )
         .unwrap();
@@ -4159,6 +4223,7 @@ mod tests {
             new_key: "nosferatusclaw".to_string(),
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -4219,6 +4284,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         let result = apply_class_specs(&cfg, 64, &assignments, &[]);
@@ -4850,6 +4916,7 @@ mod tests {
             new_key: "nosferatusclaw".to_string(),
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         // 999/888/777 are neither a class involved in the clone request at all - exactly the
@@ -4905,6 +4972,7 @@ mod tests {
             new_key: "nosferatusclaw".to_string(),
             new_name: "Nosferatu's Claw".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -4972,6 +5040,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5029,6 +5098,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: -9,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5070,6 +5140,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5126,6 +5197,7 @@ mod tests {
             new_key: "earthshatter".to_string(),
             new_name: "Earthshatter".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5185,6 +5257,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5196,6 +5269,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &resubmit, &[]).unwrap();
@@ -5251,6 +5325,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5275,6 +5350,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: vec![SpellLineSelection {
                 source_line_key: "frostbolt_tree_64_smite_base".to_string(),
                 included: true,
@@ -5327,6 +5403,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5345,6 +5422,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: vec![SpellLineSelection {
                 source_line_key: "frostbolt_tree_64_smite_base".to_string(),
                 included: true,
@@ -5387,6 +5465,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5477,8 +5556,10 @@ mod tests {
         // spec - so the clone's spec points showed correctly on the character sheet, but every
         // spell up to the character's own level was silently granted regardless, and the
         // in-game trainer window had nothing to preview/train (there was never anything
-        // point-gated to show in the first place). A clone must always be a regular, point-gated
-        // line, no matter what the source's own IsBaseLine was.
+        // point-gated to show in the first place). This specific scenario is a deliberate
+        // repurposing under a new name (new_name "Frostbolt Tree" != the source's own real
+        // "Smite") - see preserve_mechanics in clone_spec's own doc comment, and the test right
+        // below this one for the opposite, same-name case a whole-class clone actually needs.
         let dir = setup_test_db("clone-of-base-line");
         let cfg = test_cfg(&dir);
         run_remote_sql(&cfg, "UPDATE SpellLine SET IsBaseLine = 1 WHERE KeyName = 'smite_base';")
@@ -5489,6 +5570,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -5504,6 +5586,73 @@ mod tests {
             0,
             "the clone must never be a base line, even though its source is: {lines:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clone_resolves_only_the_source_classs_own_lines_and_preserves_their_baseline_status() {
+        // The exact real, reported scenario this fixes: "Rejuvenation" is shared by several real
+        // classes, each with its own distinct SpellLine (Friar's own "Rebirth", Cleric's own
+        // "Rebirth (Cleric)"), plus one shared neutral baseline row every class without one of
+        // its own falls back to - confirmed live. Cloning Friar's own "Rejuvenation" wholesale
+        // (new_name left exactly as the source's own real Name, the default every "clone this
+        // whole class" assignment uses) onto Heavy Friar must pull in only Friar's own line plus
+        // the shared baseline - never Cleric's own, unrelated line - and must keep the shared
+        // baseline's own IsBaseLine status exactly as the owner's own stated requirement: "A
+        // clone should inherit the same baseline spells as its origin class."
+        let dir = setup_test_db("clone-scoped-to-source-class");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+                VALUES ('rejuv', 'Rejuvenation', 'Healing spells', 100, NULL, 0);
+             INSERT INTO ClassXSpecialization VALUES (10, 'rejuv', 0);
+             INSERT INTO SpellLine VALUES ('rejuv_neutral_base', 'Rejuvenation', 'rejuv', 1, 0);
+             INSERT INTO SpellLine VALUES ('rebirth', 'Rebirth', 'rejuv', 0, 10);
+             INSERT INTO SpellLine VALUES ('rebirth_cleric', 'Rebirth (Cleric)', 'rejuv', 0, 6);
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('rejuv_neutral_base', 9001, 1, 'seed-rejuv-base');
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('rebirth', 9002, 1, 'seed-rebirth');
+             INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) VALUES ('rebirth_cleric', 9002, 1, 'seed-rebirth-cleric');",
+        )
+        .unwrap();
+
+        let assignments = vec![SpecAssignment {
+            source_key: "rejuv".to_string(),
+            new_key: "rejuv".to_string(),
+            new_name: "Rejuvenation".to_string(),
+            level_acquired: 0,
+            source_class_id: 10,
+            spell_line_selection: Vec::new(),
+        }];
+        apply_class_specs(&cfg, 101, &assignments, &[]).unwrap();
+
+        let cloned_lines = run_remote_sql_json(
+            &cfg,
+            "SELECT KeyName, Name, IsBaseLine FROM SpellLine WHERE Spec = 'rejuv_101';",
+        )
+        .unwrap();
+        assert_eq!(cloned_lines.len(), 2, "only Friar's own line + the shared baseline, never Cleric's own: {cloned_lines:?}");
+        assert!(
+            !cloned_lines.iter().any(|l| str_field(l, "Name") == "Rebirth (Cleric)"),
+            "Cleric's own unrelated line must never be cloned here: {cloned_lines:?}"
+        );
+
+        let base = cloned_lines
+            .iter()
+            .find(|l| str_field(l, "Name") == "Rejuvenation")
+            .expect("the shared neutral baseline must still be cloned");
+        assert_eq!(
+            int_field(base, "IsBaseLine"),
+            1,
+            "a same-name wholesale clone must preserve the source's own baseline status: {base:?}"
+        );
+
+        let gated = cloned_lines
+            .iter()
+            .find(|l| str_field(l, "Name") == "Rebirth")
+            .expect("Friar's own real line must be cloned too");
+        assert_eq!(int_field(gated, "IsBaseLine"), 0, "Friar's own Rebirth was never a base line to begin with: {gated:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5530,6 +5679,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: vec![SpellLineSelection {
                 source_line_key: "smite_base".to_string(),
                 included: true,
@@ -5565,6 +5715,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: vec![SpellLineSelection {
                 source_line_key: "smite_base".to_string(),
                 included: true,
@@ -5610,7 +5761,7 @@ mod tests {
         let dir = setup_test_db("list-spell-lines");
         let cfg = test_cfg(&dir);
 
-        let lines = list_spec_spell_lines(&cfg, "smite").unwrap();
+        let lines = list_spec_spell_lines(&cfg, "smite", 1).unwrap();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_eq!(lines[0].key_name, "smite_base");
         assert_eq!(lines[0].name, "Smiting Spells");
@@ -5646,6 +5797,7 @@ mod tests {
                 new_key: "earthshatter".to_string(),
                 new_name: "Earthshatter".to_string(),
                 level_acquired: 0,
+                source_class_id: 0,
                 spell_line_selection: Vec::new(),
             },
             SpecAssignment {
@@ -5653,6 +5805,7 @@ mod tests {
                 new_key: "frostbolt_tree".to_string(),
                 new_name: "Frostbolt Tree".to_string(),
                 level_acquired: 0,
+                source_class_id: 1,
                 spell_line_selection: Vec::new(),
             },
         ];
@@ -5724,6 +5877,7 @@ mod tests {
                 new_key: "earthshatter".to_string(),
                 new_name: "Earthshatter".to_string(),
                 level_acquired: 0,
+                source_class_id: 0,
                 spell_line_selection: Vec::new(),
             },
             SpecAssignment {
@@ -5731,6 +5885,7 @@ mod tests {
                 new_key: "frostbolt_tree".to_string(),
                 new_name: "Frostbolt Tree".to_string(),
                 level_acquired: 0,
+                source_class_id: 1,
                 spell_line_selection: Vec::new(),
             },
         ];
@@ -5930,6 +6085,7 @@ mod tests {
             new_key: "earthshatterblade".to_string(),
             new_name: "Earthshatter Blade".to_string(),
             level_acquired: 3,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -6078,6 +6234,7 @@ mod tests {
             new_key: "sword".to_string(),
             new_name: "Sword".to_string(),
             level_acquired: 0,
+            source_class_id: 0,
             spell_line_selection: Vec::new(),
         }];
         let log = apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();
@@ -6162,6 +6319,7 @@ mod tests {
             new_key: "frostbolt_tree".to_string(),
             new_name: "Frostbolt Tree".to_string(),
             level_acquired: 0,
+            source_class_id: 1,
             spell_line_selection: Vec::new(),
         }];
         apply_class_specs(&cfg, 64, &assignments, &[]).unwrap();

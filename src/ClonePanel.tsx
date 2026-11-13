@@ -301,7 +301,10 @@ export default function ClonePanel() {
       setSourceSpecs(mine);
       // Pre-fill assignments from the source class's own specs, defaulting the new name to the
       // source spec's own name (editable) - every assignment is always a clone now (see
-      // specs.rs's module doc comment for why "reuse" was removed).
+      // specs.rs's module doc comment for why "reuse" was removed). source_class_id is always
+      // specsReadFromId here - every one of these assignments' own source_key was read directly
+      // from that one real class's own specs, so its own view (own ClassIDHint, falling back to
+      // the shared neutral lines) is exactly what should be cloned.
       if (project.specAssignments.length === 0) {
         setProject((p) => ({
           ...p,
@@ -310,6 +313,7 @@ export default function ClonePanel() {
             source_name: m.spec_name,
             new_name: m.spec_name,
             level_acquired: m.level_acquired,
+            source_class_id: specsReadFromId,
             applied: false,
           })),
           // Only meaningful while editing an already-deployed class in place (reading its own
@@ -368,6 +372,7 @@ export default function ClonePanel() {
         const lines = await invoke<SpecSpellLineRow[]>("list_spec_spell_lines", {
           cfg: await ensureDesignSession(),
           specKey: a.source_key,
+          sourceClassId: a.source_class_id ?? 0,
         });
         updateSpecAssignment(i, {
           spellLineSelection: lines.map((l) => ({
@@ -477,6 +482,9 @@ export default function ClonePanel() {
           source_name: allSpecs[0]?.name ?? "",
           new_name: allSpecs[0]?.name ?? "",
           level_acquired: 0,
+          // No particular source class in mind for a row added by hand (not prefilled from one
+          // specific class's own specs) - source_class_id stays unset, resolving to just the
+          // shared/neutral SpellLines for whatever's picked, never another class's own.
           applied: false,
         },
       ],
@@ -551,6 +559,7 @@ export default function ClonePanel() {
       new_key: deriveSpecKey(a.new_name),
       new_name: a.new_name,
       level_acquired: a.level_acquired,
+      source_class_id: a.source_class_id ?? 0,
       // Undefined (never customized) sends an empty list - apply_class_specs treats that as
       // "clone every line and every spell in full", the original, still-default behavior.
       spell_line_selection: (a.spellLineSelection ?? []).map((l) => ({
@@ -814,6 +823,11 @@ export default function ClonePanel() {
                                   // A previous customization belonged to the old source spec's own
                                   // lines - meaningless (and possibly wrong) against a different one.
                                   spellLineSelection: undefined,
+                                  // Likewise, whatever class this row was originally read from no
+                                  // longer applies to a freshly hand-picked spec - resolve the
+                                  // newly picked one's own shared/neutral lines instead of some
+                                  // unrelated class's.
+                                  source_class_id: undefined,
                                 });
                                 if (expandedSpecIndex === i) closeSpellLineCustomizer();
                               }}

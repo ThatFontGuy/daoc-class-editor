@@ -59,6 +59,12 @@ export interface SpecAssignmentUI {
   source_name: string;
   new_name: string;
   level_acquired: number;
+  /** Which real class this assignment's own source_key was actually read from - lets the server
+   * resolve just that class's own applicable SpellLines (own ClassIDHint, falling back to the
+   * shared neutral ones) instead of every class that happens to share the same spec name. Unset
+   * for a row added by hand (no particular source class in mind), which resolves to the shared
+   * neutral lines only. */
+  source_class_id?: number;
   /** Set once "Apply to server" has run for this assignment, so re-applying is a visible choice. */
   applied: boolean;
   /** Undefined/empty = not customized, clone every SpellLine and every spell in full (the

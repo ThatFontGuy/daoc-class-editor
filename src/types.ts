@@ -139,6 +139,11 @@ export interface SpecAssignmentPayload {
   new_key: string;
   new_name: string;
   level_acquired: number;
+  // Which real class's own view of source_key to clone (own ClassIDHint-tagged SpellLines,
+  // falling back to the shared neutral ones) - see specs.rs's SpecAssignment::source_class_id
+  // doc comment. 0 (omitted here, defaulting server-side) resolves to just the shared/neutral
+  // lines, never another class's own.
+  source_class_id?: number;
   spell_line_selection: SpellLineSelectionPayload[];
 }
 
