@@ -13,20 +13,30 @@
 // hardcoded `7`, the same "introspect the real enum, don't assume" approach this app already uses
 // for the opening/attack-result dropdowns themselves). Any other style - the common case, "many
 // are Anytime" - has no real prerequisite to link at all.
+//
+// `OpeningRequirementValue` is matched against a style's own *shared* `Style.ID` column, never its
+// per-row `StyleID` - confirmed directly in the real server's own `SkillBase.GetStyleByID` (looked
+// up via `m_styleIndex`, keyed `(Style.ID, ClassId)`) and live (Infiltrator's own "Eviscerate"
+// requires `OpeningRequirementValue=335`, which matches "Backstab"'s own shared `ID`, not its
+// much larger per-row `StyleID`) - the exact same shared-vs-per-row-id mixup this project's own
+// style-proc feature already had (see specs.rs's own `style_shared_id` doc comment), just for a
+// different field. The caller still groups/keys display rows by their own per-row `StyleID`
+// (`list_styles_for_spec`'s own return value) - only the *matching* needs the shared `ID`.
 
 import { assignGroupColors } from "./groupColors";
 
 /** Groups styles into chains - a style and whatever (if anything) it explicitly requires, and
- * whatever requires *that* in turn, transitively. `getPrerequisiteStyleId` should return `null`
- * for an ordinary, non-chain ("Anytime") style - see this module's own doc comment for exactly
- * when a real prerequisite exists at all. */
+ * whatever requires *that* in turn, transitively. `getSharedStyleId` must return each style's own
+ * shared `Style.ID` (not its per-row `StyleID`); `getPrerequisiteSharedStyleId` should return
+ * `null` for an ordinary, non-chain ("Anytime") style - see this module's own doc comment for
+ * exactly when a real prerequisite exists at all. */
 export function groupStylesByChain<T>(
   items: T[],
-  getStyleId: (item: T) => number,
-  getPrerequisiteStyleId: (item: T) => number | null,
+  getSharedStyleId: (item: T) => number,
+  getPrerequisiteSharedStyleId: (item: T) => number | null,
 ): T[][] {
-  const indexByStyleId = new Map<number, number>();
-  items.forEach((item, i) => indexByStyleId.set(getStyleId(item), i));
+  const indexBySharedStyleId = new Map<number, number>();
+  items.forEach((item, i) => indexBySharedStyleId.set(getSharedStyleId(item), i));
 
   const parent = items.map((_, i) => i);
   function find(x: number): number {
@@ -43,9 +53,9 @@ export function groupStylesByChain<T>(
   }
 
   items.forEach((item, i) => {
-    const prereqStyleId = getPrerequisiteStyleId(item);
-    if (prereqStyleId === null) return;
-    const prereqIndex = indexByStyleId.get(prereqStyleId);
+    const prereqId = getPrerequisiteSharedStyleId(item);
+    if (prereqId === null) return;
+    const prereqIndex = indexBySharedStyleId.get(prereqId);
     // A prerequisite outside this exact list (e.g. a different spec entirely) has nothing here to
     // link to - left ungrouped rather than guessed at.
     if (prereqIndex !== undefined) union(i, prereqIndex);
@@ -66,8 +76,8 @@ export function groupStylesByChain<T>(
 export function assignChainColors<T>(
   items: T[],
   getKey: (item: T) => string,
-  getStyleId: (item: T) => number,
-  getPrerequisiteStyleId: (item: T) => number | null,
+  getSharedStyleId: (item: T) => number,
+  getPrerequisiteSharedStyleId: (item: T) => number | null,
 ): Map<string, string> {
-  return assignGroupColors(groupStylesByChain(items, getStyleId, getPrerequisiteStyleId), getKey);
+  return assignGroupColors(groupStylesByChain(items, getSharedStyleId, getPrerequisiteSharedStyleId), getKey);
 }

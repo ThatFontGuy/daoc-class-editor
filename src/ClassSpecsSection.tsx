@@ -449,7 +449,14 @@ function CombatSpecEditor({
               const chainColors = assignChainColors(
                 styles,
                 (s) => String(s.style_id),
-                (s) => s.style_id,
+                // The real server's own `m_styleIndex`/`GetStyleByID` resolves a chain's own
+                // OpeningRequirementValue against a style's *shared* `ID` column, confirmed live
+                // (Infiltrator's own "Eviscerate" requires OpeningRequirementValue=335, which
+                // matches "Backstab"'s own `ID` - not its per-row `StyleID`, a completely
+                // different, larger number) - the exact same shared-vs-per-row-id mixup this
+                // project's own style-proc feature already had (see specs.rs's own
+                // style_shared_id doc comment), just for a different field this time.
+                (s) => Number(s.fields.ID ?? s.style_id),
                 (s) => {
                   const openingType = Number(s.fields.OpeningRequirementType ?? -1);
                   const attackResult = Number(s.fields.AttackResultRequirement ?? -1);
