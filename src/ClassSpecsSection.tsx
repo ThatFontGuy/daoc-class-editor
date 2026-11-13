@@ -92,6 +92,13 @@ const PRIMARY_SPELL_FIELDS = ["Name", "Type", "Description", "Message1", "Messag
 // someone tuning a melee style is actually likely to want to change. SpecLevelRequirement is
 // deliberately left out here - it has its own quick-edit in the Level column instead. Order here
 // is the actual display order too.
+//
+// "StealthRequirement" (can this style only be used while stealthed, e.g. several real
+// Infiltrator/Shadowblade/Nightshade Critical Strike openers) is a plain boolean on the real
+// schema too - a real, reported gap: there was no way at all to toggle it, only a bare number
+// field a typo could silently turn into something other than 0/1 - rendered as a Yes/No picker,
+// not free text, by renderStyleDraftField below (mirroring MoveCast/Uninterruptible's own
+// treatment in EDITABLE_SPELL_FIELD_HINTS above).
 const EDITABLE_STYLE_FIELD_HINTS = [
   "Name",
   "Icon",
@@ -392,6 +399,15 @@ function CombatSpecEditor({
     if (key === "OpeningRequirementType") {
       return <EnumDropdown options={openingTypes} current={draft[key] ?? ""} onChange={onChange} />;
     }
+    if (key === "StealthRequirement") {
+      const current = draft[key] ?? "0";
+      return (
+        <select value={current} onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}>
+          <option value="0">No</option>
+          <option value="1">Yes</option>
+        </select>
+      );
+    }
     if (key === "OpeningRequirementValue") {
       if ((draft.OpeningRequirementType ?? "") === "2") {
         return <EnumDropdown options={openingPositions} current={draft[key] ?? ""} onChange={onChange} />;
@@ -402,7 +418,11 @@ function CombatSpecEditor({
             value={draft[key] ?? ""}
             onChange={(e) => setDraft((prev) => ({ ...prev, [key]: e.target.value }))}
           />
-          <span className="hint">0 = any style; otherwise the prerequisite style's own StyleID</span>
+          <span className="hint">
+            0 = any style; otherwise the prerequisite style's own shared ID (the real server's own
+            Style.ID column - a different, usually much smaller number than this style's own
+            per-row StyleID shown in the Combat Specs list above)
+          </span>
         </>
       );
     }
