@@ -14,6 +14,7 @@ import {
 } from "./types";
 import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
 import { useProject } from "./ProjectContext";
+import { assignProgressionColors } from "./spellProgression";
 
 // A Spell row's real columns vary by server fork and aren't worth rendering all of - these are
 // the fields someone tuning a cloned spell is actually likely to want to change. Any column not
@@ -1278,6 +1279,17 @@ function SpellSpecEditor({
               editableKeys.length > 0 ? editableKeys : fallbackKeys,
               PRIMARY_SPELL_FIELDS,
             );
+            // Cosmetic only, purely for this editing view - color-codes each series of "ranks of
+            // the same ability" (e.g. a line of heals that gets more powerful with level/spec
+            // points) with a shared background, so a long spell line's own progressions are easy
+            // to spot at a glance instead of reading as one undifferentiated list.
+            const progressionColors = assignProgressionColors(
+              group.spells,
+              (s) => s.line_xspell_id,
+              (s) => String(s.fields.Name ?? ""),
+              (s) => Number(s.fields.SpellGroup ?? 0),
+              (s) => s.level,
+            );
             return (
               <div key={group.line_key}>
                 <label className="field" style={{ maxWidth: "20em" }}>
@@ -1331,9 +1343,10 @@ function SpellSpecEditor({
                       const isEditingField = editingSpellId === item.spell_id;
                       const levelDraft = levelDrafts[item.line_xspell_id] ?? String(item.level);
                       const levelChanged = levelDraft !== String(item.level);
+                      const rowColor = progressionColors.get(item.line_xspell_id);
                       return (
                         <Fragment key={item.line_xspell_id}>
-                          <tr>
+                          <tr style={rowColor ? { backgroundColor: rowColor } : undefined}>
                             <td>
                               <input
                                 type="number"
@@ -1387,7 +1400,7 @@ function SpellSpecEditor({
                             </td>
                           </tr>
                           {isEditingField && (
-                            <tr>
+                            <tr style={rowColor ? { backgroundColor: rowColor } : undefined}>
                               <td colSpan={5}>
                                 {primaryKeys.map((key) => (
                                   <label className="field" key={key}>

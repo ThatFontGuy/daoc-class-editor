@@ -18,11 +18,11 @@ import {
 import {
   Overrides,
   SpecAssignmentUI,
-  SpellSelectionUI,
   useProject,
 } from "./ProjectContext";
 import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
 import TrainerPanel from "./TrainerPanel";
+import { groupSpellsByProgression } from "./spellProgression";
 
 export default function ClonePanel() {
   const [project, setProject] = useProject();
@@ -498,61 +498,6 @@ export default function ClonePanel() {
     return name.replace(/[^A-Za-z0-9]/g, "").toLowerCase() || "spec";
   }
 
-  // Groups a line's spells the same way real character planners (e.g. eden-daoc.net's) show
-  // them: every level of what's really one spell on its own row, instead of a flat list ordered
-  // only by level - a real, reported need: Shadows Embrace's "Endurance Drain" repeats under the
-  // exact same name at 11 different levels, and those should read as one row. Two spells are
-  // merged onto the same row if either (a) they share the exact same display Name - the common
-  // case, and what the custom Vampiir-sourced spells in this project actually have (their own
-  // SpellGroup is 0 for every one of them, since that wasn't part of the data sourced for them),
-  // or (b) they share the same nonzero Spell.SpellGroup - the real server's own progression link,
-  // still useful for native specs whose display Name changes per level (e.g. a Sorcerer's
-  // "Inflict Minor Forgetfulness" -> "Inflict Forgetfulness" -> "Inflict Minor Amnesia" ->
-  // "Inflict Amnesia" -> "Inflict Oblivion" all share one SpellGroup despite five different
-  // names). A union-find over both links handles either relation (or both at once) correctly.
-  // Rows are ordered by their earliest level, matching how a planner reads top to bottom; spells
-  // within a row are ordered by level too.
-  function groupSpellsByProgression(spells: SpellSelectionUI[]): SpellSelectionUI[][] {
-    const parent = spells.map((_, i) => i);
-    function find(x: number): number {
-      while (parent[x] !== x) {
-        parent[x] = parent[parent[x]];
-        x = parent[x];
-      }
-      return x;
-    }
-    function union(a: number, b: number) {
-      const ra = find(a);
-      const rb = find(b);
-      if (ra !== rb) parent[ra] = rb;
-    }
-
-    const firstSeenByName = new Map<string, number>();
-    const firstSeenByGroup = new Map<number, number>();
-    spells.forEach((s, i) => {
-      const priorByName = firstSeenByName.get(s.name);
-      if (priorByName !== undefined) union(i, priorByName);
-      else firstSeenByName.set(s.name, i);
-
-      if (s.spell_group !== 0) {
-        const priorByGroup = firstSeenByGroup.get(s.spell_group);
-        if (priorByGroup !== undefined) union(i, priorByGroup);
-        else firstSeenByGroup.set(s.spell_group, i);
-      }
-    });
-
-    const groups = new Map<number, SpellSelectionUI[]>();
-    spells.forEach((s, i) => {
-      const root = find(i);
-      const existing = groups.get(root);
-      if (existing) existing.push(s);
-      else groups.set(root, [s]);
-    });
-    return Array.from(groups.values())
-      .map((g) => [...g].sort((a, b) => a.level - b.level))
-      .sort((a, b) => a[0].level - b[0].level);
-  }
-
   function buildSpecAssignmentPayload(): SpecAssignmentPayload[] {
     return project.specAssignments.map((a) => ({
       source_key: a.source_key,
@@ -930,7 +875,12 @@ export default function ClonePanel() {
                                         {line.spells.length === 0 ? (
                                           <span className="hint">loading...</span>
                                         ) : (
-                                          groupSpellsByProgression(line.spells).map((group) => (
+                                          groupSpellsByProgression(
+                                            line.spells,
+                                            (s) => s.name,
+                                            (s) => s.spell_group,
+                                            (s) => s.level,
+                                          ).map((group) => (
                                             <div
                                               key={group[0].spell_id}
                                               className="spell-progression-row"
