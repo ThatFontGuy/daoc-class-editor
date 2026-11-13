@@ -328,14 +328,29 @@ fn insert_style_with_fresh_id(cfg: &SshConfig, fields: &Value) -> Result<i64, St
 /// freshly allocated `StyleID` and sometimes a deliberately-preserved shared value). Guarded by
 /// `AttackResultRequirement = 7` (the real "this style has a prerequisite" flag) so an ordinary,
 /// non-chain style's own unrelated `OpeningRequirementValue` is never touched by coincidence.
-fn sync_styles(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64) -> Result<(HashMap<i64, i64>, usize, usize), String> {
+///
+/// Also returns a second map, `shared_id_map`, for `sync_style_procs`'s own exclusive use:
+/// `StyleXSpell.StyleID` is actually a shared `Style.ID` business value, never a per-row
+/// `Style.StyleID` (see `style_shared_id`'s own doc comment in `specs.rs` for the full story) -
+/// a *completely different* identifier space than `map`'s own per-row `StyleID`s, so reusing
+/// `map` itself to remap a proc's `StyleID` would be wrong (and could even collide by sheer
+/// numeric coincidence with some unrelated owned style's own per-row key). A granted/shared
+/// style's own `ID` (`ID != StyleID`) is already globally stable and identical on both sides,
+/// same as `insert_style_with_fresh_id`'s own `preserve_id_as_is` case - only a style this tool
+/// created directly in-session (`ID == StyleID`, freshly inserted on live with a brand new
+/// matching pair) actually needs its shared `ID` remapped at all.
+type StyleSyncResult = Result<(HashMap<i64, i64>, HashMap<i64, i64>, usize, usize), String>;
+
+fn sync_styles(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64) -> StyleSyncResult {
     let owned = run_remote_sql_json(session_cfg, &format!("SELECT * FROM Style WHERE ClassId = {class_id};"))?;
 
     let mut map = HashMap::new();
+    let mut shared_id_map = HashMap::new();
     let mut newly_created: Vec<Value> = Vec::new();
     let (mut created, mut updated) = (0, 0);
     for fields in &owned {
         let session_style_id = int_field(fields, "StyleID");
+        let session_shared_id = int_field(fields, "ID");
         let live_rows = run_remote_sql_json(live_cfg, &format!("SELECT * FROM Style WHERE StyleID = {session_style_id};"))?;
         if let Some(live_fields) = live_rows.first() {
             if rows_differ(fields, live_fields, "StyleID", &[]) {
@@ -346,6 +361,9 @@ fn sync_styles(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64) -> 
         } else {
             let new_id = insert_style_with_fresh_id(live_cfg, fields)?;
             map.insert(session_style_id, new_id);
+            if session_shared_id == session_style_id {
+                shared_id_map.insert(session_shared_id, new_id);
+            }
             newly_created.push(fields.clone());
             created += 1;
         }
@@ -367,11 +385,11 @@ fn sync_styles(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64) -> 
             }
         }
     }
-    Ok((map, created, updated))
+    Ok((map, shared_id_map, created, updated))
 }
 
 /// Syncs every `StyleXSpell` proc row belonging to this class (`ClassID = class_id`) from session
-/// onto live - inserted fresh (with its own `StyleID`/`SpellID` remapped through `style_id_map`/
+/// onto live - inserted fresh (with its own `StyleID`/`SpellID` remapped through `shared_id_map`/
 /// `spell_id_map`, same as `sync_line_memberships` does for a `LineXSpell` row) if missing,
 /// updating `Chance` on an already-existing live row if it changed (`update_style_proc_chance`,
 /// the "Classes" tab's own secondary-effect editor, added after this function's own original
@@ -383,21 +401,28 @@ fn sync_styles(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64) -> 
 /// entirely, only on a fork whose `StyleXSpell` has no GUID-style primary key at all (see
 /// `style_x_spell_guid_column`'s own doc comment) - there's no way to tell two otherwise-
 /// identical-looking rows apart without one.
+///
+/// Takes `shared_id_map` (`sync_styles`'s own second return value), never `sync_styles`'s own
+/// per-row `style_id_map` - a `StyleXSpell` row's own `StyleID` column is a shared `Style.ID`
+/// business value, a completely different identifier space than a per-row `Style.StyleID` (see
+/// `style_shared_id`'s own doc comment in `specs.rs`); remapping it through the wrong map would
+/// silently write a nonsense, non-matching value on live, exactly the class of bug this whole
+/// style-proc feature already had everywhere else before being fixed.
 fn sync_style_procs(
     session_cfg: &SshConfig,
     live_cfg: &SshConfig,
     class_id: i64,
     spell_id_map: &HashMap<i64, i64>,
-    style_id_map: &HashMap<i64, i64>,
+    shared_id_map: &HashMap<i64, i64>,
 ) -> Result<(usize, usize, usize), String> {
     let guid_col = style_x_spell_guid_column(session_cfg)?;
     let rows = run_remote_sql_json(session_cfg, &format!("SELECT * FROM StyleXSpell WHERE ClassID = {class_id};"))?;
     let mut session_ids: HashSet<String> = HashSet::new();
     let (mut created, mut updated) = (0, 0);
     for row in &rows {
-        let session_style_id = int_field(row, "StyleID");
+        let session_shared_id = int_field(row, "StyleID");
         let session_spell_id = int_field(row, "SpellID");
-        let live_style_id = style_id_map.get(&session_style_id).copied().unwrap_or(session_style_id);
+        let live_shared_id = shared_id_map.get(&session_shared_id).copied().unwrap_or(session_shared_id);
         let live_spell_id = spell_id_map.get(&session_spell_id).copied().unwrap_or(session_spell_id);
         let chance = int_field(row, "Chance");
 
@@ -408,7 +433,7 @@ fn sync_style_procs(
         } else {
             run_remote_sql_json(
                 live_cfg,
-                &format!("SELECT Chance FROM StyleXSpell WHERE StyleID = {live_style_id} AND SpellID = {live_spell_id} AND ClassID = {class_id};"),
+                &format!("SELECT Chance FROM StyleXSpell WHERE StyleID = {live_shared_id} AND SpellID = {live_spell_id} AND ClassID = {class_id};"),
             )?
         };
         if let Some(live_row) = existing.first() {
@@ -423,7 +448,7 @@ fn sync_style_procs(
                     run_remote_sql(
                         live_cfg,
                         &format!(
-                            "UPDATE StyleXSpell SET Chance = {chance} WHERE StyleID = {live_style_id} AND SpellID = {live_spell_id} AND ClassID = {class_id};"
+                            "UPDATE StyleXSpell SET Chance = {chance} WHERE StyleID = {live_shared_id} AND SpellID = {live_spell_id} AND ClassID = {class_id};"
                         ),
                     )?;
                 }
@@ -438,7 +463,7 @@ fn sync_style_procs(
         for (k, v) in obj {
             cols.push(k.clone());
             vals.push(match k.as_str() {
-                "StyleID" => live_style_id.to_string(),
+                "StyleID" => live_shared_id.to_string(),
                 "SpellID" => live_spell_id.to_string(),
                 _ => sql_literal(v),
             });
@@ -606,9 +631,9 @@ fn sync_class_spec_assignment(session_cfg: &SshConfig, live_cfg: &SshConfig, cla
 pub fn migrate_class_design_to_live(session_cfg: &SshConfig, live_cfg: &SshConfig, class_id: i64) -> Result<String, String> {
     let specs_created = sync_specializations_and_lines(session_cfg, live_cfg, class_id)?;
     let (spell_id_map, spells_created, spells_updated) = sync_spells(session_cfg, live_cfg, class_id)?;
-    let (style_id_map, styles_created, styles_updated) = sync_styles(session_cfg, live_cfg, class_id)?;
+    let (_style_id_map, shared_id_map, styles_created, styles_updated) = sync_styles(session_cfg, live_cfg, class_id)?;
     let (procs_created, procs_updated, procs_removed) =
-        sync_style_procs(session_cfg, live_cfg, class_id, &spell_id_map, &style_id_map)?;
+        sync_style_procs(session_cfg, live_cfg, class_id, &spell_id_map, &shared_id_map)?;
     let (lines_created, lines_updated, lines_removed) = sync_line_memberships(session_cfg, live_cfg, class_id, &spell_id_map)?;
     let assignment_synced = sync_class_spec_assignment(session_cfg, live_cfg, class_id)?;
 
@@ -838,6 +863,93 @@ mod tests {
         let live_spell_gone =
             run_remote_sql_json(&live, &format!("SELECT 1 FROM Spell WHERE SpellID = {};", removed.spell_id)).unwrap();
         assert!(live_spell_gone.is_empty(), "the deleted effect's own underlying Spell row must be gone on live too");
+
+        std::fs::remove_dir_all(&live_dir).ok();
+        std::fs::remove_dir_all(&session_dir).ok();
+    }
+
+    #[test]
+    fn migrate_attaches_a_brand_new_effect_onto_an_already_owned_shared_id_style_correctly() {
+        // The exact real, found gap `sync_style_procs` had until now: "Pulverize" (seeded owned
+        // by class 1 on *both* sides already, with its own shared `ID` (0) deliberately
+        // different from its own per-row `StyleID` (1) - the same shape a `NEVER_CLONE_SPECS`
+        // style, e.g. Friar's real "Holy Staff", actually has) needs a brand-new proc's own
+        // `StyleXSpell.StyleID` to land on live as `0` (its real shared `ID`), never remapped
+        // through `sync_styles`'s own per-row `style_id_map` (which only ever maps per-row
+        // `StyleID`s, a completely different identifier space - see `sync_style_procs`'s own doc
+        // comment). Confirmed live: exactly this mistake once left a tool-added proc with a
+        // `StyleID` that matched no real `Style.ID` at all, so it never actually fired in-game.
+        let (live_dir, session_dir) = setup_pair("style-proc-sync-shared-id");
+        let live = test_cfg(&live_dir);
+        let session = test_cfg(&session_dir);
+
+        let added = add_style_proc(&session, 1, "slash", 1).unwrap();
+        assert!(added.is_owned);
+
+        let summary = migrate_class_design_to_live(&session, &live, 1).unwrap();
+        assert!(summary.contains("1 new style effect"), "{summary}");
+
+        let live_proc = run_remote_sql_json(
+            &live,
+            &format!("SELECT StyleID, ClassID, Chance FROM StyleXSpell WHERE SpellID = {};", added.spell_id),
+        )
+        .unwrap();
+        assert_eq!(live_proc.len(), 1, "{live_proc:?}");
+        assert_eq!(
+            int_field(&live_proc[0], "StyleID"),
+            0,
+            "must be Pulverize's own real shared ID (0), never its per-row StyleID (1)"
+        );
+        assert_eq!(int_field(&live_proc[0], "ClassID"), 1);
+        assert_eq!(int_field(&live_proc[0], "Chance"), 100);
+
+        std::fs::remove_dir_all(&live_dir).ok();
+        std::fs::remove_dir_all(&session_dir).ok();
+    }
+
+    #[test]
+    fn migrate_never_confuses_a_procs_shared_style_id_with_an_unrelated_styles_own_per_row_id() {
+        // A deliberately adversarial version of the test just above: class 1 also owns a second,
+        // brand-new-this-session style ("Decoy") whose own per-row `StyleID` (0, chosen on
+        // purpose) numerically collides with Pulverize's own real shared `ID` (also 0) - a
+        // coincidence entirely possible in a real, long-running database (small, well-known
+        // shared `Style.ID`s for stock `NEVER_CLONE_SPECS` data vs. ever-growing per-row
+        // `StyleID`s). Migrating "Decoy" allocates it a *different* fresh live `StyleID` (its own
+        // real shared `ID` is deliberately kept distinct and preserved, matching a granted
+        // style's own shape). If a new Pulverize proc's own `StyleID` (0) were ever looked up
+        // through `sync_styles`'s own per-row remap table instead of `shared_id_map`, it would
+        // wrongly land on "Decoy"'s own freshly remapped id instead of staying 0.
+        let (live_dir, session_dir) = setup_pair("style-proc-sync-collision");
+        let live = test_cfg(&live_dir);
+        let session = test_cfg(&session_dir);
+
+        run_remote_sql(
+            &session,
+            "INSERT INTO Style (StyleID, ClassId, Name, SpecKeyName, SpecLevelRequirement, ID) \
+             VALUES (0, 1, 'Decoy', 'slash', 1, 999);",
+        )
+        .unwrap();
+
+        let added = add_style_proc(&session, 1, "slash", 1).unwrap();
+        migrate_class_design_to_live(&session, &live, 1).unwrap();
+
+        let live_proc = run_remote_sql_json(
+            &live,
+            &format!("SELECT StyleID FROM StyleXSpell WHERE SpellID = {};", added.spell_id),
+        )
+        .unwrap();
+        assert_eq!(live_proc.len(), 1, "{live_proc:?}");
+        assert_eq!(
+            int_field(&live_proc[0], "StyleID"),
+            0,
+            "must stay Pulverize's own real shared ID (0), never get confused with Decoy's own unrelated remapped per-row id"
+        );
+
+        // "Decoy" itself must still have correctly landed on live, with its own real shared ID
+        // (999) preserved untouched despite getting a fresh per-row StyleID.
+        let decoy = run_remote_sql_json(&live, "SELECT StyleID, ID FROM Style WHERE Name = 'Decoy';").unwrap();
+        assert_eq!(decoy.len(), 1, "{decoy:?}");
+        assert_eq!(int_field(&decoy[0], "ID"), 999);
 
         std::fs::remove_dir_all(&live_dir).ok();
         std::fs::remove_dir_all(&session_dir).ok();
