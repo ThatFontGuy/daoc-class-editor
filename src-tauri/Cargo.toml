@@ -1,6 +1,6 @@
 [package]
 name = "daoc-class-editor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Clone existing Dark Age of Camelot classes into new custom classes and deploy them to a running Offline DAoC server."
 authors = ["ThatFontGuy"]
 edition = "2024"
