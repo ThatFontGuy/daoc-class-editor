@@ -711,10 +711,18 @@ pub fn create_new_spell_spec(
     })?;
     let mut cloner = SpellCloner::new(cfg, class_id)?;
     let new_spell_id = cloner.clone_for_class(cfg, template_spell_id)?;
+    // Freshly allocated (one more than the highest real SpellGroup in use anywhere), never left
+    // as whatever the template spell's own real SpellGroup happens to be - the exact same real,
+    // reported gap add_new_spell_series_to_line's own doc comment describes, just for a brand-new
+    // spell line's very first spell instead of its second-or-later series: a brand-new series
+    // (here, the whole line's first) has no sensible "ability already in use" to share a
+    // SpellGroup with at all.
+    let fresh_group_rows = run_remote_sql_json(cfg, "SELECT COALESCE(MAX(SpellGroup), 0) + 1 AS NextGroup FROM Spell;")?;
+    let fresh_group = fresh_group_rows.first().map(|r| int_field(r, "NextGroup")).unwrap_or(1);
     run_remote_sql(
         cfg,
         &format!(
-            "UPDATE Spell SET Name = 'New Spell' WHERE SpellID = {new_spell_id};\n\
+            "UPDATE Spell SET Name = 'New Spell', SpellGroup = {fresh_group} WHERE SpellID = {new_spell_id};\n\
              INSERT INTO LineXSpell (LineName, SpellID, Level, LineXSpell_ID) \
              VALUES ('{line_key_q}', {new_spell_id}, 1, '{}');",
             Uuid::new_v4()
@@ -4519,13 +4527,18 @@ mod tests {
 
         let spell_rows = run_remote_sql_json(
             &cfg,
-            "SELECT ls.Level, s.Name, s.SpellID FROM LineXSpell ls \
+            "SELECT ls.Level, s.Name, s.SpellID, s.SpellGroup FROM LineXSpell ls \
              JOIN Spell s ON s.SpellID = ls.SpellID WHERE ls.LineName = 'earthshatter_2_line';",
         )
         .unwrap();
         assert_eq!(spell_rows.len(), 1);
         assert_eq!(int_field(&spell_rows[0], "Level"), 1);
         assert_eq!(str_field(&spell_rows[0], "Name"), "New Spell");
+        // Freshly allocated, never left as the template spell's own real SpellGroup (500 in this
+        // fixture) - a real, reported bug: a brand-new spell line's very first spell had no
+        // SpellGroup of its own at all, since this used to inherit whatever the clone template
+        // happened to already have.
+        assert_eq!(int_field(&spell_rows[0], "SpellGroup"), 501, "{spell_rows:?}");
 
         // The seeded spell must be this class's own independent clone, not a bare reuse of the
         // template spell's own ID - otherwise editing it later would silently edit whatever else
