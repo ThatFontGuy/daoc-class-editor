@@ -209,6 +209,15 @@ function CombatSpecEditor({
     });
   }, []);
 
+  // Resolved from known_options() (never a hardcoded 7/0/1 - see styleChains.ts's own module doc
+  // comment for why) - shared by both the chain-coloring below and the prerequisite-style
+  // dropdown renderStyleDraftField shows for OpeningRequirementValue, so the two can never
+  // silently disagree about which combination of fields actually means "a specific prior style is
+  // required".
+  const styleResultValue = attackResults.find((o) => o.name === "Style")?.value;
+  const offensiveValue = openingTypes.find((o) => o.name === "Offensive")?.value;
+  const defensiveValue = openingTypes.find((o) => o.name === "Defensive")?.value;
+
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -383,11 +392,16 @@ function CombatSpecEditor({
    * one - see KnownOptions's own doc comments on the Rust side for exactly what each list is.
    *
    * OpeningRequirementValue's own real meaning depends entirely on whatever
-   * OpeningRequirementType currently is: only when it's "Positional" (2) does
-   * OpeningRequirementValue hold one of a small, fixed set of real values (Back/Side/Front) worth
-   * a dropdown at all - for "Offensive"/"Defensive" (0/1) it instead holds a prerequisite style's
-   * own StyleID (0 meaning "any style"), which has no fixed, known-good list to offer, so it
-   * stays a plain number there, with a hint explaining what it actually means right now. */
+   * OpeningRequirementType/AttackResultRequirement currently are. Positional (2) uses one of a
+   * small, fixed set of real values (Back/Side/Front) worth a dropdown on its own. Offensive/
+   * Defensive (0/1) combined with AttackResultRequirement = "Style" means this style actually has
+   * a real chain prerequisite - a real, reported gap this exists to close: that value is this
+   * tool's own shared `Style.ID` (not the per-row StyleID shown in the Combat Specs list above,
+   * and not anything derivable by eye at all), so a dropdown listing every other style already in
+   * this exact spec by name, with its own shared ID filled in automatically on selection, replaces
+   * what used to be "type in a number with no way to tell what it should even be." Anything else
+   * (Hit/Miss/Parry/Block/Evade/Fumble/Any) has no real use for this field at all - still a plain
+   * number there, with a hint, since there's nothing meaningful to offer a dropdown of. */
   function renderStyleDraftField(key: string) {
     const onChange = (value: string) => setDraft((prev) => ({ ...prev, [key]: value }));
     if (key === "WeaponTypeRequirement") {
@@ -412,6 +426,20 @@ function CombatSpecEditor({
       if ((draft.OpeningRequirementType ?? "") === "2") {
         return <EnumDropdown options={openingPositions} current={draft[key] ?? ""} onChange={onChange} />;
       }
+      const isChainStyle =
+        styleResultValue !== undefined && Number(draft.AttackResultRequirement ?? -1) === styleResultValue;
+      if (isChainStyle && styles) {
+        const styleOptions: EnumOption[] = [
+          { name: "0 - no specific style required", value: 0 },
+          ...styles
+            .filter((s) => s.style_id !== editingStyleId)
+            .map((s) => ({
+              name: `${String(s.fields.Name ?? `Style ${s.style_id}`)} (level ${s.fields.SpecLevelRequirement ?? "?"})`,
+              value: Number(s.fields.ID ?? 0),
+            })),
+        ];
+        return <EnumDropdown options={styleOptions} current={draft[key] ?? ""} onChange={onChange} />;
+      }
       return (
         <>
           <input
@@ -421,7 +449,8 @@ function CombatSpecEditor({
           <span className="hint">
             0 = any style; otherwise the prerequisite style's own shared ID (the real server's own
             Style.ID column - a different, usually much smaller number than this style's own
-            per-row StyleID shown in the Combat Specs list above)
+            per-row StyleID shown in the Combat Specs list above). Set AttackResultRequirement to
+            "Style" above to pick the prerequisite from a dropdown by name instead.
           </span>
         </>
       );
@@ -454,13 +483,6 @@ function CombatSpecEditor({
           </thead>
           <tbody>
             {(() => {
-              // Resolved from known_options() (see styleChains.ts's own module doc comment for
-              // why never a hardcoded 7/0/1) - undefined only if this fork's own vendored Style.cs
-              // doesn't define these at all, in which case no style here can ever be treated as
-              // chained (every style falls back to "no prerequisite" below).
-              const styleResultValue = attackResults.find((o) => o.name === "Style")?.value;
-              const offensiveValue = openingTypes.find((o) => o.name === "Offensive")?.value;
-              const defensiveValue = openingTypes.find((o) => o.name === "Defensive")?.value;
               // Cosmetic only, purely for this editing view - color-codes a style and whatever it
               // chains off of (and whatever chains off *that*, transitively) with a shared
               // background, so a combo's own dependency is easy to spot at a glance. Most real
