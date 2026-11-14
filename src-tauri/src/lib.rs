@@ -470,6 +470,12 @@ fn save_style_fields(
     Ok(SaveStyleResult { style_id: owned_style_id, message })
 }
 
+#[tauri::command]
+fn delete_style(cfg: SshConfig, class_id: i64, style_id: i64) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::delete_style(&cfg, class_id, style_id)
+}
+
 #[derive(serde::Serialize)]
 struct SaveStyleProcResult {
     style_x_spell_id: String,
@@ -620,6 +626,7 @@ pub fn run() {
             update_owned_spell_fields,
             save_line_spell_fields,
             save_style_fields,
+            delete_style,
             save_style_proc_fields,
             save_project_file,
             load_project_file,

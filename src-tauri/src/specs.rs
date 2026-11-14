@@ -2384,6 +2384,62 @@ pub fn update_style_fields(
     Ok(format!("updated {} field(s) on style {style_id}", fields.len()))
 }
 
+/// Deletes one style entirely from `class_id`'s own combat spec - the `Style` row itself, plus
+/// any of its own procs (`StyleXSpell`) already owned by this class. The "Delete" button
+/// counterpart, right next to each individual style's own Edit button in `CombatSpecEditor` - a
+/// real, reported gap: there was no way at all to remove a style once added (e.g. one added by
+/// mistake while building a brand-new combat spec), only to push it out of the way with an unused
+/// level as a workaround.
+///
+/// Refuses outright - no auto-cloning fallback, the same stance `delete_spell_from_line` already
+/// takes - unless this exact style is already locked specifically to `class_id` (`ClassId =
+/// class_id`, the same check `update_style_fields` already makes): deleting something still
+/// shared with other classes is never offered here, only something that's already this class's
+/// own independent copy.
+///
+/// Deliberately does *not* reuse `delete_style_procs_for_styles` (its own two existing callers,
+/// `delete_existing_clone`/`delete_deployed_class`, only ever operate on a `clone_spec`-created
+/// independent clone's own styles, whose shared `ID` is guaranteed unique to that one clone alone,
+/// per `clone_style_with_fresh_id`'s own doc comment, so deleting every `StyleXSpell` row matching
+/// it can never catch another class's own row by coincidence). This function can also be called
+/// on a granted `NEVER_CLONE_SPECS` style this class owns, whose shared `ID` may still be in
+/// active use by other classes' own procs on the very same conceptual style - so only this
+/// class's own procs (`ClassID = class_id` on the resolved shared `ID`) are ever removed here,
+/// never a universal default or another class's own override.
+///
+/// Deliberately does *not* check whether some other style's own `OpeningRequirementValue` still
+/// points at this one's shared `ID` (a chain prerequisite) - the same way deleting a spell never
+/// checks whether some other spell still references it either. A style left pointing at a
+/// deleted prerequisite simply has no matching style to chain off of anymore (see
+/// `styleChains.ts`'s own doc comment: an unmatched prerequisite is left ungrouped, not an error),
+/// worth noticing and fixing by hand afterward, but not worth blocking a straightforward delete
+/// over.
+pub fn delete_style(cfg: &SshConfig, class_id: i64, style_id: i64) -> Result<String, String> {
+    let owned = run_remote_sql_json(
+        cfg,
+        &format!("SELECT 1 FROM Style WHERE StyleID = {style_id} AND ClassId = {class_id};"),
+    )?;
+    if owned.is_empty() {
+        return Err(format!(
+            "style {style_id} is not locked specifically to class {class_id} - refusing to delete \
+             it, since it may still be shared with other classes"
+        ));
+    }
+    let shared_id = style_shared_id(cfg, style_id)?;
+    let own_procs = run_remote_sql_json(
+        cfg,
+        &format!("SELECT SpellID FROM StyleXSpell WHERE StyleID = {shared_id} AND ClassID = {class_id};"),
+    )?;
+    let own_proc_spell_ids: Vec<i64> = own_procs.iter().map(|r| int_field(r, "SpellID")).collect();
+    run_remote_sql(
+        cfg,
+        &format!("DELETE FROM StyleXSpell WHERE StyleID = {shared_id} AND ClassID = {class_id};"),
+    )?;
+    delete_owned_spells(cfg, &own_proc_spell_ids)?;
+    run_remote_sql(cfg, &format!("DELETE FROM Style WHERE StyleID = {style_id};"))?;
+    Ok("deleted".to_string())
+}
+
 /// Changes the level a style becomes available at (`Style.SpecLevelRequirement`), granting/
 /// cloning this class its own copy first if it doesn't have one yet - see `ensure_style_owned`'s
 /// own doc comment.
@@ -6476,6 +6532,95 @@ mod tests {
         assert!(result.contains("updated 1 field"), "{result}");
         let updated = run_remote_sql_json(&cfg, &format!("SELECT EnduranceCost FROM Style WHERE StyleID = {style_id};")).unwrap();
         assert_eq!(int_field(&updated[0], "EnduranceCost"), 99);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_style_removes_an_already_owned_style_and_its_own_procs() {
+        let dir = setup_test_db("delete-style-owned");
+        let cfg = test_cfg(&dir);
+        let style_id = int_field(
+            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
+            "StyleID",
+        );
+        // Pulverize's own real shared `ID` is 0 in this fixture (see `style_shared_id`'s own doc
+        // comment) - a proc attached here, owned by class 1, must be cleaned up alongside the
+        // style itself, not left behind as an orphaned row.
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('seed-proc-1', 9099, 1, 0, 25);",
+        )
+        .unwrap();
+
+        delete_style(&cfg, 1, style_id).unwrap();
+
+        let style_gone = run_remote_sql_json(&cfg, &format!("SELECT 1 FROM Style WHERE StyleID = {style_id};")).unwrap();
+        assert!(style_gone.is_empty(), "the style row itself must be gone");
+        let proc_gone = run_remote_sql_json(&cfg, "SELECT 1 FROM StyleXSpell WHERE StyleXSpell_ID = 'seed-proc-1';").unwrap();
+        assert!(proc_gone.is_empty(), "its own owned proc must be cleaned up too: {proc_gone:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_style_refuses_a_style_not_locked_to_this_class() {
+        let dir = setup_test_db("delete-style-shared");
+        let cfg = test_cfg(&dir);
+        let style_id = int_field(
+            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE Name='Pulverize';").unwrap()[0],
+            "StyleID",
+        );
+
+        // "Pulverize" is locked to class 1, not 64 - deleting it as class 64 must be refused,
+        // the owner's own explicit preference (the same stance delete_spell_from_line already
+        // takes): deletion is never possible on a class's real, original/stock content at all,
+        // only on something that's already this class's own independent copy.
+        let refused = delete_style(&cfg, 64, style_id);
+        assert!(refused.is_err(), "{refused:?}");
+
+        let still_there = run_remote_sql_json(&cfg, &format!("SELECT 1 FROM Style WHERE StyleID = {style_id};")).unwrap();
+        assert_eq!(still_there.len(), 1, "the real, still-shared original style must be completely untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_style_never_touches_another_classs_own_proc_on_a_still_shared_id() {
+        // The exact scenario delete_style's own doc comment calls out: deleting a granted
+        // NEVER_CLONE_SPECS style this class owns must only ever remove *this* class's own procs
+        // on its shared ID, never a universal default or another class's own override still
+        // live on the very same conceptual style.
+        let dir = setup_test_db("delete-style-shared-id-safety");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO Specialization (KeyName, Name, Description, Icon, Implementation, ClientStyleGroup) \
+                VALUES ('Sword', 'Sword', 'Sword weapons', 100, NULL, 0);
+             INSERT INTO Style VALUES (NULL, 9, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 900);
+             INSERT INTO Style VALUES (NULL, 64, 'Whirling Blade', 'Sword', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 900);",
+        )
+        .unwrap();
+        let class64_style_id = int_field(
+            &run_remote_sql_json(&cfg, "SELECT StyleID FROM Style WHERE SpecKeyName='Sword' AND ClassId=64;").unwrap()[0],
+            "StyleID",
+        );
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('universal-proc', 9099, 0, 900, 25);\n\
+             INSERT INTO StyleXSpell (StyleXSpell_ID, SpellID, ClassID, StyleID, Chance) \
+             VALUES ('class64-own-proc', 9098, 64, 900, 50);",
+        )
+        .unwrap();
+
+        delete_style(&cfg, 64, class64_style_id).unwrap();
+
+        let class64_proc_gone = run_remote_sql_json(&cfg, "SELECT 1 FROM StyleXSpell WHERE StyleXSpell_ID = 'class64-own-proc';").unwrap();
+        assert!(class64_proc_gone.is_empty(), "class 64's own proc must be removed");
+        let universal_survives = run_remote_sql_json(&cfg, "SELECT 1 FROM StyleXSpell WHERE StyleXSpell_ID = 'universal-proc';").unwrap();
+        assert_eq!(universal_survives.len(), 1, "the universal default proc, still shared with every other class, must survive untouched");
 
         std::fs::remove_dir_all(&dir).ok();
     }

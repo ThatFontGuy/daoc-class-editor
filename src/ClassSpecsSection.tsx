@@ -326,6 +326,28 @@ function CombatSpecEditor({
     }
   }
 
+  async function deleteStyle(s: StyleInfo) {
+    if (busyRef.current || !s.is_owned) return;
+    const name = String(s.fields.Name ?? `style ${s.style_id}`);
+    if (!confirm(`Delete "${name}" entirely? This cannot be undone.`)) return;
+    busyRef.current = true;
+    setBusy(true);
+    setStatus(okStatus("Deleting..."));
+    try {
+      const cfg = await ensureCfg();
+      await invoke("delete_style", { cfg, classId, styleId: s.style_id });
+      setStatus(okStatus(`Deleted "${name}".`));
+      // See the matching comment in save() above - load() checks this same busyRef.
+      busyRef.current = false;
+      await load();
+    } catch (e) {
+      setStatus(errorStatus(`Delete failed: ${e}`));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
+
   async function saveLevel(s: StyleInfo) {
     if (busyRef.current) return;
     const currentLevel = String(s.fields.SpecLevelRequirement ?? 0);
@@ -555,9 +577,19 @@ function CombatSpecEditor({
                             </button>
                           </>
                         ) : (
-                          <button onClick={() => startEditing(s)} disabled={busy}>
-                            Edit
-                          </button>
+                          <>
+                            <button onClick={() => startEditing(s)} disabled={busy}>
+                              Edit
+                            </button>{" "}
+                            <button
+                              onClick={() => deleteStyle(s)}
+                              disabled={busy || !s.is_owned}
+                              className="danger"
+                              title={s.is_owned ? undefined : "Edit it first to clone/grant it for this class, then it can be deleted"}
+                            >
+                              Delete
+                            </button>
+                          </>
                         )}
                       </td>
                     </tr>
