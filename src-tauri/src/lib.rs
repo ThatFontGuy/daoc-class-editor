@@ -362,6 +362,12 @@ fn delete_class_spec(cfg: SshConfig, class_id: i64, spec_key: String) -> Result<
 }
 
 #[tauri::command]
+fn unassign_class_spec(cfg: SshConfig, class_id: i64, spec_key: String) -> Result<String, String> {
+    deploy::ensure_safe_to_write(&cfg)?;
+    specs::unassign_class_spec(&cfg, class_id, &spec_key)
+}
+
+#[tauri::command]
 fn update_line_spell_level(
     cfg: SshConfig,
     class_id: i64,
@@ -617,6 +623,7 @@ pub fn run() {
             rename_spell_line,
             delete_spell_from_line,
             delete_class_spec,
+            unassign_class_spec,
             update_line_spell_level,
             update_style_level,
             list_style_procs,

@@ -1549,6 +1549,7 @@ function SpecSummaryRow({
   expanded,
   onToggle,
   onDelete,
+  onUnassign,
   busy,
   children,
 }: {
@@ -1556,6 +1557,7 @@ function SpecSummaryRow({
   expanded: boolean;
   onToggle: () => void;
   onDelete: () => void;
+  onUnassign: () => void;
   busy: boolean;
   children: React.ReactNode;
 }) {
@@ -1569,18 +1571,20 @@ function SpecSummaryRow({
           <button onClick={onToggle} disabled={busy}>
             {expanded ? "Hide" : "Edit"}
           </button>{" "}
-          <button
-            onClick={onDelete}
-            disabled={busy || !spec.deletable}
-            className="danger"
-            title={
-              spec.deletable
-                ? undefined
-                : "This is still a shared/stock spec, not an independent clone of this class's own - only a cloned spec can be deleted"
-            }
-          >
-            Delete
-          </button>
+          {spec.deletable ? (
+            <button onClick={onDelete} disabled={busy} className="danger">
+              Delete
+            </button>
+          ) : (
+            <button
+              onClick={onUnassign}
+              disabled={busy}
+              className="danger"
+              title="Still a shared/stock spec, not an independent clone of this class's own - this only removes this class's own assignment to it, never its real data"
+            >
+              Unshare
+            </button>
+          )}
         </td>
       </tr>
       {expanded && (
@@ -1861,6 +1865,46 @@ export default function ClassSpecsSection({
     }
   }
 
+  /** The counterpart to a spec that's still shared/stock (`!spec.deletable`, e.g. a
+   * NEVER_CLONE_SPECS grant like "Sword") - shown in place of a disabled "Delete" there instead.
+   * Only ever removes this one class's own assignment (and whatever styles are already locked
+   * specifically to it) - the spec's own real, shared data is never touched, so every other class
+   * that still has it assigned keeps it untouched. A real, reported gap: "Delete" already refused
+   * this on purpose, directing the owner to the Clone Wizard's own spec list instead - annoying
+   * enough in practice to ask for a direct way to do it from here after all. */
+  async function unassignSpec(spec: ClassSpecSummary) {
+    if (spec.deletable) return;
+    if (
+      !confirm(
+        `Unassign "${spec.name}" from this class?\n\n` +
+          "This only removes this class's own assignment - its real spec/spell line/style data (shared by other classes) is left completely untouched." +
+          "\n\nAny existing character already using this class would have its points in this spec reset (a free respec is granted). This cannot be undone.",
+      )
+    )
+      return;
+    setBusy(true);
+    setStatus(okStatus(`Unassigning "${spec.name}"...`));
+    try {
+      const cfg = await ensureCfg();
+      const result = await invoke<string>("unassign_class_spec", {
+        cfg,
+        classId,
+        specKey: spec.key_name,
+      });
+      setStatus(okStatus(result));
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        next.delete(spec.key_name);
+        return next;
+      });
+      await load();
+    } catch (e) {
+      setStatus(errorStatus(`Unassign failed: ${e}`));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // A spec with styles is always a combat spec, full stop, even if it also happens to carry an
   // incidental SpellLine of its own (a real, reproduced case: "Shields" has both 157 Style rows
   // *and* a "Warrior Shields (Live)" spell line, presumably internal bookkeeping for some
@@ -1967,6 +2011,7 @@ export default function ClassSpecsSection({
                   expanded={expanded.has(s.key_name)}
                   onToggle={() => toggle(s.key_name)}
                   onDelete={() => deleteSpec(s)}
+                  onUnassign={() => unassignSpec(s)}
                   busy={busy}
                 >
                   <CombatSpecEditor currentCfg={currentCfg} ensureCfg={ensureCfg} classId={classId} specKey={s.key_name} />
@@ -2002,6 +2047,7 @@ export default function ClassSpecsSection({
                   expanded={expanded.has(s.key_name)}
                   onToggle={() => toggle(s.key_name)}
                   onDelete={() => deleteSpec(s)}
+                  onUnassign={() => unassignSpec(s)}
                   busy={busy}
                 >
                   <SpellSpecEditor currentCfg={currentCfg} ensureCfg={ensureCfg} classId={classId} specKey={s.key_name} onSpecRenamed={load} />

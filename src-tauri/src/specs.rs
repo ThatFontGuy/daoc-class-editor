@@ -1068,6 +1068,47 @@ pub fn delete_class_spec(cfg: &SshConfig, class_id: i64, spec_key: &str) -> Resu
     Ok(log)
 }
 
+/// Drops `spec_key` - still a shared/stock spec, e.g. a `NEVER_CLONE_SPECS` one like "Sword" a
+/// class like Nosferatu was simply granted directly - from `class_id`'s own assignments, the
+/// "Unshare" button counterpart `ClassSpecsSection.tsx`'s own per-spec summary row shows in place
+/// of a disabled "Delete" whenever `deletable` is false. A real, reported gap: `delete_class_spec`
+/// already refused outright on a still-shared spec on purpose (the owner's own earlier explicit
+/// preference - see its own doc comment), directing the user to the Clone Wizard's own spec list
+/// instead - annoying enough in practice for the owner to ask for a direct way to do it from here
+/// after all.
+///
+/// Unlike `delete_class_spec`, this never touches the spec's own real, shared
+/// Specialization/SpellLine/Style data at all - `unassign_shared_spec_from_class` only removes
+/// this one class's own `ClassXSpecialization` row and whatever `Style` rows happen to already be
+/// locked specifically to `class_id` under this key (e.g. a `NEVER_CLONE_SPECS` grant) - every
+/// other class that still has this same spec assigned keeps it, completely unaffected. Scrubs
+/// `spec_key` from every character's own saved `SerializedSpecs` first and grants a free full
+/// respec token afterward, the exact same character-safety pair `delete_class_spec` already
+/// applies, for the identical reason (a character already trained in a spec their own class no
+/// longer offers at all is exactly the login-crash risk `scrub_spec_from_characters`'s own doc
+/// comment describes).
+///
+/// Refuses outright on a key that's actually already this class's own independent clone (the
+/// `deletable` case) - that one should go through `delete_class_spec` instead, which also cleans
+/// up the clone's own real data, not just this class's assignment to it.
+pub fn unassign_class_spec(cfg: &SshConfig, class_id: i64, spec_key: &str) -> Result<String, String> {
+    let suffix = format!("_{class_id}");
+    if spec_key.ends_with(&suffix) {
+        return Err(format!(
+            "'{spec_key}' is already this class's own independent clone - use Delete instead, \
+             which also removes its own real data, not just this class's assignment to it"
+        ));
+    }
+    let mut log = scrub_spec_from_characters(cfg, class_id, spec_key)?;
+    unassign_shared_spec_from_class(cfg, class_id, spec_key)?;
+    log.push_str(&format!(
+        "unassigned '{spec_key}' from this class only - its real Specialization/SpellLine/Style \
+         data (shared by other classes) was left untouched\n"
+    ));
+    log.push_str(&grant_respec_to_characters(cfg, class_id)?);
+    Ok(log)
+}
+
 
 /// Fields worth suggesting type-appropriate defaults for - everything in
 /// `ClassSpecsSection.tsx`'s own `EDITABLE_SPELL_FIELD_HINTS` except Name/Type/Description/
@@ -4793,11 +4834,11 @@ mod tests {
         let cfg = test_cfg(&dir);
 
         // "smite" is still shared/un-owned (no other class ever cloned it under this tool) -
-        // deleting it must be refused outright, never silently unassigning it either (the owner's
-        // own explicit preference: "Delete" should never be offered at all for a class's real,
-        // original/stock content, only for something that's already this class's own independent
-        // copy - a still-shared spec can still be dropped from this class via the Clone Wizard's
-        // own spec list instead).
+        // deleting it must be refused outright, never silently unassigning it either (the
+        // deliberate split with unassign_class_spec's own, separate purpose: "Delete" only ever
+        // removes something that's already this class's own independent copy, real data and all
+        // - unassigning just this class's own assignment to something still shared is its own,
+        // explicit action instead, never a silent fallback here).
         let result = delete_class_spec(&cfg, 1, "smite");
         assert!(result.is_err(), "{result:?}");
 
@@ -4811,6 +4852,64 @@ mod tests {
         assert_eq!(spec_survives.len(), 1);
         let spells_survive = run_remote_sql_json(&cfg, "SELECT 1 FROM LineXSpell WHERE LineName = 'smite_base';").unwrap();
         assert_eq!(spells_survive.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unassign_class_spec_drops_a_never_clone_specs_grant_without_touching_the_shared_spec() {
+        // The exact real, reported scenario this exists for: Nosferatu has "Sword" (a
+        // NEVER_CLONE_SPECS spec) assigned directly, with its own locked styles already granted -
+        // "Delete" refuses it outright (it's still a shared/stock spec, not this class's own
+        // independent clone), but the owner wants a direct way to drop it from this one class
+        // anyway, without going through the Clone Wizard's own spec list.
+        let dir = setup_test_db("unassign-class-spec");
+        let cfg = test_cfg(&dir);
+        run_remote_sql(
+            &cfg,
+            "INSERT INTO ClassXSpecialization VALUES (64, 'slash', 0);\
+             INSERT INTO Style VALUES (NULL, 9, 'Some Other Class Style', 'slash', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 900);\
+             INSERT INTO Style VALUES (NULL, 64, 'This Class Own Style', 'slash', 5, 300, 5, 0, 0, 0, 0, 0, 1.0, 1.0, 0, 0, 0, 0, 0, 901);\
+             INSERT INTO DOLCharacters (Name, Class, SerializedSpecs) VALUES ('Grolf', 64, 'slash|8;smite|3');",
+        )
+        .unwrap();
+
+        let log = unassign_class_spec(&cfg, 64, "slash").unwrap();
+        assert!(log.contains("unassigned 'slash' from this class only"), "{log}");
+        assert!(log.contains("removed stale 'slash' points from 1 character"), "{log}");
+        assert!(log.contains("free full respec"), "{log}");
+
+        let class_specs = list_class_specs(&cfg, 64).unwrap();
+        assert!(
+            !class_specs.iter().any(|c| c.spec_key_name == "slash"),
+            "this class must no longer offer 'slash': {class_specs:?}"
+        );
+
+        // The spec's own shared row, and the OTHER class's own locked style, must survive.
+        let specs = list_specializations(&cfg).unwrap();
+        assert!(specs.iter().any(|s| s.key_name == "slash"), "{specs:?}");
+        let other_class_style = run_remote_sql_json(&cfg, "SELECT 1 FROM Style WHERE SpecKeyName='slash' AND ClassId=9;").unwrap();
+        assert!(!other_class_style.is_empty(), "another class's own locked style must never be touched");
+
+        // This class's own locked style duplicate must be gone.
+        let own_style = run_remote_sql_json(&cfg, "SELECT 1 FROM Style WHERE SpecKeyName='slash' AND ClassId=64;").unwrap();
+        assert!(own_style.is_empty(), "this class's own granted style duplicate must be cleaned up");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unassign_class_spec_refuses_an_already_independent_clone() {
+        let dir = setup_test_db("unassign-class-spec-owned");
+        let cfg = test_cfg(&dir);
+
+        create_new_spell_spec(&cfg, 2, "Earthshatter", 5).unwrap();
+        let result = unassign_class_spec(&cfg, 2, "earthshatter_2");
+        assert!(result.is_err(), "{result:?}");
+
+        let assignment_survives =
+            run_remote_sql_json(&cfg, "SELECT 1 FROM ClassXSpecialization WHERE ClassID = 2 AND SpecKeyName = 'earthshatter_2';").unwrap();
+        assert_eq!(assignment_survives.len(), 1, "an already-owned clone must never be touched by this - use Delete instead");
 
         std::fs::remove_dir_all(&dir).ok();
     }
