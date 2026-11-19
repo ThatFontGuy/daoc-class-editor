@@ -159,6 +159,54 @@ pub fn discard_design_session(session_cfg: &SshConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Where every class's own currently-active design session directory is remembered across app
+/// restarts - `ClassSpecsSection.tsx`'s own `classDesignSessions` map (keyed by ClassID) is
+/// ordinarily just in-memory React state, living only as long as the app window does, *unless*
+/// the user explicitly Saves a `.daocclass.json` project file and Loads it back later. A real,
+/// reported bug: closing and reopening the app with a half-finished class design still sitting
+/// in an un-migrated session silently lost the app's own connection to it - the session's own
+/// directory (and everything designed in it) was never actually deleted, but the next visit to
+/// that class started a brand-new session cloned fresh from live instead, making already-deleted
+/// specs look like they'd "come back" and already-added ones look like they'd "disappeared."
+/// This file is the fix: written every time the map changes, read back once on launch, right
+/// next to `ssh-config.json` in the same per-user config directory.
+fn active_sessions_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("daoc-class-editor");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("active-class-sessions.json")
+}
+
+/// Every class's own currently-active session directory, keyed by ClassID - silently drops any
+/// entry whose directory's own database is no longer actually there (already discarded or
+/// migrated in some earlier run, or the whole `sessions_root()` tree wiped by hand) rather than
+/// handing back a stale path that would only fail on the first real read against it.
+fn load_active_sessions_from(path: &Path) -> std::collections::HashMap<i64, String> {
+    let raw: std::collections::HashMap<i64, String> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    raw.into_iter()
+        .filter(|(_, dir)| Path::new(dir).join("data/opendaoc.sqlite3.db").is_file())
+        .collect()
+}
+
+fn save_active_sessions_to(
+    path: &Path,
+    sessions: &std::collections::HashMap<i64, String>,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(sessions).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
+}
+
+pub fn load_active_sessions() -> std::collections::HashMap<i64, String> {
+    load_active_sessions_from(&active_sessions_path())
+}
+
+pub fn save_active_sessions(sessions: &std::collections::HashMap<i64, String>) -> Result<(), String> {
+    save_active_sessions_to(&active_sessions_path(), sessions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +333,48 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("refusing to delete"));
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn active_sessions_round_trip_through_their_own_file() {
+        let live_dir = setup_live_server("active-sessions-round-trip");
+        let session_cfg = start_design_session(&local_cfg(live_dir.to_str().unwrap())).unwrap();
+        let path = std::env::temp_dir().join("daoc-class-editor-active-sessions-round-trip.json");
+        std::fs::remove_file(&path).ok();
+
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(68, session_cfg.remote_server_dir.clone());
+        save_active_sessions_to(&path, &sessions).unwrap();
+
+        let loaded = load_active_sessions_from(&path);
+        assert_eq!(loaded, sessions);
+
+        discard_design_session(&session_cfg).unwrap();
+        std::fs::remove_dir_all(&live_dir).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_active_sessions_drops_an_entry_whose_directory_is_already_gone() {
+        // A real, reported scenario this guards against: the session was discarded or migrated
+        // in an earlier run (its own directory and database deleted), but something still wrote
+        // this file with the now-stale ClassID -> directory mapping in it - reading it back must
+        // never hand back a dead path that would only fail on the first real use.
+        let path = std::env::temp_dir().join("daoc-class-editor-active-sessions-stale.json");
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(68, "/no/such/design/session/directory/at/all".to_string());
+        save_active_sessions_to(&path, &sessions).unwrap();
+
+        let loaded = load_active_sessions_from(&path);
+        assert!(loaded.is_empty(), "{loaded:?}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_active_sessions_from_a_missing_file_is_an_empty_map_not_an_error() {
+        let path = std::env::temp_dir().join("daoc-class-editor-active-sessions-missing.json");
+        std::fs::remove_file(&path).ok();
+        assert!(load_active_sessions_from(&path).is_empty());
     }
 }

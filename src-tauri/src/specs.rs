@@ -1306,6 +1306,33 @@ pub fn list_spec_spell_lines(
         .collect())
 }
 
+/// Every real ClassID that actually grants `spec_key` (`ClassXSpecialization.SpecKeyName`),
+/// ascending - lets `ClonePanel.tsx`'s own "Add another spec" flow (manually picking a spec not
+/// already read from one specific source class) offer a "view/clone spell lines as" choice
+/// instead of silently resolving only the shared/neutral (`ClassIDHint = 0`) lines, no matter how
+/// many real classes have their own class-specific variant.
+///
+/// A real, reported gap this exists to close: several real specs are granted to more than one
+/// class under the exact same shared `SpecKeyName`, each with its own `ClassIDHint`-tagged
+/// `SpellLine` rows (e.g. "Nurture" has Warden's, Druid's, and Bard's own non-baseline lines, on
+/// top of the one shared baseline everyone gets) - see `resolve_spec_lines_for_class`'s own doc
+/// comment for the full mechanic. Building a brand-new class around an *unrelated* class's own
+/// spec this way (e.g. a Hero-based class picking up Warden's own "Nurture"/"Regrowth") had no
+/// way to reach those class-specific lines at all through `addBlankAssignment`'s own hand-picked
+/// row, which always leaves `source_class_id` unset on purpose - reproducing exactly the reported
+/// symptom: only the baseline lines showed up, never the real spec-specific ones.
+pub fn classes_granting_spec(cfg: &SshConfig, spec_key: &str) -> Result<Vec<i64>, String> {
+    let spec_key_q = sql_quote(spec_key);
+    let rows = run_remote_sql_json(
+        cfg,
+        &format!(
+            "SELECT DISTINCT ClassID FROM ClassXSpecialization WHERE SpecKeyName = '{spec_key_q}' \
+             ORDER BY ClassID;"
+        ),
+    )?;
+    Ok(rows.iter().map(|r| int_field(r, "ClassID")).collect())
+}
+
 /// Every spell in `line_key` (joining `LineXSpell` to `Spell` for a real display name) - the
 /// source list for the Edit flow's "remove specific spells from the line we copy over" picker.
 pub fn list_line_spells(cfg: &SshConfig, line_key: &str) -> Result<Vec<LineSpellRow>, String> {
@@ -3708,6 +3735,28 @@ mod tests {
                 .iter()
                 .any(|c| c.spec_key_name == "slash" && c.spec_name == "Slash")
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn classes_granting_spec_lists_every_real_class_id_assigned_to_this_key() {
+        let dir = setup_test_db("classes-granting-spec");
+        let cfg = test_cfg(&dir);
+        // "smite" is already assigned to class 1 by the shared fixture - also grant it to class
+        // 2, mirroring a real spec shared across several classes (e.g. "Nurture" across Warden/
+        // Druid/Bard) under one `SpecKeyName`.
+        run_remote_sql(&cfg, "INSERT INTO ClassXSpecialization VALUES (2, 'smite', 0);").unwrap();
+
+        let smite_classes = classes_granting_spec(&cfg, "smite").unwrap();
+        assert_eq!(smite_classes, vec![1, 2]);
+
+        // "slash" is only ever assigned to class 1 in this fixture.
+        let slash_classes = classes_granting_spec(&cfg, "slash").unwrap();
+        assert_eq!(slash_classes, vec![1]);
+
+        // A spec key nothing is assigned to at all is an empty list, not an error.
+        assert!(classes_granting_spec(&cfg, "no_such_spec").unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

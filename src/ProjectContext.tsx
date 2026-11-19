@@ -1,4 +1,14 @@
-import { createContext, Dispatch, ReactNode, SetStateAction, useContext, useState } from "react";
+import {
+  createContext,
+  Dispatch,
+  ReactNode,
+  SetStateAction,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { ClassInfo } from "./types";
 
 // Everything here is what gets saved/loaded as a ".daocclass.json" project file - the full state
@@ -59,11 +69,15 @@ export interface SpecAssignmentUI {
   source_name: string;
   new_name: string;
   level_acquired: number;
-  /** Which real class this assignment's own source_key was actually read from - lets the server
-   * resolve just that class's own applicable SpellLines (own ClassIDHint, falling back to the
-   * shared neutral ones) instead of every class that happens to share the same spec name. Unset
-   * for a row added by hand (no particular source class in mind), which resolves to the shared
-   * neutral lines only. */
+  /** Which real class this assignment's own source_key should be resolved against - lets the
+   * server resolve just that class's own applicable SpellLines (own ClassIDHint, falling back to
+   * the shared neutral ones) instead of every class that happens to share the same spec name.
+   * Prefilled from the real source class for a row read via `loadSourceSpecs`; unset by default
+   * for a row added by hand (resolves to the shared neutral lines only) until explicitly set via
+   * the "View spell lines as" dropdown (`ClonePanel.tsx`, backed by `classes_granting_spec`) -
+   * the fix for a real, reported gap: several specs are granted to more than one class under the
+   * same shared SpecKeyName (e.g. "Nurture" has Warden's/Druid's/Bard's own class-specific
+   * lines), and a hand-added row had no way to reach any but the baseline ones at all. */
   source_class_id?: number;
   /** Set once "Apply to server" has run for this assignment, so re-applying is a visible choice. */
   applied: boolean;
@@ -144,7 +158,17 @@ export interface ProjectState {
    * ever meant "switched to a different class" - but switching tabs entirely (e.g. to the Server
    * connection tab to check on/trigger a backup before migrating) unmounts the whole Classes tab
    * too, silently destroying real, already-saved work (nine real, newly designed spells, in the
-   * reported case) the very first time a user did exactly that ordinary thing. */
+   * reported case) the very first time a user did exactly that ordinary thing.
+   *
+   * Unlike `designSessionDir` above, this one is also mirrored to its own small file on disk
+   * (`ProjectProvider`'s own load/save effects in this file, backed by `design_session.rs`'s own
+   * `active_sessions_path`) every time it changes, and read back the moment the app launches - a
+   * real, reported bug this fixes: closing and reopening the app with a half-finished class
+   * design still sitting in an un-migrated session lost the app's only connection to it (nothing
+   * on disk was actually touched, but the next visit to that class started a brand-new session
+   * cloned fresh from live instead, making already-deleted specs look like they'd "come back"
+   * and newly-added ones look like they'd vanished). `designSessionDir` doesn't need the same
+   * fix since it already round-trips through an explicit Save/Load Project file instead. */
   classDesignSessions: Record<number, string>;
   trainer: TrainerState;
 }
@@ -241,6 +265,56 @@ const ProjectContext = createContext<
 
 export function ProjectProvider({ children }: { children: ReactNode }) {
   const state = useState<ProjectState>(emptyProjectState);
+  const [project, setProject] = state;
+
+  // Resumes every class's own still-active local design session the instant the app launches -
+  // see design_session.rs's own active_sessions_path doc comment for the full rationale. Unlike
+  // the rest of ProjectState, this one piece needs to survive a bare app restart with no
+  // explicit Save/Load Project step at all: a half-finished class design is realistically worked
+  // on across many separate sittings, not just one, and losing the app's only connection to an
+  // already-designed, not-yet-migrated session (while its real data sits untouched on disk) made
+  // deleted specs look like they'd "come back" and newly-added ones look like they'd vanished.
+  useEffect(() => {
+    invoke<Record<string, string>>("load_active_class_design_sessions")
+      .then((sessions) => {
+        const byClassId: Record<number, string> = {};
+        for (const [classId, dir] of Object.entries(sessions)) {
+          byClassId[Number(classId)] = dir;
+        }
+        if (Object.keys(byClassId).length > 0) {
+          setProject((p) => ({
+            ...p,
+            classDesignSessions: { ...byClassId, ...p.classDesignSessions },
+          }));
+        }
+      })
+      .catch(() => {
+        // Best-effort only - starting with no resumed sessions (the previous behavior) is
+        // always a safe fallback, not worth surfacing as an error on launch.
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persists classDesignSessions every time it changes, so a later launch's own load above has
+  // something real to resume - skips the very first render, since nothing's actually changed yet
+  // and overwriting the just-loaded file with emptyProjectState's own blank map (the load above
+  // hasn't necessarily resolved yet) would erase it before it was ever read.
+  const skipFirstSave = useRef(true);
+  useEffect(() => {
+    if (skipFirstSave.current) {
+      skipFirstSave.current = false;
+      return;
+    }
+    invoke("save_active_class_design_sessions", { sessions: project.classDesignSessions }).catch(
+      () => {
+        // Best-effort only - a failed save here just means the next launch won't resume this
+        // particular change, not a lost edit (the session's own directory is untouched either
+        // way).
+      },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.classDesignSessions]);
+
   return <ProjectContext.Provider value={state}>{children}</ProjectContext.Provider>;
 }
 

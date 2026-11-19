@@ -60,6 +60,19 @@ export default function ClonePanel() {
   const [sourceSpecs, setSourceSpecs] = useState<ClassSpecRow[] | null>(null);
   const [specLog, setSpecLog] = useState<StatusState>(emptyStatus);
 
+  /** Every real ClassID `classes_granting_spec` reports for a given spec key, cached by key -
+   * lets the "view/clone spell lines as" dropdown below know whether a spec actually has more
+   * than one class's own SpellLine variant worth choosing between (see `resolve_spec_lines_for_
+   * class`'s own doc comment in specs.rs for the full mechanic this exists to expose). A real,
+   * reported bug this fixes: building a class around another class's own spec entirely by hand
+   * (e.g. a Hero-based class adding Warden's own "Nurture"/"Regrowth") had no way to reach that
+   * other class's own spec-specific lines at all - `addBlankAssignment`'s own row always left
+   * `source_class_id` unset, so only the shared/neutral baseline lines ever showed up, with the
+   * real ones invisible and unreachable. */
+  const [specSourceClassOptions, setSpecSourceClassOptions] = useState<Record<string, number[]>>(
+    {},
+  );
+
   // The local design session's own config (see ProjectContext.tsx's own designSessionDir doc
   // comment) - a design-in-progress reads and writes this disposable local copy instead of the
   // live server, so none of it ever needs the live server stopped. Started lazily, the first
@@ -330,6 +343,37 @@ export default function ClonePanel() {
     }
   }
 
+  // Lazily fetches classes_granting_spec for every distinct source_key that shows up in
+  // specAssignments and isn't already cached - runs after loadSourceSpecs/addBlankAssignment
+  // populate the list, never before (a design session is always already active by the time any
+  // row exists at all, since both of those paths only run after loadSourceSpecs's own
+  // ensureDesignSession call already started one - see that function's own doc comment).
+  useEffect(() => {
+    const keys = Array.from(new Set(project.specAssignments.map((a) => a.source_key))).filter(
+      (k) => k && !(k in specSourceClassOptions),
+    );
+    if (keys.length === 0) return;
+    (async () => {
+      try {
+        const cfg = await ensureDesignSession();
+        const results = await Promise.all(
+          keys.map((k) => invoke<number[]>("classes_granting_spec", { cfg, specKey: k })),
+        );
+        setSpecSourceClassOptions((prev) => {
+          const next = { ...prev };
+          keys.forEach((k, i) => {
+            next[k] = results[i];
+          });
+          return next;
+        });
+      } catch {
+        // Best-effort only - worst case the dropdown below just doesn't show for this spec,
+        // same as before this feature existed.
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.specAssignments.map((a) => a.source_key).join("\u0000")]);
+
   function updateSpecAssignment(index: number, patch: Partial<SpecAssignmentUI>) {
     setProject((p) => ({
       ...p,
@@ -482,9 +526,15 @@ export default function ClonePanel() {
           source_name: allSpecs[0]?.name ?? "",
           new_name: allSpecs[0]?.name ?? "",
           level_acquired: 0,
-          // No particular source class in mind for a row added by hand (not prefilled from one
-          // specific class's own specs) - source_class_id stays unset, resolving to just the
-          // shared/neutral SpellLines for whatever's picked, never another class's own.
+          // No particular source class in mind yet for a row added by hand (not prefilled from
+          // one specific class's own specs) - source_class_id starts unset, resolving to just the
+          // shared/neutral SpellLines by default. If this spec actually has other classes' own
+          // class-specific variants (e.g. Warden's/Druid's/Bard's own "Nurture"), the "View spell
+          // lines as" dropdown next to the spec picker (populated from classes_granting_spec)
+          // lets the user pick one of those instead - a real, reported gap this closes: building
+          // a class around an unrelated class's own spec this way (e.g. a Hero-based class
+          // adding Warden's own "Nurture"/"Regrowth") previously had no way to reach anything but
+          // the shared baseline lines at all.
           applied: false,
         },
       ],
@@ -783,6 +833,34 @@ export default function ClonePanel() {
                                 </option>
                               ))}
                             </select>
+                            {(specSourceClassOptions[a.source_key] ?? []).length > 0 && (
+                              <div className="hint" style={{ marginTop: 4 }}>
+                                View spell lines as:{" "}
+                                <select
+                                  value={a.source_class_id ?? ""}
+                                  onChange={(e) => {
+                                    updateSpecAssignment(i, {
+                                      source_class_id: e.target.value
+                                        ? Number(e.target.value)
+                                        : undefined,
+                                      // A previous customization was built against whichever
+                                      // class's own lines were resolved before - meaningless (and
+                                      // possibly wrong) against a different one.
+                                      spellLineSelection: undefined,
+                                    });
+                                    if (expandedSpecIndex === i) closeSpellLineCustomizer();
+                                  }}
+                                >
+                                  <option value="">shared/baseline only</option>
+                                  {specSourceClassOptions[a.source_key].map((classId) => (
+                                    <option value={classId} key={classId}>
+                                      {classes.find((c) => c.id === classId)?.name ??
+                                        `Class ${classId}`}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            )}
                           </td>
                           <td>
                             <input

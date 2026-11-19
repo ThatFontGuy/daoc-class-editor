@@ -1671,11 +1671,13 @@ function NewSpecForm({
  * `ensure_safe_to_write` check, same as every other real live write) reconciles everything
  * designed back onto live in one step once the server actually is stopped - see
  * `class_migration.rs`'s own module doc comment for exactly how. Switching to a different class
- * (`ClassBrowserPanel` remounts this component with a fresh `key` per class) discards any
- * still-open session for the class being left, via this component's own unmount cleanup -
- * there's deliberately no "resume this class's session later" persistence, unlike the Clone
- * Wizard's own project-scoped one, since a half-finished class design is expected to be either
- * migrated or abandoned within one sitting, not picked back up after restarting the app. */
+ * or tab and back never discards a still-open session (an earlier version did exactly that on
+ * every unmount, a real, reported bug - see `discardDesignSession`'s own doc comment below), and
+ * neither does closing and reopening the app entirely: `ProjectContext.tsx`'s own
+ * `classDesignSessions` map is persisted to disk (`design_session.rs`'s own
+ * `active_sessions_path` doc comment has the full rationale) every time it changes and read back
+ * on launch, so a half-finished design picked up again days later resumes the exact same session
+ * instead of silently starting a brand-new one cloned fresh from live's current state. */
 export default function ClassSpecsSection({
   sshConfig,
   classId,

@@ -185,6 +185,11 @@ fn list_spec_spell_lines(cfg: SshConfig, spec_key: String, source_class_id: i64)
 }
 
 #[tauri::command]
+fn classes_granting_spec(cfg: SshConfig, spec_key: String) -> Result<Vec<i64>, String> {
+    specs::classes_granting_spec(&cfg, &spec_key)
+}
+
+#[tauri::command]
 fn list_line_spells(cfg: SshConfig, line_key: String) -> Result<Vec<LineSpellRow>, String> {
     specs::list_line_spells(&cfg, &line_key)
 }
@@ -221,6 +226,24 @@ fn start_design_session(cfg: SshConfig) -> Result<SshConfig, String> {
 #[tauri::command]
 fn discard_design_session(session_cfg: SshConfig) -> Result<(), String> {
     design_session::discard_design_session(&session_cfg)
+}
+
+/// Every class's own still-active design session directory, keyed by ClassID - read once on
+/// app launch so `ProjectContext.tsx`'s own `classDesignSessions` resumes exactly where it left
+/// off, instead of the app's only in-memory connection to an un-migrated design silently
+/// breaking the moment the window closes.
+#[tauri::command]
+fn load_active_class_design_sessions() -> std::collections::HashMap<i64, String> {
+    design_session::load_active_sessions()
+}
+
+/// Persists `ProjectContext.tsx`'s own `classDesignSessions` map - called every time it changes,
+/// so the next app launch can read it back via `load_active_class_design_sessions`.
+#[tauri::command]
+fn save_active_class_design_sessions(
+    sessions: std::collections::HashMap<i64, String>,
+) -> Result<(), String> {
+    design_session::save_active_sessions(&sessions)
 }
 
 /// Migrates one class's locally-designed specs/spell-lines/spells/styles from `session_cfg`'s
@@ -603,11 +626,14 @@ pub fn run() {
             list_specializations,
             list_class_specs,
             list_spec_spell_lines,
+            classes_granting_spec,
             list_line_spells,
             spell_type_field_stats,
             apply_class_specs,
             start_design_session,
             discard_design_session,
+            load_active_class_design_sessions,
+            save_active_class_design_sessions,
             migrate_class_design_to_live,
             clone_realm_abilities,
             migrate_class_to_owned_spells,
