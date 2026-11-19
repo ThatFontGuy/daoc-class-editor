@@ -12,6 +12,7 @@ import {
   SpecSpellLineRow,
   SpecializationRow,
   SshConfig,
+  WriteSafetyStatus,
   emptySshConfig,
   leafClassesOf,
 } from "./types";
@@ -22,6 +23,7 @@ import {
 } from "./ProjectContext";
 import { StatusState, emptyStatus, okStatus, errorStatus, StatusMessage } from "./Status";
 import TrainerPanel from "./TrainerPanel";
+import { formatAge } from "./DeploySettingsPanel";
 import { groupSpellsByProgression } from "./spellProgression";
 
 export default function ClonePanel() {
@@ -46,6 +48,24 @@ export default function ClonePanel() {
   const [log, setLog] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
+
+  /** Mirrors DeploySettingsPanel.tsx's own write-safety display, shown right in step 6 "Deploy"
+   * instead - a real, reported annoyance this exists to fix: checking whether the backup was
+   * stale, or backing it up, meant switching away to the Server connection tab and back, right
+   * in the middle of an otherwise one-page deploy flow. Refreshed after every write-safety-
+   * relevant action below (status/stop/backup/deploy/start), not on a timer - this panel isn't
+   * always mounted the way DeploySettingsPanel's own background interval assumes. */
+  const [writeSafety, setWriteSafety] = useState<WriteSafetyStatus | null>(null);
+  async function refreshWriteSafety(cfg: SshConfig) {
+    try {
+      setWriteSafety(await invoke<WriteSafetyStatus>("write_safety_status", { cfg }));
+    } catch {
+      // Best-effort only - the Deploy buttons below already surface their own real errors
+      // (via ensure_safe_to_write) if something's actually wrong; this is just a convenience
+      // display, not worth a second error message of its own.
+      setWriteSafety(null);
+    }
+  }
 
   // The log box has a fixed max-height and scrolls, so without this, each new action's result
   // (e.g. "Check status") lands below the fold of a box full of earlier entries and looks like
@@ -131,6 +151,7 @@ export default function ClonePanel() {
     invoke<SshConfig>("load_ssh_config").then((cfg) => {
       setSshConfig(cfg);
       refreshClasses(cfg);
+      refreshWriteSafety(cfg);
       if (project.newId === 0) {
         invoke<number>("suggest_next_id", { cfg }).then((id) =>
           setProject((p) => (p.newId === 0 ? { ...p, newId: id } : p)),
@@ -1225,12 +1246,35 @@ export default function ClonePanel() {
                   onChange={(e) => setProject((p) => ({ ...p, filename: e.target.value }))}
                 />
               </label>
+              {writeSafety && (
+                <p className="hint">
+                  Server:{" "}
+                  {writeSafety.server_running ? (
+                    <span className="badge-disabled">RUNNING - stop it to deploy</span>
+                  ) : (
+                    <strong>stopped</strong>
+                  )}
+                  {" · "}
+                  Backup:{" "}
+                  {!writeSafety.backup.exists ? (
+                    <span className="badge-disabled">none yet - back up before deploying</span>
+                  ) : writeSafety.backup.is_fresh ? (
+                    <strong>{formatAge(writeSafety.backup.age_seconds ?? 0)} ago</strong>
+                  ) : (
+                    <span className="badge-disabled">
+                      {formatAge(writeSafety.backup.age_seconds ?? 0)} ago - too old, back up again
+                    </span>
+                  )}
+                </p>
+              )}
               <div className="actions">
                 <button
                   disabled={busy}
                   onClick={() =>
-                    runAction("Check server status", () =>
-                      invoke<string>("server_status", { cfg: sshConfig }),
+                    runAction(
+                      "Check server status",
+                      () => invoke<string>("server_status", { cfg: sshConfig }),
+                      () => refreshWriteSafety(sshConfig),
                     )
                   }
                 >
@@ -1239,12 +1283,26 @@ export default function ClonePanel() {
                 <button
                   disabled={busy}
                   onClick={() =>
-                    runAction("Stop server", () =>
-                      invoke<string>("server_control", { cfg: sshConfig, action: "stop" }),
+                    runAction(
+                      "Stop server",
+                      () => invoke<string>("server_control", { cfg: sshConfig, action: "stop" }),
+                      () => refreshWriteSafety(sshConfig),
                     )
                   }
                 >
                   Stop server
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    runAction(
+                      "Backup Database",
+                      () => invoke<string>("backup_database", { cfg: sshConfig }),
+                      () => refreshWriteSafety(sshConfig),
+                    )
+                  }
+                >
+                  Backup Database
                 </button>
                 <button
                   disabled={busy}
@@ -1281,7 +1339,10 @@ export default function ClonePanel() {
                         await discardDesignSession();
                         return [specsResult, deployResult, raResult].filter(Boolean).join("\n");
                       },
-                      () => refreshClasses(sshConfig),
+                      () => {
+                        refreshClasses(sshConfig);
+                        refreshWriteSafety(sshConfig);
+                      },
                     )
                   }
                 >
@@ -1290,8 +1351,10 @@ export default function ClonePanel() {
                 <button
                   disabled={busy}
                   onClick={() =>
-                    runAction("Start server", () =>
-                      invoke<string>("server_control", { cfg: sshConfig, action: "start" }),
+                    runAction(
+                      "Start server",
+                      () => invoke<string>("server_control", { cfg: sshConfig, action: "start" }),
+                      () => refreshWriteSafety(sshConfig),
                     )
                   }
                 >

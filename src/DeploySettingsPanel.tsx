@@ -2,7 +2,9 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SshConfig, WriteSafetyStatus, emptySshConfig } from "./types";
 
-function formatAge(seconds: number): string {
+/** Shared with ClonePanel.tsx's own step 6 "Deploy" write-safety display - the same "Xm ago"/
+ * "Xh Ym ago" formatting shouldn't drift between the two places it's shown. */
+export function formatAge(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m`;
